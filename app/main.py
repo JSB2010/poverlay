@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import threading
+import time
 from typing import Any
 from uuid import uuid4
 import zipfile
@@ -16,9 +18,17 @@ import zipfile
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 
 from app.gpx_tools import shift_gpx_timestamps
-from app.layouts import THEMES, render_layout_xml
+from app.layouts import (
+    COMPONENT_OPTIONS,
+    DEFAULT_COMPONENT_VISIBILITY,
+    DEFAULT_LAYOUT_STYLE,
+    LAYOUT_STYLES,
+    THEMES,
+    render_layout_xml,
+)
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -35,6 +45,32 @@ GOPRO_DASHBOARD_BIN = os.environ.get(
 )
 FFPROBE_BIN = os.environ.get("FFPROBE_BIN", "ffprobe")
 DEFAULT_FONT_PATH = os.environ.get("OVERLAY_FONT_PATH", str(STATIC_DIR / "fonts" / "Orbitron-Bold.ttf"))
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float, minimum: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return max(minimum, value)
+
+
+JOB_CLEANUP_ENABLED = _env_bool("JOB_CLEANUP_ENABLED", True)
+JOB_CLEANUP_INTERVAL_SECONDS = int(_env_float("JOB_CLEANUP_INTERVAL_SECONDS", 900.0, 60.0))
+JOB_OUTPUT_RETENTION_HOURS = _env_float("JOB_OUTPUT_RETENTION_HOURS", 24.0, 1.0)
+DELETE_INPUTS_ON_COMPLETE = _env_bool("DELETE_INPUTS_ON_COMPLETE", True)
+DELETE_WORK_ON_COMPLETE = _env_bool("DELETE_WORK_ON_COMPLETE", True)
+JOB_EXPIRY_MARKER_FILE = ".expires-at"
 
 ALLOWED_UNITS_SPEED = {"kph", "mph", "mps", "knots"}
 ALLOWED_UNITS_ALTITUDE = {"metre", "meter", "feet", "foot"}
@@ -205,6 +241,7 @@ else:
     DEFAULT_RENDER_PROFILE = "h264-4k-compat" if "h264-4k-compat" in ALLOWED_RENDER_PROFILES else "h264-source"
 
 
+TERMINAL_JOB_STATUSES = {"completed", "completed_with_errors", "failed"}
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
 
@@ -243,6 +280,97 @@ def _ensure_ffmpeg_profiles() -> None:
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _utc_after_hours(hours: float) -> str:
+    return (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
+
+
+def _safe_unlink(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except IsADirectoryError:
+        pass
+
+
+def _safe_rmtree(path: Path) -> None:
+    try:
+        shutil.rmtree(path)
+    except FileNotFoundError:
+        pass
+
+
+def _is_active_job(job_id: str) -> bool:
+    with JOBS_LOCK:
+        current = JOBS.get(job_id)
+        if current is None:
+            return False
+        return current.get("status") not in TERMINAL_JOB_STATUSES
+
+
+def _forget_job(job_id: str) -> None:
+    with JOBS_LOCK:
+        current = JOBS.get(job_id)
+        if current and current.get("status") in TERMINAL_JOB_STATUSES:
+            del JOBS[job_id]
+
+
+def _write_expiry_marker(job_dir: Path, expires_at: str) -> None:
+    (job_dir / JOB_EXPIRY_MARKER_FILE).write_text(expires_at, encoding="utf-8")
+
+
+def _read_expiry_marker(job_dir: Path) -> datetime | None:
+    marker = job_dir / JOB_EXPIRY_MARKER_FILE
+    if not marker.exists():
+        return None
+    return _parse_iso(marker.read_text(encoding="utf-8").strip())
+
+
+def _cleanup_completed_job_live_files(job_dir: Path) -> None:
+    # Inputs/work are not needed after rendering completes.
+    if DELETE_INPUTS_ON_COMPLETE:
+        _safe_rmtree(job_dir / "inputs")
+    if DELETE_WORK_ON_COMPLETE:
+        _safe_rmtree(job_dir / "work")
+    # Remove legacy persistent zip bundles if they exist.
+    _safe_unlink(job_dir / "outputs.zip")
+
+
+def _cleanup_expired_jobs_once() -> None:
+    if not JOBS_DIR.exists():
+        return
+
+    now = datetime.now(timezone.utc)
+    for job_dir in JOBS_DIR.iterdir():
+        if not job_dir.is_dir():
+            continue
+
+        job_id = job_dir.name
+        if _is_active_job(job_id):
+            continue
+
+        expires_at = _read_expiry_marker(job_dir)
+        if expires_at is None:
+            # Backfill retention for old jobs without marker metadata.
+            mtime = datetime.fromtimestamp(job_dir.stat().st_mtime, tz=timezone.utc)
+            expires_at = mtime + timedelta(hours=JOB_OUTPUT_RETENTION_HOURS)
+
+        if expires_at > now:
+            continue
+
+        _safe_rmtree(job_dir)
+        _forget_job(job_id)
+
+
+def _cleanup_loop() -> None:
+    while True:
+        try:
+            _cleanup_expired_jobs_once()
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(JOB_CLEANUP_INTERVAL_SECONDS)
 
 
 def _set_job(job_id: str, **fields: Any) -> None:
@@ -419,7 +547,78 @@ def _render_profile_meta() -> list[dict[str, Any]]:
 
 
 def _theme_meta() -> list[dict[str, str]]:
-    return [{"id": key, "label": theme.label} for key, theme in THEMES.items()]
+    return [
+        {
+            "id": key,
+            "label": theme.label,
+            "panel_bg": theme.panel_bg,
+            "panel_bg_alt": theme.panel_bg_alt,
+            "speed_rgb": theme.speed_rgb,
+            "accent_rgb": theme.accent_rgb,
+            "text_rgb": theme.text_rgb,
+        }
+        for key, theme in THEMES.items()
+    ]
+
+
+def _layout_style_meta() -> list[dict[str, str]]:
+    return [
+        {
+            "id": key,
+            "label": style.label,
+            "description": style.description,
+        }
+        for key, style in LAYOUT_STYLES.items()
+    ]
+
+
+def _component_meta() -> list[dict[str, Any]]:
+    return [
+        {
+            "id": key,
+            "label": option.label,
+            "description": option.description,
+            "default_enabled": option.default_enabled,
+        }
+        for key, option in COMPONENT_OPTIONS.items()
+    ]
+
+
+def _coerce_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _parse_component_visibility(raw: str | None, include_maps: bool) -> dict[str, bool]:
+    payload: dict[str, Any] | None = None
+    if not raw:
+        visibility = dict(DEFAULT_COMPONENT_VISIBILITY)
+    else:
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail=f"component_visibility must be valid JSON: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise HTTPException(status_code=400, detail="component_visibility must be an object")
+        payload = parsed
+
+        visibility = dict(DEFAULT_COMPONENT_VISIBILITY)
+        for key, value in payload.items():
+            if key not in COMPONENT_OPTIONS:
+                raise HTTPException(status_code=400, detail=f"Unsupported component option: {key}")
+            visibility[key] = _coerce_bool(value)
+
+    # Keep backwards compatibility with the legacy include_maps toggle.
+    if payload is not None and "route_maps" in payload:
+        return visibility
+
+    visibility["route_maps"] = bool(include_maps)
+    return visibility
 
 
 def _auto_render_profile_candidates(metadata: dict[str, Any]) -> list[str]:
@@ -516,6 +715,8 @@ def _process_job(job_id: str) -> None:
         float(job["settings"]["gpx_offset_seconds"]),
         speed_unit=str(job["settings"].get("gpx_speed_unit", "auto")),
     )
+    if DELETE_INPUTS_ON_COMPLETE:
+        _safe_unlink(source_gpx)
 
     total_videos = len(job["videos"])
     failed_count = 0
@@ -536,6 +737,9 @@ def _process_job(job_id: str) -> None:
                 metadata["height"],
                 job["settings"]["overlay_theme"],
                 include_maps=bool(job["settings"]["include_maps"]),
+                layout_style=str(job["settings"].get("layout_style", DEFAULT_LAYOUT_STYLE)),
+                component_visibility=job["settings"].get("component_visibility"),
+                speed_units=str(job["settings"].get("speed_units", "kph")),
             )
             layout_path = work_dir / f"layout-{index + 1}.xml"
             layout_path.write_text(layout_xml, encoding="utf-8")
@@ -605,6 +809,9 @@ def _process_job(job_id: str) -> None:
         except Exception as exc:  # noqa: BLE001
             failed_count += 1
             _set_video(job_id, index, status="failed", progress=0, error=str(exc))
+        finally:
+            if DELETE_INPUTS_ON_COMPLETE:
+                _safe_unlink(input_path)
 
     if failed_count == 0:
         _set_job(job_id, status="completed", progress=100, finished_at=_utc_now(), message="All videos rendered")
@@ -619,6 +826,18 @@ def _process_job(job_id: str) -> None:
     else:
         _set_job(job_id, status="failed", progress=100, finished_at=_utc_now(), message="Rendering failed")
 
+    expires_at = _utc_after_hours(JOB_OUTPUT_RETENTION_HOURS)
+    _set_job(job_id, expires_at=expires_at)
+    _write_expiry_marker(job_dir, expires_at)
+    _cleanup_completed_job_live_files(job_dir)
+
+
+@app.on_event("startup")
+def startup() -> None:
+    _ensure_dirs()
+    if JOB_CLEANUP_ENABLED:
+        threading.Thread(target=_cleanup_loop, name="job-cleanup", daemon=True).start()
+
 
 @app.get("/")
 def index() -> FileResponse:
@@ -630,6 +849,10 @@ def meta() -> dict[str, Any]:
     return {
         "themes": sorted(THEMES.keys()),
         "theme_options": _theme_meta(),
+        "layout_styles": _layout_style_meta(),
+        "default_layout_style": DEFAULT_LAYOUT_STYLE,
+        "component_options": _component_meta(),
+        "default_component_visibility": DEFAULT_COMPONENT_VISIBILITY,
         "speed_units": sorted(ALLOWED_UNITS_SPEED),
         "gpx_speed_units": sorted(ALLOWED_GPX_SPEED_UNITS),
         "altitude_units": sorted(ALLOWED_UNITS_ALTITUDE),
@@ -655,6 +878,8 @@ async def create_job(
     map_style: str = Form("osm"),
     gpx_offset_seconds: float = Form(0.0),
     overlay_theme: str = Form("powder-neon"),
+    layout_style: str = Form(DEFAULT_LAYOUT_STYLE),
+    component_visibility: str = Form(""),
     include_maps: bool = Form(True),
     fps_mode: str = Form("source_exact"),
     fixed_fps: float = Form(30.0),
@@ -681,12 +906,17 @@ async def create_job(
         raise HTTPException(status_code=400, detail=f"Unsupported map style: {map_style}")
     if overlay_theme not in THEMES:
         raise HTTPException(status_code=400, detail=f"Unsupported overlay theme: {overlay_theme}")
+    if layout_style not in LAYOUT_STYLES:
+        raise HTTPException(status_code=400, detail=f"Unsupported layout style: {layout_style}")
     if fps_mode not in ALLOWED_FPS_MODES:
         raise HTTPException(status_code=400, detail=f"Unsupported fps mode: {fps_mode}")
     if fps_mode == "fixed" and fixed_fps <= 0:
         raise HTTPException(status_code=400, detail="fixed_fps must be > 0")
     if render_profile not in ALLOWED_RENDER_PROFILES:
         raise HTTPException(status_code=400, detail=f"Unsupported render_profile: {render_profile}")
+
+    resolved_component_visibility = _parse_component_visibility(component_visibility, include_maps)
+    include_maps = bool(resolved_component_visibility.get("route_maps", include_maps))
 
     if not Path(GOPRO_DASHBOARD_BIN).exists():
         raise HTTPException(
@@ -742,6 +972,7 @@ async def create_job(
         "job_dir": str(job_dir),
         "status": "queued",
         "created_at": _utc_now(),
+        "expires_at": None,
         "started_at": None,
         "finished_at": None,
         "progress": 0,
@@ -757,6 +988,8 @@ async def create_job(
             "map_style": map_style,
             "gpx_offset_seconds": gpx_offset_seconds,
             "overlay_theme": overlay_theme,
+            "layout_style": layout_style,
+            "component_visibility": resolved_component_visibility,
             "include_maps": include_maps,
             "fps_mode": fps_mode,
             "fixed_fps": fixed_fps,
@@ -821,7 +1054,7 @@ def download_all(job_id: str) -> FileResponse:
     job = _get_job(job_id)
     job_dir = Path(job["job_dir"])
     outputs_dir = job_dir / "outputs"
-    zip_path = job_dir / "outputs.zip"
+    zip_path = job_dir / f"outputs-{uuid4().hex}.zip"
 
     output_files = [v.get("output_name") for v in job["videos"] if v.get("output_name")]
     if not output_files:
@@ -833,4 +1066,9 @@ def download_all(job_id: str) -> FileResponse:
             if source.exists():
                 archive.write(source, arcname=source.name)
 
-    return FileResponse(zip_path, filename=f"overlay-renders-{job_id}.zip", media_type="application/zip")
+    return FileResponse(
+        zip_path,
+        filename=f"overlay-renders-{job_id}.zip",
+        media_type="application/zip",
+        background=BackgroundTask(_safe_unlink, zip_path),
+    )

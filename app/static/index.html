@@ -44,6 +44,12 @@
             </label>
 
             <label class="field">
+              <span>Layout style</span>
+              <select id="layout_style" name="layout_style"></select>
+              <small id="layout-style-help" class="field-help"></small>
+            </label>
+
+            <label class="field">
               <span>Export codec</span>
               <select id="render_profile" name="render_profile"></select>
               <small id="render-profile-help" class="field-help"></small>
@@ -78,10 +84,23 @@
             </label>
           </div>
 
-          <label class="field-toggle">
-            <input id="include_maps" name="include_maps" type="checkbox" checked />
-            <span>Render route maps</span>
-          </label>
+          <div class="preview-stack">
+            <section class="preview-panel">
+              <h3>Theme Preview</h3>
+              <div id="theme-preview"></div>
+            </section>
+
+            <section class="preview-panel">
+              <h3>Layout Previews</h3>
+              <div id="layout-preview-grid" class="layout-preview-grid"></div>
+            </section>
+          </div>
+
+          <div class="section-head">
+            <h2>3) Overlay components</h2>
+          </div>
+          <p class="section-copy">Pick exactly which overlay parts should be rendered into the video.</p>
+          <div id="component-options" class="component-grid"></div>
 
           <details class="advanced-panel">
             <summary>Advanced settings</summary>

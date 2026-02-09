@@ -122,6 +122,32 @@ The app renders in GPX-only mode and aligns each video using file timestamps.
 - If you disable maps, rendering is generally faster.
 - Job artifacts are written under `data/jobs/<job-id>/`.
 
+## VPS storage cleanup
+
+The app can automatically clean job files to keep disk usage under control:
+
+- deletes `inputs/` and `work/` after a job finishes
+- keeps rendered outputs for a retention window
+- periodically purges expired job directories
+- `download-all` zip files are now temporary and auto-deleted after the response
+
+Environment variables:
+
+- `JOB_OUTPUT_RETENTION_HOURS` (default: `24`)
+- `JOB_CLEANUP_INTERVAL_SECONDS` (default: `900`)
+- `JOB_CLEANUP_ENABLED` (default: `true`)
+- `DELETE_INPUTS_ON_COMPLETE` (default: `true`)
+- `DELETE_WORK_ON_COMPLETE` (default: `true`)
+
+Example for a small VPS:
+
+```bash
+export JOB_OUTPUT_RETENTION_HOURS=12
+export JOB_CLEANUP_INTERVAL_SECONDS=600
+export DELETE_INPUTS_ON_COMPLETE=true
+export DELETE_WORK_ON_COMPLETE=true
+```
+
 ## First Commit Checklist
 
 - Do not commit local render outputs (`data/` is ignored).
