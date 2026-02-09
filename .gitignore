@@ -1,0 +1,22 @@
+# Python / virtualenv
+.venv/
+__pycache__/
+*.py[cod]
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+
+# Runtime/output artifacts
+data/
+*.log
+*.zip
+
+# Local temp renders
+tmp-*.mp4
+*.tmp.mp4
+
+# Local sample data (keep only the samples README in git)
+samples/*
+!samples/README.md

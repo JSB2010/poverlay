@@ -1,0 +1,5 @@
+fastapi==0.128.5
+uvicorn==0.40.0
+python-multipart==0.0.22
+gopro-overlay==0.129.0
+setuptools<81
