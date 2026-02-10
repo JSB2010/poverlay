@@ -56,6 +56,17 @@ pnpm check
 
 GitHub Actions CI runs the same command on push/PR via `.github/workflows/ci.yml`.
 
+### Regenerate layout preview screenshots
+
+```bash
+scripts/generate-layout-previews.py
+```
+
+Notes:
+- The script prefers sample inputs from `samples/` when both a `.gpx` and video file are present.
+- If sample inputs are not present, it generates deterministic fallback GPX/video input and still produces one preview PNG per layout style ID.
+- Output assets are written to `apps/web/public/layout-previews/` with a stable `manifest.json` mapping layout IDs to image paths.
+
 ## API overview
 
 - `GET /health` - health probe

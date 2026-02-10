@@ -1,0 +1,40 @@
+{
+  "base_path": "/layout-previews",
+  "format": "png",
+  "preview_size": {
+    "width": 640,
+    "height": 360
+  },
+  "render_input_size": {
+    "width": 1280,
+    "height": 720
+  },
+  "theme": "powder-neon",
+  "input_source": "deterministic-fallback",
+  "layout_ids": [
+    "summit-grid",
+    "velocity-rail",
+    "cinematic-lower-third",
+    "apex-split",
+    "moto-dial-bars",
+    "telemetry-hud",
+    "race-cluster",
+    "moto-journey-needle",
+    "moto-journey-dual-bars",
+    "compass-asi-cluster",
+    "power-zone-pro"
+  ],
+  "images": {
+    "summit-grid": "/layout-previews/summit-grid.png",
+    "velocity-rail": "/layout-previews/velocity-rail.png",
+    "cinematic-lower-third": "/layout-previews/cinematic-lower-third.png",
+    "apex-split": "/layout-previews/apex-split.png",
+    "moto-dial-bars": "/layout-previews/moto-dial-bars.png",
+    "telemetry-hud": "/layout-previews/telemetry-hud.png",
+    "race-cluster": "/layout-previews/race-cluster.png",
+    "moto-journey-needle": "/layout-previews/moto-journey-needle.png",
+    "moto-journey-dual-bars": "/layout-previews/moto-journey-dual-bars.png",
+    "compass-asi-cluster": "/layout-previews/compass-asi-cluster.png",
+    "power-zone-pro": "/layout-previews/power-zone-pro.png"
+  }
+}
