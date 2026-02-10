@@ -95,3 +95,21 @@ Notes:
 - Use `--with-systemd` when you change `deploy/systemd/*`.
 - Use `--with-nginx` only when you intentionally want to sync `deploy/nginx/poverlay.conf`.
 - If your VPS nginx file is Certbot-managed, `--with-nginx` will refuse to overwrite it unless templates match Certbot layout.
+
+## GitHub Actions auto-deploy
+
+`.github/workflows/deploy.yml` can deploy automatically after CI passes on pushes to `main` (or manually via workflow dispatch).
+
+Set these repository secrets:
+
+- `VPS_HOST` (example: `15.204.223.62`)
+- `VPS_USER` (example: `ubuntu`)
+- `VPS_SSH_KEY` (private key contents)
+- `VPS_PORT` (optional, defaults to `22`)
+
+Optional repository variables:
+
+- `VPS_APP_DIR` (defaults to `/opt/poverlay`)
+- `VPS_PUBLIC_URL` (defaults to `https://poverlay.com`)
+
+The workflow assumes the remote user can run `sudo -n` non-interactively.

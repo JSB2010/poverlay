@@ -95,6 +95,7 @@ Deployment artifacts are included:
 - Nginx site: `deploy/nginx/poverlay.conf`
 - step-by-step guide: `deploy/VPS.md`
 - deployment command: `./scripts/deploy-vps.sh --branch main --public-url https://poverlay.com`
+- CI-triggered VPS deploy workflow: `.github/workflows/deploy.yml`
 
 ## Repository layout
 
