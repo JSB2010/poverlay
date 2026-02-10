@@ -4,11 +4,12 @@ After=network.target
 
 [Service]
 Type=simple
-User=www-data
-Group=www-data
+User=ubuntu
+Group=ubuntu
 WorkingDirectory=/opt/poverlay
 EnvironmentFile=-/etc/poverlay/poverlay.env
 Environment=NODE_ENV=production
+Environment=HOME=/home/ubuntu
 ExecStart=/usr/bin/env bash -lc 'HOSTNAME=127.0.0.1 PORT=3000 pnpm --filter @poverlay/web start'
 Restart=always
 RestartSec=3

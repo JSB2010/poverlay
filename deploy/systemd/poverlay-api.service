@@ -4,9 +4,10 @@ After=network.target
 
 [Service]
 Type=simple
-User=www-data
-Group=www-data
+User=ubuntu
+Group=ubuntu
 WorkingDirectory=/opt/poverlay
+Environment=HOME=/home/ubuntu
 EnvironmentFile=-/etc/poverlay/poverlay.env
 ExecStart=/opt/poverlay/.venv/bin/uvicorn --app-dir /opt/poverlay/apps/api app.main:app --host 127.0.0.1 --port 8787
 Restart=always
