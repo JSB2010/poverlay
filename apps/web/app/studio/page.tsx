@@ -45,6 +45,10 @@ type MetaResponse = {
   default_render_profile?: string;
 };
 
+type LayoutPreviewManifest = {
+  images?: Record<string, string>;
+};
+
 type VideoState = {
   input_name: string;
   status: string;
@@ -293,6 +297,20 @@ function isObjectRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+function isRecordOfStrings(value: unknown): value is Record<string, string> {
+  if (!isObjectRecord(value)) {
+    return false;
+  }
+
+  for (const entry of Object.values(value)) {
+    if (typeof entry !== "string") {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 function extractErrorMessage(payload: unknown, fallback: string): string {
   if (typeof payload === "string") {
     const message = payload.trim();
@@ -428,6 +446,8 @@ export default function HomePage() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
+  const [layoutPreviewById, setLayoutPreviewById] = useState<Record<string, string>>({});
+  const [brokenLayoutPreviews, setBrokenLayoutPreviews] = useState<Record<string, true>>({});
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -498,6 +518,41 @@ export default function HomePage() {
       if (pollRef.current) {
         clearInterval(pollRef.current);
       }
+    };
+  }, []);
+
+  useEffect(() => {
+    let ignore = false;
+
+    async function loadLayoutPreviewManifest() {
+      try {
+        const response = await fetch("/layout-previews/manifest.json");
+        const payload = await readApiPayload(response);
+        if (!response.ok || !isObjectRecord(payload)) {
+          throw new Error("Could not load layout preview manifest");
+        }
+
+        const manifest = payload as LayoutPreviewManifest;
+        if (!isRecordOfStrings(manifest.images)) {
+          throw new Error("Invalid layout preview manifest");
+        }
+
+        if (!ignore) {
+          setLayoutPreviewById(manifest.images);
+          setBrokenLayoutPreviews({});
+        }
+      } catch {
+        if (!ignore) {
+          setLayoutPreviewById({});
+          setBrokenLayoutPreviews({});
+        }
+      }
+    }
+
+    void loadLayoutPreviewManifest();
+
+    return () => {
+      ignore = true;
     };
   }, []);
 
@@ -882,27 +937,58 @@ export default function HomePage() {
               <article className="rounded-xl border border-[var(--color-border)] bg-[var(--color-card)] p-6">
                 <h3 className="mb-4 text-lg font-semibold">Layout Previews</h3>
                 <div className="grid grid-cols-2 gap-3">
-                  {layoutStyles.map((layoutStyle) => (
-                    <button
-                      key={layoutStyle.id}
-                      type="button"
-                      className={`group rounded-lg border p-3 text-left transition-all hover:border-[var(--color-primary)] hover:shadow-md ${
-                        layoutStyle.id === formState.layout_style
-                          ? "border-[var(--color-primary)] bg-[var(--color-primary)]/5 shadow-sm"
-                          : "border-[var(--color-border)] bg-[var(--color-background)]"
-                      }`}
-                      onClick={() => setFormState((prev) => ({ ...prev, layout_style: layoutStyle.id }))}
-                    >
-                      <div
-                        className="mb-2 overflow-hidden rounded"
-                        dangerouslySetInnerHTML={{ __html: getLayoutPreviewSvg(layoutStyle.id) }}
-                      />
-                      <div>
-                        <strong className="block text-xs font-semibold">{layoutStyle.label}</strong>
-                        <small className="block text-[10px] text-[var(--color-muted-foreground)]">{layoutStyle.description}</small>
-                      </div>
-                    </button>
-                  ))}
+                  {layoutStyles.map((layoutStyle) => {
+                    const previewSource = layoutPreviewById[layoutStyle.id];
+                    const normalizedSource = previewSource
+                      ? previewSource.startsWith("/")
+                        ? previewSource
+                        : `/${previewSource}`
+                      : null;
+                    const shouldUseImage = Boolean(normalizedSource && !brokenLayoutPreviews[layoutStyle.id]);
+
+                    return (
+                      <button
+                        key={layoutStyle.id}
+                        type="button"
+                        className={`group rounded-lg border p-3 text-left transition-all hover:border-[var(--color-primary)] hover:shadow-md ${
+                          layoutStyle.id === formState.layout_style
+                            ? "border-[var(--color-primary)] bg-[var(--color-primary)]/5 shadow-sm"
+                            : "border-[var(--color-border)] bg-[var(--color-background)]"
+                        }`}
+                        onClick={() => setFormState((prev) => ({ ...prev, layout_style: layoutStyle.id }))}
+                      >
+                        {shouldUseImage ? (
+                          <div className="mb-2 overflow-hidden rounded">
+                            <img
+                              src={normalizedSource ?? ""}
+                              alt={`${layoutStyle.label} preview`}
+                              loading="lazy"
+                              className="h-auto w-full"
+                              onError={() =>
+                                setBrokenLayoutPreviews((prev) => (
+                                  prev[layoutStyle.id]
+                                    ? prev
+                                    : {
+                                        ...prev,
+                                        [layoutStyle.id]: true,
+                                      }
+                                ))
+                              }
+                            />
+                          </div>
+                        ) : (
+                          <div
+                            className="mb-2 overflow-hidden rounded"
+                            dangerouslySetInnerHTML={{ __html: getLayoutPreviewSvg(layoutStyle.id) }}
+                          />
+                        )}
+                        <div>
+                          <strong className="block text-xs font-semibold">{layoutStyle.label}</strong>
+                          <small className="block text-[10px] text-[var(--color-muted-foreground)]">{layoutStyle.description}</small>
+                        </div>
+                      </button>
+                    );
+                  })}
                 </div>
               </article>
             </div>
