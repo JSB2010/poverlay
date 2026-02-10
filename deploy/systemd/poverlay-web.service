@@ -10,7 +10,9 @@ WorkingDirectory=/opt/poverlay
 EnvironmentFile=-/etc/poverlay/poverlay.env
 Environment=NODE_ENV=production
 Environment=HOME=/home/ubuntu
-ExecStart=/usr/bin/env bash -lc 'HOSTNAME=127.0.0.1 PORT=3000 pnpm --filter @poverlay/web start'
+Environment=HOSTNAME=127.0.0.1
+Environment=PORT=3000
+ExecStart=/usr/bin/node /opt/poverlay/apps/web/.next/standalone/apps/web/server.js
 Restart=always
 RestartSec=3
 TimeoutStopSec=30
