@@ -94,7 +94,7 @@ Deployment artifacts are included:
 - systemd units: `deploy/systemd/poverlay-api.service`, `deploy/systemd/poverlay-web.service`
 - Nginx site: `deploy/nginx/poverlay.conf`
 - step-by-step guide: `deploy/VPS.md`
-- deployment command: `./scripts/deploy-vps.sh --branch main`
+- deployment command: `./scripts/deploy-vps.sh --branch main --public-url https://poverlay.com`
 
 ## Repository layout
 

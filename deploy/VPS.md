@@ -25,7 +25,6 @@ git clone <your-repo-url> /opt/poverlay
 cd /opt/poverlay
 ./scripts/setup.sh
 pnpm check
-pnpm build
 ```
 
 ## 3) Runtime environment
@@ -85,12 +84,14 @@ sudo systemctl restart poverlay-api poverlay-web
 Run this on the VPS from `/opt/poverlay`:
 
 ```bash
-./scripts/deploy-vps.sh --branch main
+./scripts/deploy-vps.sh --branch main --public-url https://poverlay.com
 ```
 
 Notes:
 
 - This does a safe `git pull --ff-only` (no hard reset by default).
-- It runs `pnpm check`, `pnpm build`, then restarts services.
+- By default it runs `pnpm check` (which includes build), then restarts services.
 - Use `--skip-check` for faster deploys when needed.
-- Use `--with-system` when you change `deploy/systemd/*` or `deploy/nginx/*`.
+- Use `--with-systemd` when you change `deploy/systemd/*`.
+- Use `--with-nginx` only when you intentionally want to sync `deploy/nginx/poverlay.conf`.
+- If your VPS nginx file is Certbot-managed, `--with-nginx` will refuse to overwrite it unless templates match Certbot layout.
