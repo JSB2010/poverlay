@@ -84,7 +84,7 @@ type FormState = {
   fixed_fps: string;
 };
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "";
+const CONFIGURED_API_BASE = (process.env.NEXT_PUBLIC_API_BASE ?? "").replace(/\/+$/, "");
 
 const TERMINAL_STATES = new Set(["completed", "completed_with_errors", "failed"]);
 
@@ -264,6 +264,66 @@ const DEFAULT_FORM_STATE: FormState = {
   fixed_fps: "30",
 };
 
+function resolveApiBase(): string {
+  if (CONFIGURED_API_BASE) {
+    return CONFIGURED_API_BASE;
+  }
+
+  if (process.env.NODE_ENV !== "development") {
+    return "";
+  }
+
+  if (typeof window === "undefined") {
+    return "";
+  }
+
+  const host = window.location.hostname;
+  if (host === "localhost" || host === "127.0.0.1") {
+    return "http://127.0.0.1:8787";
+  }
+
+  return "";
+}
+
+function apiUrl(path: string): string {
+  return `${resolveApiBase()}${path}`;
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function extractErrorMessage(payload: unknown, fallback: string): string {
+  if (typeof payload === "string") {
+    const message = payload.trim();
+    return message || fallback;
+  }
+
+  if (isObjectRecord(payload)) {
+    for (const key of ["detail", "message", "error"]) {
+      const value = payload[key];
+      if (typeof value === "string" && value.trim()) {
+        return value;
+      }
+    }
+  }
+
+  return fallback;
+}
+
+async function readApiPayload(response: Response): Promise<unknown> {
+  const text = await response.text();
+  if (!text) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return text;
+  }
+}
+
 function rgbStringToCss(value: string, fallback: string): string {
   const parts = value
     .split(",")
@@ -374,12 +434,17 @@ export default function HomePage() {
   useEffect(() => {
     async function loadMeta() {
       try {
-        const response = await fetch(`${API_BASE}/api/meta`);
+        const response = await fetch(apiUrl("/api/meta"));
         if (!response.ok) {
-          throw new Error("Could not load server metadata");
+          const errorPayload = await readApiPayload(response);
+          throw new Error(extractErrorMessage(errorPayload, "Could not load server metadata"));
         }
 
-        const meta = (await response.json()) as MetaResponse;
+        const metaPayload = await readApiPayload(response);
+        if (!isObjectRecord(metaPayload)) {
+          throw new Error("Could not load server metadata");
+        }
+        const meta = metaPayload as MetaResponse;
         const nextThemes = meta.theme_options?.length ? meta.theme_options : FALLBACK_THEMES;
         const nextLayouts = meta.layout_styles?.length ? meta.layout_styles : FALLBACK_LAYOUTS;
         const nextComponents = meta.component_options?.length ? meta.component_options : FALLBACK_COMPONENTS;
@@ -454,16 +519,21 @@ export default function HomePage() {
 
   async function pollJob(jobId: string): Promise<void> {
     try {
-      const response = await fetch(`${API_BASE}/api/jobs/${jobId}`);
+      const response = await fetch(apiUrl(`/api/jobs/${jobId}`));
+      const payload = await readApiPayload(response);
       if (!response.ok) {
-        throw new Error(`Could not fetch job ${jobId}`);
+        throw new Error(extractErrorMessage(payload, `Could not fetch job ${jobId}`));
       }
 
-      const payload = (await response.json()) as JobStatus;
-      setJob(payload);
+      if (!isObjectRecord(payload)) {
+        throw new Error(`Unexpected response while fetching job ${jobId}`);
+      }
+
+      const jobPayload = payload as JobStatus;
+      setJob(jobPayload);
       setStatusError(null);
 
-      if (TERMINAL_STATES.has(payload.status)) {
+      if (TERMINAL_STATES.has(jobPayload.status)) {
         if (pollRef.current) {
           clearInterval(pollRef.current);
           pollRef.current = null;
@@ -571,22 +641,26 @@ export default function HomePage() {
     payload.append("include_maps", mapsEnabled ? "true" : "false");
 
     try {
-      const response = await fetch(`${API_BASE}/api/jobs`, {
+      const response = await fetch(apiUrl("/api/jobs"), {
         method: "POST",
         body: payload,
       });
+      const responsePayload = await readApiPayload(response);
 
       if (!response.ok) {
-        const errorPayload = (await response.json()) as { detail?: string };
-        throw new Error(errorPayload.detail ?? "Failed to create render job");
+        throw new Error(extractErrorMessage(responsePayload, "Failed to create render job"));
       }
 
-      const created = (await response.json()) as { job_id: string };
-      setActiveJobId(created.job_id);
-      await pollJob(created.job_id);
+      if (!isObjectRecord(responsePayload) || typeof responsePayload.job_id !== "string" || !responsePayload.job_id) {
+        throw new Error("Invalid response from API while creating job");
+      }
+
+      const createdJobId = responsePayload.job_id;
+      setActiveJobId(createdJobId);
+      await pollJob(createdJobId);
 
       pollRef.current = setInterval(() => {
-        void pollJob(created.job_id);
+        void pollJob(createdJobId);
       }, 2000);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Failed to create render job";
@@ -1069,7 +1143,7 @@ export default function HomePage() {
                     <div className="flex flex-wrap gap-2">
                       {video.download_url && (
                         <a
-                          href={`${API_BASE}${video.download_url}`}
+                          href={apiUrl(video.download_url)}
                           className="rounded-md bg-[var(--color-primary)] px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-[var(--color-primary)]/90"
                         >
                           Download video
@@ -1078,7 +1152,7 @@ export default function HomePage() {
 
                       {video.log_name && job?.id && (
                         <a
-                          href={`${API_BASE}/api/jobs/${job.id}/log/${video.log_name}`}
+                          href={apiUrl(`/api/jobs/${job.id}/log/${video.log_name}`)}
                           className="rounded-md border border-[var(--color-border)] px-3 py-1.5 text-xs font-medium transition-colors hover:bg-[var(--color-muted)]/30"
                         >
                           Renderer log
@@ -1093,7 +1167,7 @@ export default function HomePage() {
             {job?.download_all_url && (
               <a
                 className="block rounded-xl border border-[var(--color-border)] bg-[var(--color-background)] px-4 py-3 text-center text-sm font-semibold transition-colors hover:bg-[var(--color-muted)]/30"
-                href={`${API_BASE}${job.download_all_url}`}
+                href={apiUrl(job.download_all_url)}
               >
                 Download all outputs (.zip)
               </a>

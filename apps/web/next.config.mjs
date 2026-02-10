@@ -1,10 +1,16 @@
 /** @type {import('next').NextConfig} */
+const proxyClientMaxBodySize = process.env.NEXT_PROXY_CLIENT_MAX_BODY_SIZE || "1024mb";
+
 const nextConfig = {
   output: "standalone",
 
   // Performance optimizations
   compress: true,
   poweredByHeader: false,
+
+  experimental: {
+    proxyClientMaxBodySize,
+  },
 
   // Image optimization
   images: {

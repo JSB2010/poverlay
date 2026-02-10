@@ -84,6 +84,7 @@ Frontend:
 
 - `NEXT_PUBLIC_API_BASE` (optional; direct browser API base)
 - `API_PROXY_TARGET` (used by Next rewrite for `/api/*`, default `http://127.0.0.1:8787`)
+- `NEXT_PROXY_CLIENT_MAX_BODY_SIZE` (optional; Next proxy upload limit, default `1024mb`)
 
 See `apps/web/.env.example`.
 
