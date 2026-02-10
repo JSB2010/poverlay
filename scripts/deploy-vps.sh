@@ -20,6 +20,22 @@ BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 RUN_CHECK=true
 WITH_SYSTEM=false
 
+wait_for_http() {
+  local name="$1"
+  local url="$2"
+  local retries="${3:-30}"
+
+  for ((i = 1; i <= retries; i++)); do
+    if curl -fsS "${url}" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+
+  echo "${name} did not become ready: ${url}" >&2
+  return 1
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --branch)
@@ -71,10 +87,9 @@ if [[ "${RUN_CHECK}" == "true" ]]; then
   pnpm check
 else
   echo "==> Skipping checks"
+  echo "==> Building web"
+  pnpm build
 fi
-
-echo "==> Building web"
-pnpm build
 
 if [[ "${WITH_SYSTEM}" == "true" ]]; then
   echo "==> Refreshing system-level config"
@@ -91,7 +106,7 @@ echo "==> Restarting app services"
 sudo systemctl restart poverlay-api poverlay-web
 
 echo "==> Health checks"
-curl -fsS http://127.0.0.1:8787/health >/dev/null
-curl -fsS http://127.0.0.1:3000 >/dev/null
+wait_for_http "API" "http://127.0.0.1:8787/health"
+wait_for_http "Web" "http://127.0.0.1:3000"
 
 echo "Deploy complete."
