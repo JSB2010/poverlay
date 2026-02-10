@@ -1,6 +1,9 @@
-name: Deploy Production
+name: Deploy Staging
 
 on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       branch:
@@ -9,15 +12,20 @@ on:
         default: "main"
 
 concurrency:
-  group: production-deploy
+  group: staging-deploy
   cancel-in-progress: false
 
 jobs:
   deploy:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main')
     runs-on: ubuntu-latest
     environment:
-      name: production
-      url: https://poverlay.com
+      name: staging
+      url: https://dev.poverlay.com
     permissions:
       contents: read
     steps:
@@ -47,25 +55,35 @@ jobs:
           mkdir -p ~/.ssh
           ssh-keyscan -H -p "${PORT}" "${VPS_HOST}" >> ~/.ssh/known_hosts
 
-      - name: Deploy to VPS
+      - name: Deploy to staging on VPS
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
           VPS_PORT: ${{ secrets.VPS_PORT }}
-          VPS_APP_DIR: ${{ vars.VPS_APP_DIR }}
-          VPS_PUBLIC_URL: ${{ vars.VPS_PUBLIC_URL }}
+          VPS_STAGING_APP_DIR: ${{ vars.VPS_STAGING_APP_DIR }}
+          VPS_STAGING_PUBLIC_URL: ${{ vars.VPS_STAGING_PUBLIC_URL }}
           MANUAL_BRANCH: ${{ inputs.branch }}
         run: |
           set -euo pipefail
           PORT="${VPS_PORT:-22}"
-          APP_DIR="${VPS_APP_DIR:-/opt/poverlay}"
-          PUBLIC_URL="${VPS_PUBLIC_URL:-https://poverlay.com}"
+          APP_DIR="${VPS_STAGING_APP_DIR:-/opt/poverlay-staging}"
+          PUBLIC_URL="${VPS_STAGING_PUBLIC_URL:-https://dev.poverlay.com}"
 
-          BRANCH="${MANUAL_BRANCH}"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            BRANCH="${MANUAL_BRANCH}"
+          else
+            BRANCH="main"
+          fi
 
           ssh -p "${PORT}" "${VPS_USER}@${VPS_HOST}" <<EOF
           set -euo pipefail
           cd "${APP_DIR}"
           sudo -n true >/dev/null
-          ./scripts/deploy-vps.sh --branch "${BRANCH}" --public-url "${PUBLIC_URL}"
+          ./scripts/deploy-vps.sh \
+            --branch "${BRANCH}" \
+            --api-service poverlay-staging-api \
+            --web-service poverlay-staging-web \
+            --api-health-url http://127.0.0.1:8788/health \
+            --web-health-url http://127.0.0.1:3001 \
+            --public-url "${PUBLIC_URL}"
           EOF

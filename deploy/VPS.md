@@ -98,7 +98,10 @@ Notes:
 
 ## GitHub Actions auto-deploy
 
-`.github/workflows/deploy.yml` can deploy automatically after CI passes on pushes to `main` (or manually via workflow dispatch).
+Workflows:
+
+- `.github/workflows/deploy-staging.yml`: auto-deploys staging after CI passes on pushes to `main` (or manual dispatch).
+- `.github/workflows/deploy.yml`: manual production deploy.
 
 Set these repository secrets:
 
@@ -111,5 +114,30 @@ Optional repository variables:
 
 - `VPS_APP_DIR` (defaults to `/opt/poverlay`)
 - `VPS_PUBLIC_URL` (defaults to `https://poverlay.com`)
+- `VPS_STAGING_APP_DIR` (defaults to `/opt/poverlay-staging`)
+- `VPS_STAGING_PUBLIC_URL` (defaults to `https://dev.poverlay.com`)
 
 The workflow assumes the remote user can run `sudo -n` non-interactively.
+
+## Staging on the same VPS
+
+The repository includes staging service/nginx templates:
+
+- `deploy/systemd/poverlay-staging-api.service`
+- `deploy/systemd/poverlay-staging-web.service`
+- `deploy/nginx/poverlay-dev.conf`
+
+Recommended staging layout on the same host:
+
+- app dir: `/opt/poverlay-staging`
+- api port: `8788`
+- web port: `3001`
+- env file: `/etc/poverlay/poverlay-staging.env`
+- domain: `dev.poverlay.com`
+
+One-time bootstrap on VPS:
+
+```bash
+cd /opt/poverlay
+./scripts/bootstrap-staging-vps.sh
+```

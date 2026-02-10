@@ -1,0 +1,18 @@
+[Unit]
+Description=POVerlay Staging FastAPI service
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/poverlay-staging
+Environment=HOME=/home/ubuntu
+EnvironmentFile=-/etc/poverlay/poverlay-staging.env
+ExecStart=/opt/poverlay-staging/.venv/bin/uvicorn --app-dir /opt/poverlay-staging/apps/api app.main:app --host 127.0.0.1 --port 8788
+Restart=always
+RestartSec=3
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
