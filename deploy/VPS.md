@@ -25,7 +25,7 @@ git clone <your-repo-url> /opt/poverlay
 cd /opt/poverlay
 ./scripts/setup.sh
 pnpm check
-pnpm --filter @poverlay/web build
+pnpm build
 ```
 
 ## 3) Runtime environment
@@ -79,3 +79,18 @@ sudo journalctl -u poverlay-api -f
 sudo journalctl -u poverlay-web -f
 sudo systemctl restart poverlay-api poverlay-web
 ```
+
+## Ongoing deploys (git-first workflow)
+
+Run this on the VPS from `/opt/poverlay`:
+
+```bash
+./scripts/deploy-vps.sh --branch main
+```
+
+Notes:
+
+- This does a safe `git pull --ff-only` (no hard reset by default).
+- It runs `pnpm check`, `pnpm build`, then restarts services.
+- Use `--skip-check` for faster deploys when needed.
+- Use `--with-system` when you change `deploy/systemd/*` or `deploy/nginx/*`.
