@@ -1,0 +1,17 @@
+[Unit]
+Description=POVerlay FastAPI service
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/poverlay
+EnvironmentFile=-/etc/poverlay/poverlay.env
+ExecStart=/opt/poverlay/.venv/bin/uvicorn --app-dir /opt/poverlay/apps/api app.main:app --host 127.0.0.1 --port 8787
+Restart=always
+RestartSec=3
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

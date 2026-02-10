@@ -8,6 +8,13 @@ __pycache__/
 .vscode/
 .idea/
 
+# JavaScript / Next.js
+node_modules/
+apps/web/.next/
+apps/web/.env.local
+*.tsbuildinfo
+.pytest_cache/
+
 # Runtime/output artifacts
 data/
 *.log

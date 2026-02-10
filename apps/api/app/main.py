@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import json
@@ -17,7 +18,7 @@ import zipfile
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 from starlette.background import BackgroundTask
 
 from app.gpx_tools import shift_gpx_timestamps
@@ -31,17 +32,26 @@ from app.layouts import (
 )
 
 
-ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = ROOT / "data"
+def _discover_repo_root() -> Path:
+    this_file = Path(__file__).resolve()
+    for parent in this_file.parents:
+        if (parent / "vendor" / "gopro-dashboard-overlay").exists() and (parent / "scripts").exists():
+            return parent
+    return this_file.parents[3]
+
+
+SERVICE_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = _discover_repo_root()
+DATA_DIR = Path(os.environ.get("POVERLAY_DATA_DIR", str(REPO_ROOT / "data")))
 JOBS_DIR = DATA_DIR / "jobs"
-STATIC_DIR = ROOT / "app" / "static"
+STATIC_DIR = SERVICE_ROOT / "app" / "static"
 CONFIG_DIR = DATA_DIR / "gopro-config"
 FFMPEG_PROFILES_FILE = CONFIG_DIR / "ffmpeg-profiles.json"
 
-LOCAL_DASHBOARD_BIN = ROOT / "scripts" / "gopro-dashboard-local.sh"
+LOCAL_DASHBOARD_BIN = REPO_ROOT / "scripts" / "gopro-dashboard-local.sh"
 GOPRO_DASHBOARD_BIN = os.environ.get(
     "GOPRO_DASHBOARD_BIN",
-    str(LOCAL_DASHBOARD_BIN if LOCAL_DASHBOARD_BIN.exists() else (ROOT / ".venv" / "bin" / "gopro-dashboard.py")),
+    str(LOCAL_DASHBOARD_BIN if LOCAL_DASHBOARD_BIN.exists() else (REPO_ROOT / ".venv" / "bin" / "gopro-dashboard.py")),
 )
 FFPROBE_BIN = os.environ.get("FFPROBE_BIN", "ffprobe")
 DEFAULT_FONT_PATH = os.environ.get("OVERLAY_FONT_PATH", str(STATIC_DIR / "fonts" / "Orbitron-Bold.ttf"))
@@ -246,8 +256,32 @@ JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
 
 
-app = FastAPI(title="GoPro GPX Overlay Studio")
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    _ensure_dirs()
+    if JOB_CLEANUP_ENABLED:
+        threading.Thread(target=_cleanup_loop, name="job-cleanup", daemon=True).start()
+    yield
+
+
+app = FastAPI(title="POVerlay API", lifespan=_lifespan)
+
+ALLOWED_CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get(
+        "CORS_ORIGINS",
+        "http://localhost:3000,http://127.0.0.1:3000",
+    ).split(",")
+    if origin.strip()
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def _safe_filename(name: str) -> str:
@@ -832,16 +866,14 @@ def _process_job(job_id: str) -> None:
     _cleanup_completed_job_live_files(job_dir)
 
 
-@app.on_event("startup")
-def startup() -> None:
-    _ensure_dirs()
-    if JOB_CLEANUP_ENABLED:
-        threading.Thread(target=_cleanup_loop, name="job-cleanup", daemon=True).start()
-
-
 @app.get("/")
-def index() -> FileResponse:
-    return FileResponse(STATIC_DIR / "index.html")
+def api_index() -> dict[str, str]:
+    return {"name": "POVerlay API", "status": "ok"}
+
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok"}
 
 
 @app.get("/api/meta")

@@ -1,0 +1,18 @@
+[Unit]
+Description=POVerlay Next.js web service
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/poverlay
+EnvironmentFile=-/etc/poverlay/poverlay.env
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/env bash -lc 'HOSTNAME=127.0.0.1 PORT=3000 pnpm --filter @poverlay/web start'
+Restart=always
+RestartSec=3
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

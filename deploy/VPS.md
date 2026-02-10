@@ -1,0 +1,81 @@
+# POVerlay VPS Deployment
+
+This deployment model runs two services behind Nginx:
+
+- `poverlay-api` (FastAPI) on `127.0.0.1:8787`
+- `poverlay-web` (Next.js) on `127.0.0.1:3000`
+
+## 1) Install system dependencies
+
+```bash
+sudo apt update
+sudo apt install -y ffmpeg nginx python3 python3-venv python3-pip curl
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt install -y nodejs
+sudo corepack enable
+sudo corepack prepare pnpm@9.15.4 --activate
+```
+
+## 2) Clone and build
+
+```bash
+sudo mkdir -p /opt/poverlay
+sudo chown -R $USER:$USER /opt/poverlay
+git clone <your-repo-url> /opt/poverlay
+cd /opt/poverlay
+./scripts/setup.sh
+pnpm check
+pnpm --filter @poverlay/web build
+```
+
+## 3) Runtime environment
+
+Create `/etc/poverlay/poverlay.env`:
+
+```bash
+sudo mkdir -p /etc/poverlay
+cat <<'ENV' | sudo tee /etc/poverlay/poverlay.env
+API_PROXY_TARGET=http://127.0.0.1:8787
+CORS_ORIGINS=https://your-domain.com,http://localhost:3000,http://127.0.0.1:3000
+JOB_OUTPUT_RETENTION_HOURS=24
+JOB_CLEANUP_INTERVAL_SECONDS=900
+DELETE_INPUTS_ON_COMPLETE=true
+DELETE_WORK_ON_COMPLETE=true
+ENV
+```
+
+## 4) Install systemd services
+
+```bash
+sudo cp deploy/systemd/poverlay-api.service /etc/systemd/system/
+sudo cp deploy/systemd/poverlay-web.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now poverlay-api
+sudo systemctl enable --now poverlay-web
+```
+
+## 5) Configure Nginx
+
+```bash
+sudo cp deploy/nginx/poverlay.conf /etc/nginx/sites-available/poverlay
+sudo ln -sf /etc/nginx/sites-available/poverlay /etc/nginx/sites-enabled/poverlay
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+## 6) (Optional) HTTPS with Let's Encrypt
+
+```bash
+sudo apt install -y certbot python3-certbot-nginx
+sudo certbot --nginx -d your-domain.com
+```
+
+## Operational commands
+
+```bash
+sudo systemctl status poverlay-api poverlay-web
+sudo journalctl -u poverlay-api -f
+sudo journalctl -u poverlay-web -f
+sudo systemctl restart poverlay-api poverlay-web
+```
