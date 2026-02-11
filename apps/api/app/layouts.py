@@ -123,6 +123,26 @@ LAYOUT_STYLES: dict[str, OverlayLayoutStyle] = {
         label="Race Cluster",
         description="Dual-indicator race dashboard with compass heading and stacked performance bars.",
     ),
+    "moto-journey-needle": OverlayLayoutStyle(
+        name="moto-journey-needle",
+        label="Moto Journey Needle",
+        description="Moto-inspired needle dial with brake/throttle bars, journey map stack, and speed trend chart.",
+    ),
+    "moto-journey-dual-bars": OverlayLayoutStyle(
+        name="moto-journey-dual-bars",
+        label="Moto Journey Dual Bars",
+        description="Dual-indicator moto cluster with mirrored control bars and moving journey map stack.",
+    ),
+    "compass-asi-cluster": OverlayLayoutStyle(
+        name="compass-asi-cluster",
+        label="Compass ASI Cluster",
+        description="Heading compass with mirrored ASI gauges and center speed cluster.",
+    ),
+    "power-zone-pro": OverlayLayoutStyle(
+        name="power-zone-pro",
+        label="Power Zone Pro",
+        description="Power-focused telemetry HUD with zone bars, gradient trend chart, and icon-backed metrics.",
+    ),
 }
 
 
@@ -1063,6 +1083,367 @@ def _render_style_race_cluster(
     ]
 
 
+def _render_style_moto_journey_core(
+    width: int,
+    height: int,
+    theme: OverlayTheme,
+    visibility: dict[str, bool],
+    speed_units: str,
+    dial_component: str,
+) -> list[str]:
+    margin = _clamp(int(min(width, height) * 0.02), 24, 72)
+    panel_radius = _clamp(int(min(width, height) * 0.018), 20, 54)
+    sizes = _metric_sizes(height)
+    speed_profile = _speed_scale_profile(speed_units)
+
+    time_w = int(width * 0.24)
+    time_h = int(height * 0.12)
+    time_x = margin
+    time_y = margin
+
+    stats_w = int(width * 0.28)
+    stats_h = int(height * 0.14)
+    stats_x = margin
+    stats_y = time_y + time_h + margin
+
+    dial_w = int(width * 0.30)
+    dial_h = int(height * 0.34)
+    dial_x = margin
+    dial_y = height - dial_h - margin
+
+    bars_w = int(width * 0.31)
+    bars_h = int(height * 0.15)
+    bars_x = dial_x + dial_w + margin
+    bars_y = height - bars_h - margin
+
+    chart_x = bars_x + bars_w + margin
+    chart_y = height - int(height * 0.15) - margin
+    chart_w = width - chart_x - margin
+    chart_h = int(height * 0.15)
+    if chart_w < int(width * 0.18):
+        chart_x = int(width * 0.43)
+        chart_w = width - chart_x - margin
+
+    map_size = int(min(width, height) * 0.18)
+    map_x = width - map_size - margin
+    map_y = margin
+    map_gap = int(margin * 0.55)
+    map_stack_h = (map_size * 2) + map_gap
+
+    gps_w = int(width * 0.24)
+    gps_h = int(height * 0.11)
+    gps_x = width - gps_w - margin
+    gps_y = map_y + map_stack_h + margin
+    if gps_y + gps_h > height - margin:
+        gps_y = height - gps_h - margin
+
+    dial_panel = ""
+    if _is_enabled(visibility, "speed_panel"):
+        dial_size = int(min(dial_w, dial_h) * 0.72)
+        needle = ' needle="1"' if dial_component == "msi" else ""
+        dial_panel = f"""    <composite x=\"{dial_x}\" y=\"{dial_y}\" name=\"moto_journey_dial_panel\">
+        <frame width=\"{dial_w}\" height=\"{dial_h}\" bg=\"{theme.panel_bg}\" cr=\"{panel_radius}\" opacity=\"0.92\">
+            <component type=\"text\" x=\"{int(dial_w * 0.08)}\" y=\"{int(dial_h * 0.10)}\" size=\"{sizes["label"]}\" rgb=\"{theme.accent_rgb}\">MOTO SPEED</component>
+            <composite x=\"{int((dial_w - dial_size) / 2)}\" y=\"{int(dial_h * 0.17)}\">
+                <component type=\"{dial_component}\" metric=\"speed\" units=\"{speed_units}\" size=\"{dial_size}\" textsize=\"{int(sizes["label"] * 0.9)}\" yellow=\"{speed_profile["yellow"]}\" end=\"{speed_profile["end"]}\" outline=\"3\"{needle}/>
+            </composite>
+            <component type=\"metric\" x=\"{int(dial_w * 0.50)}\" y=\"{int(dial_h * 0.72)}\" metric=\"speed\" units=\"speed\" dp=\"0\" size=\"{int(sizes["metric"] * 1.15)}\" align=\"centre\" rgb=\"{theme.speed_rgb}\" outline=\"0,0,0\" outline_width=\"3\"/>
+            <component type=\"metric_unit\" x=\"{int(dial_w * 0.50)}\" y=\"{int(dial_h * 0.85)}\" metric=\"speed\" units=\"speed\" size=\"{sizes["label"]}\" align=\"centre\" rgb=\"{theme.accent_rgb}\">{{:~c}}</component>
+        </frame>
+    </composite>"""
+
+    bars_panel = ""
+    if _is_enabled(visibility, "speed_panel"):
+        bars_panel = f"""    <composite x=\"{bars_x}\" y=\"{bars_y}\" name=\"moto_control_bars\">
+        <frame width=\"{bars_w}\" height=\"{bars_h}\" bg=\"{theme.panel_bg_alt}\" cr=\"{panel_radius}\" opacity=\"0.90\">
+            <component type=\"text\" x=\"{int(bars_w * 0.07)}\" y=\"{int(bars_h * 0.10)}\" size=\"{sizes["label"]}\" rgb=\"{theme.accent_rgb}\">BRAKE / THROTTLE</component>
+            <composite x=\"{int(bars_w * 0.07)}\" y=\"{int(bars_h * 0.40)}\">
+                <component type=\"bar\" width=\"{int(bars_w * 0.40)}\" min=\"-3\" max=\"0\" height=\"{int(bars_h * 0.34)}\" metric=\"accel\" outline-width=\"2\" bar=\"255,157,157\" h-neg=\"255,157,157\" h-pos=\"255,157,157\" zero=\"0,0,0,0\"/>
+            </composite>
+            <composite x=\"{int(bars_w * 0.53)}\" y=\"{int(bars_h * 0.40)}\">
+                <component type=\"bar\" width=\"{int(bars_w * 0.40)}\" min=\"0\" max=\"3\" height=\"{int(bars_h * 0.34)}\" metric=\"accel\" outline-width=\"2\" bar=\"157,157,255\" h-neg=\"157,157,255\" h-pos=\"157,157,255\" zero=\"0,0,0,0\"/>
+            </composite>
+        </frame>
+    </composite>"""
+
+    chart_panel = ""
+    if _is_enabled(visibility, "speed_panel"):
+        chart_panel = f"""    <composite x=\"{chart_x}\" y=\"{chart_y}\" name=\"moto_speed_chart\">
+        <frame width=\"{chart_w}\" height=\"{chart_h}\" bg=\"{theme.panel_bg}\" cr=\"{panel_radius}\" opacity=\"0.88\">
+            <component type=\"chart\" x=\"{int(chart_w * 0.04)}\" y=\"{int(chart_h * 0.18)}\" height=\"{int(chart_h * 0.62)}\" metric=\"speed\" units=\"{speed_units}\" samples=\"300\" values=\"false\" fill=\"58,188,255,160\" line=\"255,255,255,180\" bg=\"255,255,255,20\" text=\"255,255,255,200\"/>
+        </frame>
+    </composite>"""
+
+    map_stack = ""
+    if _is_enabled(visibility, "route_maps"):
+        map_stack = f"""    <composite x=\"{map_x}\" y=\"{map_y}\" name=\"journey_map_stack\">
+        <frame width=\"{map_size}\" height=\"{map_size}\" bg=\"{theme.panel_bg_alt}\" cr=\"{int(panel_radius * 0.9)}\" opacity=\"0.72\">
+            <component type=\"moving_map\" name=\"moving_map\" size=\"{map_size}\" zoom=\"15\" corner_radius=\"{int(panel_radius * 0.9)}\"/>
+        </frame>
+        <frame y=\"{map_size + map_gap}\" width=\"{map_size}\" height=\"{map_size}\" bg=\"{theme.panel_bg_alt}\" cr=\"{int(panel_radius * 0.9)}\" opacity=\"0.72\">
+            <component type=\"moving_journey_map\" size=\"{map_size}\" zoom=\"14\"/>
+        </frame>
+    </composite>"""
+
+    return [
+        _time_panel(theme, time_x, time_y, time_w, time_h, panel_radius, sizes["label"], sizes["time"], visibility),
+        _stats_panel(
+            theme,
+            stats_x,
+            stats_y,
+            stats_w,
+            stats_h,
+            panel_radius,
+            sizes["label"],
+            sizes["metric"],
+            sizes["small_metric"],
+            visibility,
+        ),
+        _gps_panel(
+            theme,
+            gps_x,
+            gps_y,
+            gps_w,
+            gps_h,
+            panel_radius,
+            sizes["label"],
+            sizes["small_metric"],
+            visibility,
+        ),
+        dial_panel,
+        bars_panel,
+        chart_panel,
+        map_stack,
+    ]
+
+
+def _render_style_moto_journey_needle(
+    width: int,
+    height: int,
+    theme: OverlayTheme,
+    visibility: dict[str, bool],
+    speed_units: str,
+) -> list[str]:
+    return _render_style_moto_journey_core(width, height, theme, visibility, speed_units, dial_component="msi")
+
+
+def _render_style_moto_journey_dual_bars(
+    width: int,
+    height: int,
+    theme: OverlayTheme,
+    visibility: dict[str, bool],
+    speed_units: str,
+) -> list[str]:
+    return _render_style_moto_journey_core(width, height, theme, visibility, speed_units, dial_component="msi2")
+
+
+def _render_style_compass_asi_cluster(
+    width: int,
+    height: int,
+    theme: OverlayTheme,
+    visibility: dict[str, bool],
+    speed_units: str,
+) -> list[str]:
+    margin = _clamp(int(min(width, height) * 0.02), 24, 72)
+    panel_radius = _clamp(int(min(width, height) * 0.017), 19, 52)
+    sizes = _metric_sizes(height)
+
+    time_w = int(width * 0.22)
+    time_h = int(height * 0.11)
+    time_x = margin
+    time_y = margin
+
+    stats_w = int(width * 0.34)
+    stats_h = int(height * 0.13)
+    stats_x = width - stats_w - margin
+    stats_y = margin
+
+    cluster_w = int(width * 0.42)
+    cluster_h = int(height * 0.28)
+    cluster_x = int((width - cluster_w) / 2)
+    cluster_y = height - cluster_h - margin
+
+    compass_w = int(width * 0.23)
+    compass_h = int(height * 0.20)
+    compass_x = margin
+    compass_y = int(height * 0.38)
+
+    gps_w = int(width * 0.26)
+    gps_h = int(height * 0.11)
+    gps_x = int((width - gps_w) / 2)
+    gps_y = margin
+
+    map_size = int(min(width, height) * 0.17)
+    moving_x = width - map_size - margin
+    moving_y = int(height * 0.38)
+    journey_x = moving_x - map_size - margin
+    journey_y = moving_y
+
+    cluster_panel = ""
+    if _is_enabled(visibility, "speed_panel"):
+        cluster_panel = f"""    <composite x=\"{cluster_x}\" y=\"{cluster_y}\" name=\"compass_asi_speed_cluster\">
+        <frame width=\"{cluster_w}\" height=\"{cluster_h}\" bg=\"{theme.panel_bg}\" cr=\"{panel_radius}\" opacity=\"0.92\">
+            <component type=\"text\" x=\"{int(cluster_w * 0.08)}\" y=\"{int(cluster_h * 0.10)}\" size=\"{sizes["label"]}\" rgb=\"{theme.accent_rgb}\">ASI CLUSTER</component>
+            <composite x=\"{int(cluster_w * 0.12)}\" y=\"{int(cluster_h * 0.28)}\">
+                <component type=\"asi\" vs0=\"10\"/>
+            </composite>
+            <composite x=\"{int(cluster_w * 0.56)}\" y=\"{int(cluster_h * 0.28)}\">
+                <component type=\"asi\" vs0=\"10\" rotate=\"180\"/>
+            </composite>
+            <component type=\"metric\" x=\"{int(cluster_w * 0.50)}\" y=\"{int(cluster_h * 0.70)}\" metric=\"speed\" units=\"speed\" dp=\"0\" size=\"{int(sizes["metric"] * 1.25)}\" align=\"centre\" rgb=\"{theme.speed_rgb}\" outline=\"0,0,0\" outline_width=\"3\"/>
+            <component type=\"metric_unit\" x=\"{int(cluster_w * 0.50)}\" y=\"{int(cluster_h * 0.84)}\" metric=\"speed\" units=\"speed\" size=\"{sizes["label"]}\" align=\"centre\" rgb=\"{theme.accent_rgb}\">{{:~c}}</component>
+        </frame>
+    </composite>"""
+
+    compass_panel = ""
+    if _is_enabled(visibility, "gps_panel"):
+        compass_size = int(min(compass_w, compass_h) * 0.78)
+        compass_panel = f"""    <composite x=\"{compass_x}\" y=\"{compass_y}\" name=\"compass_heading_panel\">
+        <frame width=\"{compass_w}\" height=\"{compass_h}\" bg=\"{theme.panel_bg_alt}\" cr=\"{panel_radius}\" opacity=\"0.89\">
+            <component type=\"text\" x=\"{int(compass_w * 0.08)}\" y=\"{int(compass_h * 0.10)}\" size=\"{sizes["label"]}\" rgb=\"{theme.accent_rgb}\">HEADING</component>
+            <composite x=\"{int((compass_w - compass_size) / 2)}\" y=\"{int(compass_h * 0.18)}\">
+                <component type=\"compass\" size=\"{compass_size}\" bg=\"0,0,0,0\" fg=\"{theme.text_rgb}\" text=\"{theme.speed_rgb}\" textsize=\"{int(sizes["label"] * 0.9)}\"/>
+            </composite>
+        </frame>
+    </composite>"""
+
+    return [
+        _time_panel(theme, time_x, time_y, time_w, time_h, panel_radius, sizes["label"], sizes["time"], visibility),
+        _stats_panel(
+            theme,
+            stats_x,
+            stats_y,
+            stats_w,
+            stats_h,
+            panel_radius,
+            sizes["label"],
+            sizes["metric"],
+            sizes["small_metric"],
+            visibility,
+        ),
+        _gps_panel(
+            theme,
+            gps_x,
+            gps_y,
+            gps_w,
+            gps_h,
+            panel_radius,
+            sizes["label"],
+            sizes["small_metric"],
+            visibility,
+        ),
+        cluster_panel,
+        compass_panel,
+        _map_components(
+            [
+                {"type": "moving_map", "x": moving_x, "y": moving_y, "size": map_size, "zoom": 16},
+                {"type": "journey_map", "x": journey_x, "y": journey_y, "size": map_size},
+            ],
+            panel_radius,
+            visibility,
+        ),
+    ]
+
+
+def _render_style_power_zone_pro(
+    width: int,
+    height: int,
+    theme: OverlayTheme,
+    visibility: dict[str, bool],
+    speed_units: str,
+) -> list[str]:
+    margin = _clamp(int(min(width, height) * 0.02), 24, 72)
+    panel_radius = _clamp(int(min(width, height) * 0.018), 20, 54)
+    sizes = _metric_sizes(height)
+
+    time_w = int(width * 0.22)
+    time_h = int(height * 0.11)
+    time_x = margin
+    time_y = margin
+
+    stats_w = int(width * 0.30)
+    stats_h = int(height * 0.13)
+    stats_x = int((width - stats_w) / 2)
+    stats_y = margin
+
+    gps_w = int(width * 0.24)
+    gps_h = int(height * 0.11)
+    gps_x = width - gps_w - margin
+    gps_y = margin
+
+    maps_size = int(min(width, height) * 0.18)
+    moving_x = width - maps_size - margin
+    moving_y = gps_y + gps_h + margin
+    journey_x = moving_x - maps_size - margin
+    journey_y = moving_y
+
+    power_w = width - (margin * 2)
+    power_h = int(height * 0.30)
+    power_x = margin
+    power_y = height - power_h - margin
+
+    power_panel = ""
+    if _is_enabled(visibility, "speed_panel"):
+        power_panel = f"""    <composite x=\"{power_x}\" y=\"{power_y}\" name=\"power_zone_panel\">
+        <frame width=\"{power_w}\" height=\"{power_h}\" bg=\"{theme.panel_bg}\" cr=\"{panel_radius}\" opacity=\"0.92\">
+            <component type=\"text\" x=\"{int(power_w * 0.03)}\" y=\"{int(power_h * 0.09)}\" size=\"{sizes["label"]}\" rgb=\"{theme.accent_rgb}\">POWER ZONE PRO</component>
+            <component type=\"metric\" x=\"{int(power_w * 0.03)}\" y=\"{int(power_h * 0.28)}\" metric=\"speed\" units=\"speed\" dp=\"0\" size=\"{int(sizes["speed"] * 0.68)}\" rgb=\"{theme.speed_rgb}\" outline=\"0,0,0\" outline_width=\"3\"/>
+            <component type=\"metric_unit\" x=\"{int(power_w * 0.16)}\" y=\"{int(power_h * 0.18)}\" metric=\"speed\" units=\"speed\" size=\"{sizes["label"]}\" rgb=\"{theme.accent_rgb}\">{{:~c}}</component>
+            <component type=\"icon\" x=\"{int(power_w * 0.03)}\" y=\"{int(power_h * 0.74)}\" file=\"mountain.png\" size=\"{int(sizes["small_metric"] * 1.6)}\"/>
+            <component type=\"metric\" x=\"{int(power_w * 0.10)}\" y=\"{int(power_h * 0.77)}\" metric=\"alt\" units=\"alt\" dp=\"0\" size=\"{sizes["small_metric"]}\" rgb=\"{theme.text_rgb}\"/>
+            <component type=\"icon\" x=\"{int(power_w * 0.22)}\" y=\"{int(power_h * 0.74)}\" file=\"slope-triangle.png\" size=\"{int(sizes["small_metric"] * 1.6)}\"/>
+            <component type=\"metric\" x=\"{int(power_w * 0.29)}\" y=\"{int(power_h * 0.77)}\" metric=\"gradient\" dp=\"1\" size=\"{sizes["small_metric"]}\" rgb=\"{theme.text_rgb}\"/>
+            <component type=\"gradient_chart\" x=\"{int(power_w * 0.36)}\" y=\"{int(power_h * 0.22)}\"/>
+            <component type=\"icon\" x=\"{int(power_w * 0.64)}\" y=\"{int(power_h * 0.22)}\" file=\"heartbeat.png\" size=\"{int(sizes["small_metric"] * 1.7)}\"/>
+            <component type=\"metric\" x=\"{int(power_w * 0.71)}\" y=\"{int(power_h * 0.25)}\" metric=\"hr\" dp=\"0\" size=\"{sizes["small_metric"]}\" rgb=\"{theme.text_rgb}\"/>
+            <composite x=\"{int(power_w * 0.64)}\" y=\"{int(power_h * 0.38)}\">
+                <component type=\"zone-bar\" width=\"{int(power_w * 0.32)}\" height=\"{int(power_h * 0.16)}\" metric=\"hr\" max=\"200\" z1=\"130\" z2=\"163\" z3=\"183\" z0-rgb=\"52,122,235,200\" z1-rgb=\"67,235,52,200\" z2-rgb=\"240,232,19,200\" z3-rgb=\"207,19,2,200\" outline=\"255,255,255,150\" outline-width=\"2\"/>
+            </composite>
+            <component type=\"icon\" x=\"{int(power_w * 0.64)}\" y=\"{int(power_h * 0.58)}\" file=\"power.png\" size=\"{int(sizes["small_metric"] * 1.7)}\"/>
+            <component type=\"metric\" x=\"{int(power_w * 0.71)}\" y=\"{int(power_h * 0.61)}\" metric=\"power\" dp=\"0\" size=\"{sizes["small_metric"]}\" rgb=\"{theme.text_rgb}\"/>
+            <composite x=\"{int(power_w * 0.64)}\" y=\"{int(power_h * 0.74)}\">
+                <component type=\"zone-bar\" width=\"{int(power_w * 0.32)}\" height=\"{int(power_h * 0.16)}\" metric=\"power\" max=\"600\" z1=\"130\" z2=\"160\" z3=\"200\" z0-rgb=\"67,235,52,200\" z1-rgb=\"67,235,52,200\" z2-rgb=\"240,232,19,200\" z3-rgb=\"207,19,2,200\" outline=\"255,255,255,150\" outline-width=\"2\"/>
+            </composite>
+        </frame>
+    </composite>"""
+
+    return [
+        _time_panel(theme, time_x, time_y, time_w, time_h, panel_radius, sizes["label"], sizes["time"], visibility),
+        _stats_panel(
+            theme,
+            stats_x,
+            stats_y,
+            stats_w,
+            stats_h,
+            panel_radius,
+            sizes["label"],
+            sizes["metric"],
+            sizes["small_metric"],
+            visibility,
+        ),
+        _gps_panel(
+            theme,
+            gps_x,
+            gps_y,
+            gps_w,
+            gps_h,
+            panel_radius,
+            sizes["label"],
+            sizes["small_metric"],
+            visibility,
+        ),
+        power_panel,
+        _map_components(
+            [
+                {"type": "moving_map", "x": moving_x, "y": moving_y, "size": maps_size, "zoom": 16},
+                {"type": "journey_map", "x": journey_x, "y": journey_y, "size": maps_size},
+            ],
+            panel_radius,
+            visibility,
+        ),
+    ]
+
+
 STYLE_RENDERERS = {
     "summit-grid": lambda w, h, t, v, _s: _render_style_summit_grid(w, h, t, v),
     "velocity-rail": lambda w, h, t, v, _s: _render_style_velocity_rail(w, h, t, v),
@@ -1071,6 +1452,10 @@ STYLE_RENDERERS = {
     "moto-dial-bars": _render_style_moto_dial_bars,
     "telemetry-hud": _render_style_telemetry_hud,
     "race-cluster": _render_style_race_cluster,
+    "moto-journey-needle": _render_style_moto_journey_needle,
+    "moto-journey-dual-bars": _render_style_moto_journey_dual_bars,
+    "compass-asi-cluster": _render_style_compass_asi_cluster,
+    "power-zone-pro": _render_style_power_zone_pro,
 }
 
 
