@@ -4,6 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 source scripts/load-env.sh
 
+pnpm install --frozen-lockfile
 pnpm check:web
 pnpm build
 
