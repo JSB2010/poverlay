@@ -24,3 +24,5 @@ python3 -m pytest apps/api/tests -q
 - Main ASGI entrypoint: `app.main:app`
 - Local runtime data defaults to `data/` at repository root.
 - Override data root with `POVERLAY_DATA_DIR` if needed.
+- Runtime config is centralized/validated in `apps/api/app/config.py`.
+- Firestore and R2 data contracts are defined in `apps/api/app/contracts.py`.

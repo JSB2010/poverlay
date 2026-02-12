@@ -1,7 +1,9 @@
 import type { Metadata } from "next";
 import { Inter, Sora } from "next/font/google";
+import { AuthProvider } from "@/components/auth-provider";
 import { ThemeProvider } from "@/components/theme-provider";
 import { Navbar } from "@/components/navbar";
+import { PUBLIC_WEB_CONFIG } from "@/lib/public-config";
 import "./globals.css";
 
 const display = Sora({
@@ -17,7 +19,7 @@ const body = Inter({
 });
 
 export const metadata: Metadata = {
-  metadataBase: new URL(process.env.NEXT_PUBLIC_SITE_URL || 'https://poverlay.com'),
+  metadataBase: new URL(PUBLIC_WEB_CONFIG.siteUrl),
   title: {
     default: "POVerlay — GoPro Telemetry Overlay Studio",
     template: "%s | POVerlay"
@@ -119,7 +121,7 @@ export default function RootLayout({
       priceCurrency: 'USD',
     },
     description: 'Professional GoPro telemetry overlay rendering platform. Upload GPX tracks and GoPro clips to create stunning overlays with real-time speed, altitude, maps, and telemetry data.',
-    url: process.env.NEXT_PUBLIC_SITE_URL || 'https://poverlay.com',
+    url: PUBLIC_WEB_CONFIG.siteUrl,
     image: '/logo.png',
     featureList: [
       'GoPro telemetry overlay rendering',
@@ -144,8 +146,10 @@ export default function RootLayout({
       </head>
       <body>
         <ThemeProvider>
-          <Navbar />
-          {children}
+          <AuthProvider>
+            <Navbar />
+            {children}
+          </AuthProvider>
         </ThemeProvider>
       </body>
     </html>

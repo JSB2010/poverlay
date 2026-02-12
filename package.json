@@ -3,8 +3,8 @@
   "private": true,
   "packageManager": "pnpm@9.15.4",
   "scripts": {
-    "dev": "concurrently -k -n WEB,API -c cyan,orange \"pnpm --filter @poverlay/web dev\" \"./scripts/run-api.sh\"",
-    "dev:web": "pnpm --filter @poverlay/web dev",
+    "dev": "concurrently -k -n WEB,API -c cyan,orange \"./scripts/run-web.sh\" \"./scripts/run-api.sh\"",
+    "dev:web": "./scripts/run-web.sh",
     "dev:api": "./scripts/run-api.sh",
     "build": "pnpm --filter @poverlay/web build && ./scripts/sync-next-standalone.sh",
     "start:web": "pnpm --filter @poverlay/web start",
