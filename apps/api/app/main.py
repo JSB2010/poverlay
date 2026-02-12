@@ -21,6 +21,7 @@ from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.background import BackgroundTask
 
+from app.config import load_runtime_config
 from app.gpx_tools import shift_gpx_timestamps
 from app.layouts import (
     COMPONENT_OPTIONS,
@@ -42,44 +43,21 @@ def _discover_repo_root() -> Path:
 
 SERVICE_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = _discover_repo_root()
-DATA_DIR = Path(os.environ.get("POVERLAY_DATA_DIR", str(REPO_ROOT / "data")))
+RUNTIME_CONFIG = load_runtime_config(repo_root=REPO_ROOT, service_root=SERVICE_ROOT)
+DATA_DIR = RUNTIME_CONFIG.data_dir
 JOBS_DIR = DATA_DIR / "jobs"
-STATIC_DIR = SERVICE_ROOT / "app" / "static"
 CONFIG_DIR = DATA_DIR / "gopro-config"
 FFMPEG_PROFILES_FILE = CONFIG_DIR / "ffmpeg-profiles.json"
 
-LOCAL_DASHBOARD_BIN = REPO_ROOT / "scripts" / "gopro-dashboard-local.sh"
-GOPRO_DASHBOARD_BIN = os.environ.get(
-    "GOPRO_DASHBOARD_BIN",
-    str(LOCAL_DASHBOARD_BIN if LOCAL_DASHBOARD_BIN.exists() else (REPO_ROOT / ".venv" / "bin" / "gopro-dashboard.py")),
-)
-FFPROBE_BIN = os.environ.get("FFPROBE_BIN", "ffprobe")
-DEFAULT_FONT_PATH = os.environ.get("OVERLAY_FONT_PATH", str(STATIC_DIR / "fonts" / "Orbitron-Bold.ttf"))
+GOPRO_DASHBOARD_BIN = RUNTIME_CONFIG.gopro_dashboard_bin
+FFPROBE_BIN = RUNTIME_CONFIG.ffprobe_bin
+DEFAULT_FONT_PATH = RUNTIME_CONFIG.overlay_font_path
 
-
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _env_float(name: str, default: float, minimum: float) -> float:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        value = float(raw)
-    except ValueError:
-        return default
-    return max(minimum, value)
-
-
-JOB_CLEANUP_ENABLED = _env_bool("JOB_CLEANUP_ENABLED", True)
-JOB_CLEANUP_INTERVAL_SECONDS = int(_env_float("JOB_CLEANUP_INTERVAL_SECONDS", 900.0, 60.0))
-JOB_OUTPUT_RETENTION_HOURS = _env_float("JOB_OUTPUT_RETENTION_HOURS", 24.0, 1.0)
-DELETE_INPUTS_ON_COMPLETE = _env_bool("DELETE_INPUTS_ON_COMPLETE", True)
-DELETE_WORK_ON_COMPLETE = _env_bool("DELETE_WORK_ON_COMPLETE", True)
+JOB_CLEANUP_ENABLED = RUNTIME_CONFIG.job_cleanup_enabled
+JOB_CLEANUP_INTERVAL_SECONDS = RUNTIME_CONFIG.job_cleanup_interval_seconds
+JOB_OUTPUT_RETENTION_HOURS = RUNTIME_CONFIG.job_output_retention_hours
+DELETE_INPUTS_ON_COMPLETE = RUNTIME_CONFIG.delete_inputs_on_complete
+DELETE_WORK_ON_COMPLETE = RUNTIME_CONFIG.delete_work_on_complete
 JOB_EXPIRY_MARKER_FILE = ".expires-at"
 
 ALLOWED_UNITS_SPEED = {"kph", "mph", "mps", "knots"}
@@ -254,13 +232,10 @@ else:
 TERMINAL_JOB_STATUSES = {"completed", "completed_with_errors", "failed"}
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
-FIREBASE_AUTH_ENABLED = _env_bool("FIREBASE_AUTH_ENABLED", True)
-FIREBASE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID", "").strip()
-FIREBASE_CREDENTIALS_JSON = os.environ.get("FIREBASE_CREDENTIALS_JSON", "").strip()
-FIREBASE_CREDENTIALS_PATH = os.environ.get(
-    "FIREBASE_CREDENTIALS_PATH",
-    os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", ""),
-).strip()
+FIREBASE_AUTH_ENABLED = RUNTIME_CONFIG.firebase.auth_enabled
+FIREBASE_PROJECT_ID = (RUNTIME_CONFIG.firebase.project_id or "").strip()
+FIREBASE_CREDENTIALS_JSON = (RUNTIME_CONFIG.firebase.credentials_json or "").strip()
+FIREBASE_CREDENTIALS_PATH = (RUNTIME_CONFIG.firebase.credentials_path or "").strip()
 _FIREBASE_INIT_LOCK = threading.Lock()
 _FIREBASE_AUTH_MODULE: Any | None = None
 
@@ -275,14 +250,7 @@ async def _lifespan(_app: FastAPI):
 
 app = FastAPI(title="POVerlay API", lifespan=_lifespan)
 
-ALLOWED_CORS_ORIGINS = [
-    origin.strip()
-    for origin in os.environ.get(
-        "CORS_ORIGINS",
-        "http://localhost:3000,http://127.0.0.1:3000",
-    ).split(",")
-    if origin.strip()
-]
+ALLOWED_CORS_ORIGINS = list(RUNTIME_CONFIG.cors_origins)
 
 app.add_middleware(
     CORSMiddleware,

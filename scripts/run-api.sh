@@ -2,6 +2,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+source scripts/load-env.sh
 
 if [[ ! -x .venv/bin/uvicorn ]]; then
   echo "Environment not ready. Run ./scripts/setup.sh first." >&2

@@ -79,25 +79,26 @@ Notes:
 
 ## Environment variables
 
-Backend:
+Use one centralized env file at repo root:
 
-- `GOPRO_DASHBOARD_BIN`
-- `FFPROBE_BIN`
-- `OVERLAY_FONT_PATH`
-- `CORS_ORIGINS`
-- `JOB_OUTPUT_RETENTION_HOURS`
-- `JOB_CLEANUP_INTERVAL_SECONDS`
-- `JOB_CLEANUP_ENABLED`
-- `DELETE_INPUTS_ON_COMPLETE`
-- `DELETE_WORK_ON_COMPLETE`
+```bash
+cp .env.example .env
+```
 
-Frontend:
+The root template includes:
 
-- `NEXT_PUBLIC_API_BASE` (optional; direct browser API base)
-- `API_PROXY_TARGET` (used by Next rewrite for `/api/*`, default `http://127.0.0.1:8787`)
-- `NEXT_PROXY_CLIENT_MAX_BODY_SIZE` (optional; Next proxy upload limit, default `1024mb`)
+- App URLs/runtime: `WEB_BASE_URL`, `API_BASE_URL`, `NEXT_PUBLIC_SITE_URL`, CORS + job cleanup settings
+- Firebase: client SDK keys + admin credentials (`FIREBASE_*`, `NEXT_PUBLIC_FIREBASE_*`)
+- Firestore: project/database/collection names (`FIRESTORE_*`)
+- Cloudflare R2: account/bucket/credentials (`R2_*`)
+- Brevo: notifications + sender/template settings (`BREVO_*`)
 
-See `apps/web/.env.example`.
+Config validation is fail-fast:
+
+- API startup validates enabled integrations in `apps/api/app/config.py`
+- Web startup validates public Firebase env in `apps/web/lib/public-config.ts`
+
+Use `./scripts/run.sh`, `./scripts/run-web.sh`, or `./scripts/run-api.sh` so root `.env` is loaded automatically.
 
 ## VPS deployment
 

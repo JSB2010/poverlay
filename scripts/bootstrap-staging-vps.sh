@@ -50,10 +50,14 @@ echo "==> Ensuring staging environment file"
 sudo mkdir -p "$(dirname "${ENV_FILE}")"
 if ! sudo test -f "${ENV_FILE}"; then
   cat <<ENV | sudo tee "${ENV_FILE}" >/dev/null
+WEB_BASE_URL=https://${DOMAIN}
+API_BASE_URL=https://${DOMAIN}/api
+NEXT_PUBLIC_SITE_URL=https://${DOMAIN}
 API_PROXY_TARGET=http://127.0.0.1:${API_PORT}
 CORS_ORIGINS=https://poverlay.com,https://${DOMAIN},http://localhost:${WEB_PORT},http://127.0.0.1:${WEB_PORT}
 JOB_OUTPUT_RETENTION_HOURS=24
 JOB_CLEANUP_INTERVAL_SECONDS=900
+JOB_CLEANUP_ENABLED=true
 DELETE_INPUTS_ON_COMPLETE=true
 DELETE_WORK_ON_COMPLETE=true
 ENV

@@ -1,6 +1,7 @@
 "use client";
 
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { PUBLIC_WEB_CONFIG } from "@/lib/public-config";
 
 type ThemeOption = {
   id: string;
@@ -88,7 +89,7 @@ type FormState = {
   fixed_fps: string;
 };
 
-const CONFIGURED_API_BASE = (process.env.NEXT_PUBLIC_API_BASE ?? "").replace(/\/+$/, "");
+const CONFIGURED_API_BASE = PUBLIC_WEB_CONFIG.apiBase;
 
 const TERMINAL_STATES = new Set(["completed", "completed_with_errors", "failed"]);
 

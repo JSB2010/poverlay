@@ -29,15 +29,35 @@ pnpm check
 
 ## 3) Runtime environment
 
-Create `/etc/poverlay/poverlay.env`:
+Use the centralized root env template, then install it as the systemd env file:
 
 ```bash
+cd /opt/poverlay
+cp .env.example .env
+
+# Edit `.env` with production values for Firebase/Firestore/R2/Brevo.
+# Keep integration toggles false until credentials are ready.
+#   FIREBASE_AUTH_ENABLED=true
+#   FIRESTORE_ENABLED=true
+#   R2_UPLOAD_ENABLED=true
+#   BREVO_NOTIFICATIONS_ENABLED=true
+
 sudo mkdir -p /etc/poverlay
-cat <<'ENV' | sudo tee /etc/poverlay/poverlay.env
+cat .env | sudo tee /etc/poverlay/poverlay.env >/dev/null
+```
+
+Minimum baseline variables to set for VPS:
+
+```bash
+cat <<'ENV' | sudo tee -a /etc/poverlay/poverlay.env >/dev/null
+WEB_BASE_URL=https://your-domain.com
+API_BASE_URL=https://your-domain.com/api
+NEXT_PUBLIC_SITE_URL=https://your-domain.com
 API_PROXY_TARGET=http://127.0.0.1:8787
 CORS_ORIGINS=https://your-domain.com,http://localhost:3000,http://127.0.0.1:3000
 JOB_OUTPUT_RETENTION_HOURS=24
 JOB_CLEANUP_INTERVAL_SECONDS=900
+JOB_CLEANUP_ENABLED=true
 DELETE_INPUTS_ON_COMPLETE=true
 DELETE_WORK_ON_COMPLETE=true
 ENV

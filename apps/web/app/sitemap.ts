@@ -1,7 +1,8 @@
 import { MetadataRoute } from 'next';
+import { PUBLIC_WEB_CONFIG } from '@/lib/public-config';
 
 export default function sitemap(): MetadataRoute.Sitemap {
-  const baseUrl = process.env.NEXT_PUBLIC_SITE_URL || 'https://poverlay.com';
+  const baseUrl = PUBLIC_WEB_CONFIG.siteUrl;
 
   return [
     {
@@ -18,4 +19,3 @@ export default function sitemap(): MetadataRoute.Sitemap {
     },
   ];
 }
-

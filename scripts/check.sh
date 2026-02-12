@@ -2,6 +2,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+source scripts/load-env.sh
 
 pnpm check:web
 pnpm build
