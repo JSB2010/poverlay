@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import json
+import logging
 import os
 import queue
 from pathlib import Path
@@ -21,6 +22,7 @@ import zipfile
 from fastapi import Body, Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
 from app.config import load_runtime_config
@@ -243,6 +245,7 @@ FIREBASE_CREDENTIALS_PATH = (RUNTIME_CONFIG.firebase.credentials_path or "").str
 FIRESTORE_ENABLED = RUNTIME_CONFIG.firestore.enabled
 FIRESTORE_PROJECT_ID = (RUNTIME_CONFIG.firestore.project_id or "").strip()
 FIRESTORE_DATABASE_ID = RUNTIME_CONFIG.firestore.database_id
+FIRESTORE_USERS_COLLECTION = RUNTIME_CONFIG.firestore.users_collection
 FIRESTORE_JOBS_COLLECTION = RUNTIME_CONFIG.firestore.jobs_collection
 R2_UPLOAD_ENABLED = RUNTIME_CONFIG.r2.upload_enabled
 R2_BUCKET = (RUNTIME_CONFIG.r2.bucket or "").strip()
@@ -258,16 +261,25 @@ STATE_RETRY_ATTEMPTS = 3
 STATE_RETRY_DELAY_SECONDS = 0.5
 UPLOAD_RETRY_ATTEMPTS = 3
 UPLOAD_RETRY_DELAY_SECONDS = 1.0
+BREVO_NOTIFICATIONS_ENABLED = RUNTIME_CONFIG.brevo.notifications_enabled
+BREVO_API_KEY = (RUNTIME_CONFIG.brevo.api_key or "").strip()
+BREVO_SENDER_EMAIL = (RUNTIME_CONFIG.brevo.sender_email or "").strip()
+BREVO_SENDER_NAME = RUNTIME_CONFIG.brevo.sender_name
+BREVO_TEMPLATE_RENDER_COMPLETE_ID = (RUNTIME_CONFIG.brevo.template_render_complete_id or "").strip()
+WEB_BASE_URL = RUNTIME_CONFIG.web_base_url.rstrip("/")
 _FIREBASE_INIT_LOCK = threading.Lock()
 _FIREBASE_AUTH_MODULE: Any | None = None
 _FIRESTORE_CLIENT_LOCK = threading.Lock()
 _FIRESTORE_CLIENT: Any | None = None
 _R2_CLIENT_LOCK = threading.Lock()
 _R2_CLIENT: Any | None = None
+_BREVO_CLIENT_LOCK = threading.Lock()
+_BREVO_CLIENT: Any | None = None
 _QUEUE_WORKER_LOCK = threading.Lock()
 _QUEUE_WORKER_STARTED = False
 JOB_QUEUE: queue.Queue[str] = queue.Queue()
 ENQUEUED_JOBS: set[str] = set()
+LOGGER = logging.getLogger("poverlay.api")
 
 
 @asynccontextmanager
@@ -291,6 +303,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+class UserSettingsUpdate(BaseModel):
+    notifications_enabled: bool
 
 
 def _safe_filename(name: str) -> str:
@@ -394,6 +410,264 @@ def _firestore_jobs_collection() -> Any:
                 _FIRESTORE_CLIENT = firestore.Client(**client_kwargs)
 
     return _FIRESTORE_CLIENT.collection(FIRESTORE_JOBS_COLLECTION)
+
+
+def _firestore_users_collection() -> Any:
+    if not FIRESTORE_ENABLED:
+        raise RuntimeError("Firestore-backed user state is disabled")
+    global _FIRESTORE_CLIENT
+    if _FIRESTORE_CLIENT is None:
+        _firestore_jobs_collection()
+    assert _FIRESTORE_CLIENT is not None
+    return _FIRESTORE_CLIENT.collection(FIRESTORE_USERS_COLLECTION)
+
+
+def _load_or_create_user_profile(uid: str) -> dict[str, Any]:
+    if not FIRESTORE_ENABLED:
+        return {"uid": uid, "notifications_enabled": True}
+
+    def _read() -> Any:
+        return _firestore_users_collection().document(uid).get()
+
+    snapshot = _retry_operation(
+        f"Loading user profile {uid}",
+        _read,
+        attempts=STATE_RETRY_ATTEMPTS,
+        delay_seconds=STATE_RETRY_DELAY_SECONDS,
+    )
+
+    now = _utc_now()
+    if not snapshot.exists:
+        profile: dict[str, Any] = {
+            "uid": uid,
+            "notifications_enabled": True,
+            "created_at": now,
+            "updated_at": now,
+        }
+
+        def _create() -> None:
+            _firestore_users_collection().document(uid).set(profile)
+
+        _retry_operation(
+            f"Creating user profile {uid}",
+            _create,
+            attempts=STATE_RETRY_ATTEMPTS,
+            delay_seconds=STATE_RETRY_DELAY_SECONDS,
+        )
+        return profile
+
+    profile = snapshot.to_dict() or {}
+    profile.setdefault("uid", uid)
+    if "notifications_enabled" not in profile:
+        profile["notifications_enabled"] = True
+        profile["updated_at"] = now
+
+        def _backfill_pref() -> None:
+            _firestore_users_collection().document(uid).set({"notifications_enabled": True, "updated_at": now}, merge=True)
+
+        _retry_operation(
+            f"Backfilling notifications preference for {uid}",
+            _backfill_pref,
+            attempts=STATE_RETRY_ATTEMPTS,
+            delay_seconds=STATE_RETRY_DELAY_SECONDS,
+        )
+    return profile
+
+
+def _update_user_notification_preference(uid: str, *, notifications_enabled: bool) -> dict[str, Any]:
+    profile = _load_or_create_user_profile(uid)
+    profile["notifications_enabled"] = bool(notifications_enabled)
+    profile["updated_at"] = _utc_now()
+
+    if FIRESTORE_ENABLED:
+        def _write() -> None:
+            _firestore_users_collection().document(uid).set(
+                {
+                    "uid": uid,
+                    "notifications_enabled": profile["notifications_enabled"],
+                    "updated_at": profile["updated_at"],
+                },
+                merge=True,
+            )
+
+        _retry_operation(
+            f"Updating notifications preference for {uid}",
+            _write,
+            attempts=STATE_RETRY_ATTEMPTS,
+            delay_seconds=STATE_RETRY_DELAY_SECONDS,
+        )
+
+    return profile
+
+
+def _update_user_profile_contact(uid: str, *, email: str | None, display_name: str | None) -> None:
+    if not FIRESTORE_ENABLED:
+        return
+    payload = {"uid": uid, "updated_at": _utc_now()}
+    if email:
+        payload["email"] = email
+    if display_name:
+        payload["display_name"] = display_name
+    if len(payload) <= 2:
+        return
+
+    def _write() -> None:
+        _firestore_users_collection().document(uid).set(payload, merge=True)
+
+    _retry_operation(
+        f"Updating user profile contact for {uid}",
+        _write,
+        attempts=STATE_RETRY_ATTEMPTS,
+        delay_seconds=STATE_RETRY_DELAY_SECONDS,
+    )
+
+
+def _lookup_recipient_email(uid: str) -> tuple[str | None, str | None]:
+    profile = _load_or_create_user_profile(uid)
+    email = str(profile.get("email") or "").strip() or None
+    display_name = str(profile.get("display_name") or "").strip() or None
+    if email:
+        return email, display_name
+
+    if not FIREBASE_AUTH_ENABLED:
+        return None, display_name
+
+    try:
+        record = _firebase_auth_module().get_user(uid)
+        resolved_email = str(record.email or "").strip() or None
+        resolved_name = str(record.display_name or "").strip() or display_name
+        if resolved_email:
+            _update_user_profile_contact(uid, email=resolved_email, display_name=resolved_name)
+        return resolved_email, resolved_name
+    except HTTPException:
+        return None, display_name
+    except Exception:  # noqa: BLE001
+        LOGGER.exception("Failed looking up recipient email for uid=%s", uid)
+        return None, display_name
+
+
+def _brevo_client() -> Any:
+    if not BREVO_NOTIFICATIONS_ENABLED:
+        raise RuntimeError("Brevo notifications are disabled")
+
+    global _BREVO_CLIENT
+    if _BREVO_CLIENT is not None:
+        return _BREVO_CLIENT
+
+    with _BREVO_CLIENT_LOCK:
+        if _BREVO_CLIENT is None:
+            try:
+                import sib_api_v3_sdk
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError("sib-api-v3-sdk is unavailable") from exc
+            configuration = sib_api_v3_sdk.Configuration()
+            configuration.api_key["api-key"] = BREVO_API_KEY
+            _BREVO_CLIENT = sib_api_v3_sdk.TransactionalEmailsApi(sib_api_v3_sdk.ApiClient(configuration))
+
+    return _BREVO_CLIENT
+
+
+def _job_completion_summary(job: dict[str, Any]) -> dict[str, Any]:
+    videos = job.get("videos", [])
+    total = len(videos)
+    completed = sum(1 for item in videos if item.get("status") == "completed")
+    failed = sum(1 for item in videos if item.get("status") == "failed")
+    status = str(job.get("status") or "")
+    status_label = status.replace("_", " ").title()
+    media_url = f"{WEB_BASE_URL}/media"
+    job_id = str(job.get("id") or "")
+    if job_id:
+        media_url = f"{media_url}?job={quote(job_id)}"
+    return {
+        "job_id": job_id,
+        "job_status": status,
+        "job_status_label": status_label,
+        "job_message": str(job.get("message") or ""),
+        "total_videos": total,
+        "completed_videos": completed,
+        "failed_videos": failed,
+        "media_url": media_url,
+    }
+
+
+def _send_brevo_completion_email(job: dict[str, Any], *, recipient_email: str, recipient_name: str | None) -> None:
+    summary = _job_completion_summary(job)
+    status = str(summary["job_status"])
+    subject = f"POVerlay render {summary['job_status_label']} (job {summary['job_id']})"
+    if status == "completed":
+        subject = f"POVerlay render complete (job {summary['job_id']})"
+    elif status == "failed":
+        subject = f"POVerlay render failed (job {summary['job_id']})"
+
+    greeting = recipient_name or "there"
+    html_content = (
+        f"<p>Hi {greeting},</p>"
+        f"<p>Your POVerlay job <strong>{summary['job_id']}</strong> is <strong>{summary['job_status_label']}</strong>.</p>"
+        f"<p>{summary['job_message']}</p>"
+        f"<ul>"
+        f"<li>Total videos: {summary['total_videos']}</li>"
+        f"<li>Completed: {summary['completed_videos']}</li>"
+        f"<li>Failed: {summary['failed_videos']}</li>"
+        f"</ul>"
+        f"<p><a href=\"{summary['media_url']}\">Open your media library</a></p>"
+    )
+    text_content = (
+        f"Hi {greeting},\n\n"
+        f"Your POVerlay job {summary['job_id']} is {summary['job_status_label']}.\n"
+        f"{summary['job_message']}\n"
+        f"Total videos: {summary['total_videos']}\n"
+        f"Completed: {summary['completed_videos']}\n"
+        f"Failed: {summary['failed_videos']}\n\n"
+        f"Open your media library: {summary['media_url']}\n"
+    )
+
+    try:
+        template_id = int(BREVO_TEMPLATE_RENDER_COMPLETE_ID) if BREVO_TEMPLATE_RENDER_COMPLETE_ID else None
+    except ValueError as exc:
+        raise RuntimeError("BREVO_TEMPLATE_RENDER_COMPLETE_ID must be numeric") from exc
+
+    try:
+        import sib_api_v3_sdk
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError("sib-api-v3-sdk is unavailable") from exc
+
+    payload: dict[str, Any] = {
+        "sender": {"email": BREVO_SENDER_EMAIL, "name": BREVO_SENDER_NAME},
+        "to": [{"email": recipient_email}],
+        "headers": {"X-POVerlay-Job-ID": summary["job_id"]},
+    }
+
+    if template_id is not None:
+        payload["template_id"] = template_id
+        payload["params"] = summary
+    else:
+        payload["subject"] = subject
+        payload["html_content"] = html_content
+        payload["text_content"] = text_content
+
+    message = sib_api_v3_sdk.SendSmtpEmail(**payload)
+    _brevo_client().send_transac_email(message)
+
+
+def _send_job_completion_notification(job: dict[str, Any]) -> None:
+    if not BREVO_NOTIFICATIONS_ENABLED:
+        return
+
+    uid = str(job.get("uid") or "")
+    if not uid:
+        LOGGER.warning("Skipping completion notification: missing job uid for job=%s", job.get("id"))
+        return
+
+    profile = _load_or_create_user_profile(uid)
+    if not bool(profile.get("notifications_enabled", True)):
+        return
+
+    recipient_email, recipient_name = _lookup_recipient_email(uid)
+    if not recipient_email:
+        LOGGER.warning("Skipping completion notification: no recipient email for uid=%s job=%s", uid, job.get("id"))
+        return
+
+    _send_brevo_completion_email(job, recipient_email=recipient_email, recipient_name=recipient_name)
 
 
 def _persist_job_state(job: dict[str, Any]) -> dict[str, Any]:
@@ -830,8 +1104,16 @@ def _set_job(job_id: str, **fields: Any) -> None:
     current = _load_job_state(job_id, prefer_cache=True)
     if current is None:
         raise RuntimeError(f"Job {job_id} not found")
+    previous_status = str(current.get("status") or "")
     current.update(fields)
-    _persist_job_state(current)
+    persisted = _persist_job_state(current)
+
+    new_status = str(persisted.get("status") or "")
+    if previous_status != new_status and new_status in TERMINAL_JOB_STATUSES:
+        try:
+            _send_job_completion_notification(persisted)
+        except Exception:  # noqa: BLE001
+            LOGGER.exception("Job completion notification failed for job=%s status=%s", job_id, new_status)
 
 
 def _set_video(job_id: str, index: int, **fields: Any) -> None:
@@ -1464,6 +1746,24 @@ def meta() -> dict[str, Any]:
         "render_profiles": _render_profile_meta(),
         "render_profile_ids": AVAILABLE_RENDER_PROFILE_IDS,
         "default_render_profile": AUTO_RENDER_PROFILE,
+    }
+
+
+@app.get("/api/user/settings")
+def get_user_settings(uid: str = Depends(_require_user_uid)) -> dict[str, Any]:
+    profile = _load_or_create_user_profile(uid)
+    return {
+        "uid": uid,
+        "notifications_enabled": bool(profile.get("notifications_enabled", True)),
+    }
+
+
+@app.put("/api/user/settings")
+def update_user_settings(payload: UserSettingsUpdate, uid: str = Depends(_require_user_uid)) -> dict[str, Any]:
+    profile = _update_user_notification_preference(uid, notifications_enabled=payload.notifications_enabled)
+    return {
+        "uid": uid,
+        "notifications_enabled": bool(profile.get("notifications_enabled", True)),
     }
 
 
