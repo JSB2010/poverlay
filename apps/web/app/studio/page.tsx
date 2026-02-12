@@ -1237,7 +1237,8 @@ export default function HomePage() {
                   {job?.message ?? (activeJobId ? "Waiting for updates..." : "Run a render to view progress.")}
                 </p>
                 <p className="mt-1 text-xs text-[var(--color-muted-foreground)]">
-                  Renders continue on the server after submission, even if you close this page.
+                  Renders continue on the server after submission, even if you close this page. If enabled in Settings, we
+                  email you when processing finishes.
                 </p>
               </div>
               {job?.status && (

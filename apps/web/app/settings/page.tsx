@@ -2,18 +2,60 @@
 
 import { FormEvent, useEffect, useState } from "react";
 import { useAuth } from "@/components/auth-provider";
+import { PUBLIC_WEB_CONFIG } from "@/lib/public-config";
 
-const NOTIFICATION_PREF_KEY = "poverlay.notifications.enabled";
+const CONFIGURED_API_BASE = PUBLIC_WEB_CONFIG.apiBase;
+
+type UserSettingsResponse = {
+  notifications_enabled?: boolean;
+};
+
+function apiUrl(path: string): string {
+  if (/^https?:\/\//i.test(path)) {
+    return path;
+  }
+  if (!CONFIGURED_API_BASE) {
+    return path;
+  }
+  return `${CONFIGURED_API_BASE}${path.startsWith("/") ? path : `/${path}`}`;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+async function readApiPayload(response: Response): Promise<unknown> {
+  const contentType = response.headers.get("content-type") ?? "";
+  if (contentType.includes("application/json")) {
+    try {
+      return await response.json();
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function extractErrorMessage(payload: unknown, fallback: string): string {
+  if (isRecord(payload) && typeof payload.detail === "string" && payload.detail.trim()) {
+    return payload.detail;
+  }
+  return fallback;
+}
 
 export default function SettingsPage() {
-  const { account, updateProfileMetadata, sendPasswordReset } = useAuth();
+  const { account, getIdToken, updateProfileMetadata, sendPasswordReset } = useAuth();
   const [displayName, setDisplayName] = useState("");
   const [photoURL, setPhotoURL] = useState("");
   const [notificationsEnabled, setNotificationsEnabled] = useState(true);
+  const [notificationError, setNotificationError] = useState<string | null>(null);
+  const [notificationMessage, setNotificationMessage] = useState<string | null>(null);
   const [profileMessage, setProfileMessage] = useState<string | null>(null);
   const [passwordMessage, setPasswordMessage] = useState<string | null>(null);
   const [profileError, setProfileError] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
+  const [isLoadingNotifications, setIsLoadingNotifications] = useState(true);
+  const [isSavingNotifications, setIsSavingNotifications] = useState(false);
   const [isSendingReset, setIsSendingReset] = useState(false);
 
   useEffect(() => {
@@ -22,21 +64,90 @@ export default function SettingsPage() {
   }, [account?.displayName, account?.photoURL]);
 
   useEffect(() => {
-    if (typeof window === "undefined") {
+    if (!account?.uid) {
+      setIsLoadingNotifications(false);
       return;
     }
-    const stored = window.localStorage.getItem(NOTIFICATION_PREF_KEY);
-    if (stored === "false") {
-      setNotificationsEnabled(false);
-    }
-  }, []);
 
-  useEffect(() => {
-    if (typeof window === "undefined") {
-      return;
+    let isMounted = true;
+    async function loadNotificationPreference(): Promise<void> {
+      setNotificationError(null);
+      setNotificationMessage(null);
+      setIsLoadingNotifications(true);
+      try {
+        const token = await getIdToken();
+        if (!token) {
+          throw new Error("Authentication token unavailable.");
+        }
+
+        const response = await fetch(apiUrl("/api/user/settings"), {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+          cache: "no-store",
+        });
+        const payload = (await readApiPayload(response)) as UserSettingsResponse | null;
+        if (!response.ok) {
+          throw new Error(extractErrorMessage(payload, "Could not load notification preference."));
+        }
+
+        if (isMounted && typeof payload?.notifications_enabled === "boolean") {
+          setNotificationsEnabled(payload.notifications_enabled);
+        }
+      } catch (error) {
+        if (isMounted) {
+          const message = error instanceof Error ? error.message : "Could not load notification preference.";
+          setNotificationError(message);
+        }
+      } finally {
+        if (isMounted) {
+          setIsLoadingNotifications(false);
+        }
+      }
     }
-    window.localStorage.setItem(NOTIFICATION_PREF_KEY, notificationsEnabled ? "true" : "false");
-  }, [notificationsEnabled]);
+
+    void loadNotificationPreference();
+    return () => {
+      isMounted = false;
+    };
+  }, [account?.uid, getIdToken]);
+
+  async function handleNotificationsToggle(nextValue: boolean): Promise<void> {
+    const previous = notificationsEnabled;
+    setNotificationsEnabled(nextValue);
+    setNotificationError(null);
+    setNotificationMessage(null);
+    setIsSavingNotifications(true);
+    try {
+      const token = await getIdToken();
+      if (!token) {
+        throw new Error("Authentication token unavailable.");
+      }
+
+      const response = await fetch(apiUrl("/api/user/settings"), {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ notifications_enabled: nextValue }),
+      });
+      const payload = (await readApiPayload(response)) as UserSettingsResponse | null;
+      if (!response.ok) {
+        throw new Error(extractErrorMessage(payload, "Could not update notification preference."));
+      }
+
+      const serverValue = typeof payload?.notifications_enabled === "boolean" ? payload.notifications_enabled : nextValue;
+      setNotificationsEnabled(serverValue);
+      setNotificationMessage(serverValue ? "Completion emails are enabled." : "Completion emails are disabled.");
+    } catch (error) {
+      setNotificationsEnabled(previous);
+      const message = error instanceof Error ? error.message : "Could not update notification preference.";
+      setNotificationError(message);
+    } finally {
+      setIsSavingNotifications(false);
+    }
+  }
 
   async function handleSaveProfile(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -131,22 +242,23 @@ export default function SettingsPage() {
         <section className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-card)] p-6">
           <h2 className="text-lg font-semibold">Notifications</h2>
           <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
-            Toggle whether render completion notifications are enabled for your account profile scaffold.
+            Toggle whether render completion emails are enabled for your account.
           </p>
           <label className="mt-4 inline-flex items-center gap-3">
             <input
               type="checkbox"
               checked={notificationsEnabled}
-              onChange={(event) => setNotificationsEnabled(event.target.checked)}
+              disabled={isLoadingNotifications || isSavingNotifications}
+              onChange={(event) => void handleNotificationsToggle(event.target.checked)}
               className="h-4 w-4 rounded border-[var(--color-border)]"
             />
             <span className="text-sm font-medium">
               {notificationsEnabled ? "Notifications enabled" : "Notifications opt-out enabled"}
             </span>
           </label>
-          <p className="mt-2 text-xs text-[var(--color-muted-foreground)]">
-            This preference is currently scaffolded locally and will be persisted to backend user settings in a follow-up.
-          </p>
+          {isLoadingNotifications && <p className="mt-2 text-xs text-[var(--color-muted-foreground)]">Loading preference...</p>}
+          {notificationError && <p className="mt-2 text-xs text-red-600">{notificationError}</p>}
+          {notificationMessage && <p className="mt-2 text-xs text-green-700">{notificationMessage}</p>}
         </section>
 
         <section className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-card)] p-6">
