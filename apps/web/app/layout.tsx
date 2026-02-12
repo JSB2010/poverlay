@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Inter, Sora } from "next/font/google";
+import { AuthProvider } from "@/components/auth-provider";
 import { ThemeProvider } from "@/components/theme-provider";
 import { Navbar } from "@/components/navbar";
 import { PUBLIC_WEB_CONFIG } from "@/lib/public-config";
@@ -145,8 +146,10 @@ export default function RootLayout({
       </head>
       <body>
         <ThemeProvider>
-          <Navbar />
-          {children}
+          <AuthProvider>
+            <Navbar />
+            {children}
+          </AuthProvider>
         </ThemeProvider>
       </body>
     </html>

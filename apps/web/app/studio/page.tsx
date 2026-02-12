@@ -1,6 +1,7 @@
 "use client";
 
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { useAuth } from "@/components/auth-provider";
 import { PUBLIC_WEB_CONFIG } from "@/lib/public-config";
 
 type ThemeOption = {
@@ -56,6 +57,7 @@ type VideoState = {
   progress: number;
   detail?: string | null;
   error?: string | null;
+  output_name?: string | null;
   output_size_bytes?: number | null;
   render_profile_label?: string | null;
   source_resolution?: string | null;
@@ -343,6 +345,27 @@ async function readApiPayload(response: Response): Promise<unknown> {
   }
 }
 
+function contentDispositionFilename(value: string | null): string | null {
+  if (!value) {
+    return null;
+  }
+
+  const utf8Match = value.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8Match?.[1]) {
+    try {
+      return decodeURIComponent(utf8Match[1].trim().replace(/^"|"$/g, ""));
+    } catch {
+      return utf8Match[1].trim().replace(/^"|"$/g, "");
+    }
+  }
+
+  const basicMatch = value.match(/filename=([^;]+)/i);
+  if (!basicMatch?.[1]) {
+    return null;
+  }
+  return basicMatch[1].trim().replace(/^"|"$/g, "");
+}
+
 function rgbStringToCss(value: string, fallback: string): string {
   const parts = value
     .split(",")
@@ -432,6 +455,7 @@ function makeDefaultVisibility(
 }
 
 export default function HomePage() {
+  const { isEnabled: isAuthEnabled, getIdToken } = useAuth();
   const [formState, setFormState] = useState<FormState>(DEFAULT_FORM_STATE);
   const [themes, setThemes] = useState<ThemeOption[]>(FALLBACK_THEMES);
   const [layoutStyles, setLayoutStyles] = useState<LayoutStyle[]>(FALLBACK_LAYOUTS);
@@ -452,10 +476,24 @@ export default function HomePage() {
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  async function authHeaders(): Promise<Headers> {
+    const headers = new Headers();
+    if (!isAuthEnabled) {
+      return headers;
+    }
+
+    const token = await getIdToken();
+    if (!token) {
+      throw new Error("Your session expired. Please sign in again.");
+    }
+    headers.set("Authorization", `Bearer ${token}`);
+    return headers;
+  }
+
   useEffect(() => {
     async function loadMeta() {
       try {
-        const response = await fetch(apiUrl("/api/meta"));
+        const response = await fetch(apiUrl("/api/meta"), { headers: await authHeaders() });
         if (!response.ok) {
           const errorPayload = await readApiPayload(response);
           throw new Error(extractErrorMessage(errorPayload, "Could not load server metadata"));
@@ -512,7 +550,7 @@ export default function HomePage() {
     }
 
     void loadMeta();
-  }, []);
+  }, [getIdToken, isAuthEnabled]);
 
   useEffect(() => {
     return () => {
@@ -575,7 +613,7 @@ export default function HomePage() {
 
   async function pollJob(jobId: string): Promise<void> {
     try {
-      const response = await fetch(apiUrl(`/api/jobs/${jobId}`));
+      const response = await fetch(apiUrl(`/api/jobs/${jobId}`), { headers: await authHeaders() });
       const payload = await readApiPayload(response);
       if (!response.ok) {
         throw new Error(extractErrorMessage(payload, `Could not fetch job ${jobId}`));
@@ -605,6 +643,33 @@ export default function HomePage() {
         clearInterval(pollRef.current);
         pollRef.current = null;
       }
+    }
+  }
+
+  async function downloadAuthenticated(path: string, fallbackFilename: string): Promise<void> {
+    try {
+      setStatusError(null);
+      const response = await fetch(apiUrl(path), { headers: await authHeaders() });
+      if (!response.ok) {
+        const errorPayload = await readApiPayload(response);
+        throw new Error(extractErrorMessage(errorPayload, "Download failed"));
+      }
+
+      const blob = await response.blob();
+      const objectUrl = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      const headerName = contentDispositionFilename(response.headers.get("content-disposition"));
+
+      link.href = objectUrl;
+      link.download = headerName || fallbackFilename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+
+      URL.revokeObjectURL(objectUrl);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Download failed";
+      setStatusError(message);
     }
   }
 
@@ -700,6 +765,7 @@ export default function HomePage() {
       const response = await fetch(apiUrl("/api/jobs"), {
         method: "POST",
         body: payload,
+        headers: await authHeaders(),
       });
       const responsePayload = await readApiPayload(response);
 
@@ -1170,6 +1236,9 @@ export default function HomePage() {
                 <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
                   {job?.message ?? (activeJobId ? "Waiting for updates..." : "Run a render to view progress.")}
                 </p>
+                <p className="mt-1 text-xs text-[var(--color-muted-foreground)]">
+                  Renders continue on the server after submission, even if you close this page.
+                </p>
               </div>
               {job?.status && (
                 <span className="rounded-full bg-[var(--color-primary)]/10 px-3 py-1 text-xs font-medium text-[var(--color-primary)]">
@@ -1229,21 +1298,33 @@ export default function HomePage() {
 
                     <div className="flex flex-wrap gap-2">
                       {video.download_url && (
-                        <a
-                          href={apiUrl(video.download_url)}
+                        <button
+                          type="button"
+                          onClick={() =>
+                            void downloadAuthenticated(
+                              video.download_url ?? "",
+                              video.output_name ?? `${video.input_name.replace(/\.[^.]+$/, "")}-overlay.mp4`,
+                            )
+                          }
                           className="rounded-md bg-[var(--color-primary)] px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-[var(--color-primary)]/90"
                         >
                           Download video
-                        </a>
+                        </button>
                       )}
 
                       {video.log_name && job?.id && (
-                        <a
-                          href={apiUrl(`/api/jobs/${job.id}/log/${video.log_name}`)}
+                        <button
+                          type="button"
+                          onClick={() =>
+                            void downloadAuthenticated(
+                              `/api/jobs/${job.id}/log/${video.log_name}`,
+                              `${video.log_name}`,
+                            )
+                          }
                           className="rounded-md border border-[var(--color-border)] px-3 py-1.5 text-xs font-medium transition-colors hover:bg-[var(--color-muted)]/30"
                         >
                           Renderer log
-                        </a>
+                        </button>
                       )}
                     </div>
                   </li>
@@ -1252,12 +1333,13 @@ export default function HomePage() {
             </ul>
 
             {job?.download_all_url && (
-              <a
+              <button
+                type="button"
                 className="block rounded-xl border border-[var(--color-border)] bg-[var(--color-background)] px-4 py-3 text-center text-sm font-semibold transition-colors hover:bg-[var(--color-muted)]/30"
-                href={apiUrl(job.download_all_url)}
+                onClick={() => void downloadAuthenticated(job.download_all_url ?? "", `overlay-renders-${job.id}.zip`)}
               >
                 Download all outputs (.zip)
-              </a>
+              </button>
             )}
           </section>
         </aside>

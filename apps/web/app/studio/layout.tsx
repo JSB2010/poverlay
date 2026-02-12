@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { RequireAuth } from "@/components/require-auth";
 
 export const metadata: Metadata = {
   title: "Studio",
@@ -14,6 +15,5 @@ export default function StudioLayout({
 }: {
   children: React.ReactNode;
 }) {
-  return children;
+  return <RequireAuth>{children}</RequireAuth>;
 }
-
