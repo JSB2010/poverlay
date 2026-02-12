@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import sys
 from pathlib import Path
@@ -27,10 +28,34 @@ NEW_LAYOUT_STYLE_IDS = (
 
 
 @pytest.fixture(autouse=True)
-def clear_jobs_state() -> None:
+def fake_job_store(monkeypatch: pytest.MonkeyPatch) -> dict[str, dict[str, object]]:
+    store: dict[str, dict[str, object]] = {}
+
+    def _persist_job_state(job: dict[str, object]) -> dict[str, object]:
+        payload = deepcopy(job)
+        payload["updated_at"] = payload.get("updated_at") or "2026-01-01T00:00:00+00:00"
+        store[str(payload["id"])] = payload
+        return deepcopy(payload)
+
+    def _load_job_state(job_id: str, *, prefer_cache: bool) -> dict[str, object] | None:  # noqa: ARG001
+        payload = store.get(job_id)
+        return deepcopy(payload) if payload is not None else None
+
+    def _list_jobs_with_status(statuses: set[str]) -> list[dict[str, object]]:
+        return [deepcopy(job) for job in store.values() if str(job.get("status")) in statuses]
+
+    monkeypatch.setattr(api_main, "_persist_job_state", _persist_job_state)
+    monkeypatch.setattr(api_main, "_load_job_state", _load_job_state)
+    monkeypatch.setattr(api_main, "_list_jobs_with_status", _list_jobs_with_status)
+    monkeypatch.setattr(api_main, "_enqueue_job", lambda job_id: None)
+    monkeypatch.setattr(api_main, "FIRESTORE_ENABLED", True)
+    monkeypatch.setattr(api_main, "R2_UPLOAD_ENABLED", True)
+
     with api_main.JOBS_LOCK:
         api_main.JOBS.clear()
-    yield
+
+    yield store
+
     with api_main.JOBS_LOCK:
         api_main.JOBS.clear()
 
@@ -72,19 +97,22 @@ def test_invalid_token_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     assert response.status_code == 401
 
 
-def test_cross_user_job_access_returns_not_found(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_cross_user_job_access_returns_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fake_job_store: dict[str, dict[str, object]],
+) -> None:
     monkeypatch.setattr(api_main, "_verify_firebase_token", _stub_verify_token)
     job_dir = tmp_path / "job-1"
     job_dir.mkdir(parents=True, exist_ok=True)
 
-    with api_main.JOBS_LOCK:
-        api_main.JOBS["job-1"] = {
-            "id": "job-1",
-            "uid": "user-a",
-            "job_dir": str(job_dir),
-            "videos": [],
-            "status": "queued",
-        }
+    fake_job_store["job-1"] = {
+        "id": "job-1",
+        "uid": "user-a",
+        "job_dir": str(job_dir),
+        "videos": [],
+        "status": "queued",
+    }
 
     other_user_response = client.get("/api/jobs/job-1", headers={"Authorization": "Bearer token-user-b"})
     assert other_user_response.status_code == 404
@@ -95,7 +123,11 @@ def test_cross_user_job_access_returns_not_found(monkeypatch: pytest.MonkeyPatch
     assert owner_response.json()["uid"] == "user-a"
 
 
-def test_create_job_persists_authenticated_uid(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_create_job_persists_authenticated_uid(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fake_job_store: dict[str, dict[str, object]],
+) -> None:
     monkeypatch.setattr(api_main, "_verify_firebase_token", _stub_verify_token)
     monkeypatch.setattr(api_main, "_ensure_ffmpeg_profiles", lambda: None)
     monkeypatch.setattr(api_main, "GOPRO_DASHBOARD_BIN", str(Path(__file__).resolve()))
@@ -107,15 +139,7 @@ def test_create_job_persists_authenticated_uid(monkeypatch: pytest.MonkeyPatch, 
         destination.write_bytes(b"test")
         await upload.close()
 
-    class _NoopThread:
-        def __init__(self, *args, **kwargs) -> None:
-            pass
-
-        def start(self) -> None:
-            return None
-
     monkeypatch.setattr(api_main, "_save_upload", _noop_save_upload)
-    monkeypatch.setattr(api_main.threading, "Thread", _NoopThread)
 
     files = [
         ("gpx", ("track.gpx", b"<gpx></gpx>", "application/gpx+xml")),
@@ -125,8 +149,39 @@ def test_create_job_persists_authenticated_uid(monkeypatch: pytest.MonkeyPatch, 
     assert response.status_code == 200
 
     job_id = response.json()["job_id"]
-    with api_main.JOBS_LOCK:
-        assert api_main.JOBS[job_id]["uid"] == "user-a"
+    assert fake_job_store[job_id]["uid"] == "user-a"
+
+
+def test_download_output_redirects_to_signed_r2_url(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fake_job_store: dict[str, dict[str, object]],
+) -> None:
+    monkeypatch.setattr(api_main, "_verify_firebase_token", _stub_verify_token)
+    monkeypatch.setattr(api_main, "_signed_r2_download_url", lambda object_key, filename: f"https://signed/{object_key}/{filename}")
+
+    job_dir = tmp_path / "job-2"
+    job_dir.mkdir(parents=True, exist_ok=True)
+    fake_job_store["job-2"] = {
+        "id": "job-2",
+        "uid": "user-a",
+        "job_dir": str(job_dir),
+        "status": "completed",
+        "videos": [
+            {
+                "output_name": "clip-overlay.mp4",
+                "r2_object_key": "users/user-a/jobs/job-2/outputs/clip-overlay.mp4",
+            }
+        ],
+    }
+
+    response = client.get(
+        "/api/jobs/job-2/download/clip-overlay.mp4",
+        headers={"Authorization": "Bearer token-user-a"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 307
+    assert response.headers["location"].endswith("/users/user-a/jobs/job-2/outputs/clip-overlay.mp4/clip-overlay.mp4")
 
 
 def test_health_endpoint() -> None:

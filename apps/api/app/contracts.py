@@ -21,12 +21,38 @@ class FirestoreUserDocument(TypedDict, total=False):
 class FirestoreJobDocument(TypedDict, total=False):
     id: str
     uid: str
+    job_dir: str
     status: str
     progress: int
     message: str
+    gpx_name: str
+    videos: list["FirestoreJobVideoDocument"]
+    settings: dict[str, object]
     created_at: str
     updated_at: str
-    completed_at: str
+    started_at: str
+    finished_at: str
+    expires_at: str
+    local_artifacts_deleted_at: str
+
+
+class FirestoreJobVideoDocument(TypedDict, total=False):
+    input_name: str
+    status: str
+    progress: int
+    detail: str
+    error: str
+    output_name: str
+    output_size_bytes: int
+    log_name: str
+    render_profile: str
+    render_profile_label: str
+    source_resolution: str
+    source_fps: str
+    r2_object_key: str
+    r2_bucket: str
+    r2_etag: str
+    r2_uploaded_at: str
 
 
 class FirestoreMediaDocument(TypedDict, total=False):
