@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, Suspense, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useAuth } from "@/components/auth-provider";
@@ -15,7 +15,7 @@ function normalizedMode(value: string | null): AuthMode {
   return "sign-in";
 }
 
-export default function AuthPage() {
+function AuthPageContent() {
   const { isEnabled, isLoading, account, signInWithPassword, signUpWithPassword, sendPasswordReset } = useAuth();
   const searchParams = useSearchParams();
   const router = useRouter();
@@ -236,5 +236,23 @@ export default function AuthPage() {
         </form>
       </section>
     </main>
+  );
+}
+
+function AuthPageFallback() {
+  return (
+    <main className="mx-auto max-w-2xl px-4 py-12">
+      <section className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-card)] p-8 shadow-sm">
+        <p className="text-sm text-[var(--color-muted-foreground)]">Loading authentication…</p>
+      </section>
+    </main>
+  );
+}
+
+export default function AuthPage() {
+  return (
+    <Suspense fallback={<AuthPageFallback />}>
+      <AuthPageContent />
+    </Suspense>
   );
 }
