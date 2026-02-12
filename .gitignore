@@ -12,6 +12,11 @@ __pycache__/
 node_modules/
 apps/web/.next/
 apps/web/.env.local
+.env
+.env.*
+!.env.example
+*firebase-adminsdk-*.json
+*service-account*.json
 *.tsbuildinfo
 .pytest_cache/
 
