@@ -5,12 +5,14 @@ import sys
 from pathlib import Path
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 # Ensure the apps/api package root is importable when tests run from repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.layouts import DEFAULT_LAYOUT_STYLE, LAYOUT_STYLES, render_layout_xml  # noqa: E402
+import app.main as api_main  # noqa: E402
 from app.main import app  # noqa: E402
 
 
@@ -22,6 +24,109 @@ NEW_LAYOUT_STYLE_IDS = (
     "compass-asi-cluster",
     "power-zone-pro",
 )
+
+
+@pytest.fixture(autouse=True)
+def clear_jobs_state() -> None:
+    with api_main.JOBS_LOCK:
+        api_main.JOBS.clear()
+    yield
+    with api_main.JOBS_LOCK:
+        api_main.JOBS.clear()
+
+
+def _stub_verify_token(token: str) -> str:
+    if token == "token-user-a":
+        return "user-a"
+    if token == "token-user-b":
+        return "user-b"
+    raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/jobs/job-1",
+        "/api/jobs/job-1/download/output.mp4",
+        "/api/jobs/job-1/log/render.log",
+        "/api/jobs/job-1/download-all",
+    ],
+)
+def test_protected_job_get_routes_require_auth(path: str) -> None:
+    response = client.get(path)
+    assert response.status_code == 401
+
+
+def test_create_job_requires_auth() -> None:
+    files = [
+        ("gpx", ("track.gpx", b"<gpx></gpx>", "application/gpx+xml")),
+        ("videos", ("clip.mp4", b"fake-video", "video/mp4")),
+    ]
+    response = client.post("/api/jobs", files=files)
+    assert response.status_code == 401
+
+
+def test_invalid_token_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(api_main, "_verify_firebase_token", _stub_verify_token)
+    response = client.get("/api/jobs/job-1", headers={"Authorization": "Bearer not-valid"})
+    assert response.status_code == 401
+
+
+def test_cross_user_job_access_returns_not_found(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(api_main, "_verify_firebase_token", _stub_verify_token)
+    job_dir = tmp_path / "job-1"
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    with api_main.JOBS_LOCK:
+        api_main.JOBS["job-1"] = {
+            "id": "job-1",
+            "uid": "user-a",
+            "job_dir": str(job_dir),
+            "videos": [],
+            "status": "queued",
+        }
+
+    other_user_response = client.get("/api/jobs/job-1", headers={"Authorization": "Bearer token-user-b"})
+    assert other_user_response.status_code == 404
+    assert other_user_response.json()["detail"] == "Job not found"
+
+    owner_response = client.get("/api/jobs/job-1", headers={"Authorization": "Bearer token-user-a"})
+    assert owner_response.status_code == 200
+    assert owner_response.json()["uid"] == "user-a"
+
+
+def test_create_job_persists_authenticated_uid(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(api_main, "_verify_firebase_token", _stub_verify_token)
+    monkeypatch.setattr(api_main, "_ensure_ffmpeg_profiles", lambda: None)
+    monkeypatch.setattr(api_main, "GOPRO_DASHBOARD_BIN", str(Path(__file__).resolve()))
+    monkeypatch.setattr(api_main, "DEFAULT_FONT_PATH", str(Path(__file__).resolve()))
+    monkeypatch.setattr(api_main, "JOBS_DIR", tmp_path / "jobs")
+
+    async def _noop_save_upload(upload, destination: Path) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"test")
+        await upload.close()
+
+    class _NoopThread:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def start(self) -> None:
+            return None
+
+    monkeypatch.setattr(api_main, "_save_upload", _noop_save_upload)
+    monkeypatch.setattr(api_main.threading, "Thread", _NoopThread)
+
+    files = [
+        ("gpx", ("track.gpx", b"<gpx></gpx>", "application/gpx+xml")),
+        ("videos", ("clip.mp4", b"fake-video", "video/mp4")),
+    ]
+    response = client.post("/api/jobs", files=files, headers={"Authorization": "Bearer token-user-a"})
+    assert response.status_code == 200
+
+    job_id = response.json()["job_id"]
+    with api_main.JOBS_LOCK:
+        assert api_main.JOBS[job_id]["uid"] == "user-a"
 
 
 def test_health_endpoint() -> None:

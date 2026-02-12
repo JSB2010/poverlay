@@ -16,7 +16,7 @@ from typing import Any
 from uuid import uuid4
 import zipfile
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.background import BackgroundTask
@@ -254,6 +254,15 @@ else:
 TERMINAL_JOB_STATUSES = {"completed", "completed_with_errors", "failed"}
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
+FIREBASE_AUTH_ENABLED = _env_bool("FIREBASE_AUTH_ENABLED", True)
+FIREBASE_PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID", "").strip()
+FIREBASE_CREDENTIALS_JSON = os.environ.get("FIREBASE_CREDENTIALS_JSON", "").strip()
+FIREBASE_CREDENTIALS_PATH = os.environ.get(
+    "FIREBASE_CREDENTIALS_PATH",
+    os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", ""),
+).strip()
+_FIREBASE_INIT_LOCK = threading.Lock()
+_FIREBASE_AUTH_MODULE: Any | None = None
 
 
 @asynccontextmanager
@@ -417,10 +426,76 @@ def _set_video(job_id: str, index: int, **fields: Any) -> None:
         JOBS[job_id]["videos"][index].update(fields)
 
 
-def _get_job(job_id: str) -> dict[str, Any]:
+def _bearer_token_from_header(authorization: str | None = Header(default=None, alias="Authorization")) -> str:
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        raise HTTPException(status_code=401, detail="Invalid authorization header")
+    return token.strip()
+
+
+def _firebase_auth_module() -> Any:
+    global _FIREBASE_AUTH_MODULE
+    if _FIREBASE_AUTH_MODULE is not None:
+        return _FIREBASE_AUTH_MODULE
+
+    if not FIREBASE_AUTH_ENABLED:
+        raise HTTPException(status_code=503, detail="Firebase auth is disabled")
+
+    with _FIREBASE_INIT_LOCK:
+        if _FIREBASE_AUTH_MODULE is not None:
+            return _FIREBASE_AUTH_MODULE
+
+        try:
+            import firebase_admin
+            from firebase_admin import auth as firebase_auth
+            from firebase_admin import credentials
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=503, detail="Firebase auth is unavailable") from exc
+
+        options = {"projectId": FIREBASE_PROJECT_ID} if FIREBASE_PROJECT_ID else None
+        if not firebase_admin._apps:
+            if FIREBASE_CREDENTIALS_JSON:
+                try:
+                    credential_payload = json.loads(FIREBASE_CREDENTIALS_JSON)
+                except json.JSONDecodeError as exc:
+                    raise HTTPException(status_code=500, detail="Invalid FIREBASE_CREDENTIALS_JSON") from exc
+                firebase_admin.initialize_app(credentials.Certificate(credential_payload), options=options)
+            elif FIREBASE_CREDENTIALS_PATH:
+                firebase_admin.initialize_app(credentials.Certificate(FIREBASE_CREDENTIALS_PATH), options=options)
+            else:
+                firebase_admin.initialize_app(options=options)
+
+        _FIREBASE_AUTH_MODULE = firebase_auth
+        return _FIREBASE_AUTH_MODULE
+
+
+def _verify_firebase_token(token: str) -> str:
+    try:
+        decoded = _firebase_auth_module().verify_id_token(token, check_revoked=True)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=401, detail="Invalid or expired token") from exc
+
+    uid = decoded.get("uid") or decoded.get("sub")
+    if not isinstance(uid, str) or not uid:
+        raise HTTPException(status_code=401, detail="Invalid token payload")
+    return uid
+
+
+def _require_user_uid(token: str = Depends(_bearer_token_from_header)) -> str:
+    return _verify_firebase_token(token)
+
+
+def _get_job(job_id: str, requester_uid: str | None = None) -> dict[str, Any]:
     with JOBS_LOCK:
         job = JOBS.get(job_id)
         if job is None:
+            raise HTTPException(status_code=404, detail="Job not found")
+        if requester_uid is not None and job.get("uid") != requester_uid:
             raise HTTPException(status_code=404, detail="Job not found")
         return deepcopy(job)
 
@@ -916,6 +991,7 @@ async def create_job(
     fps_mode: str = Form("source_exact"),
     fixed_fps: float = Form(30.0),
     render_profile: str = Form(AUTO_RENDER_PROFILE),
+    uid: str = Depends(_require_user_uid),
 ) -> dict[str, Any]:
     _ensure_ffmpeg_profiles()
 
@@ -1001,6 +1077,7 @@ async def create_job(
 
     job_data = {
         "id": job_id,
+        "uid": uid,
         "job_dir": str(job_dir),
         "status": "queued",
         "created_at": _utc_now(),
@@ -1039,8 +1116,8 @@ async def create_job(
 
 
 @app.get("/api/jobs/{job_id}")
-def job_status(job_id: str) -> dict[str, Any]:
-    job = _get_job(job_id)
+def job_status(job_id: str, uid: str = Depends(_require_user_uid)) -> dict[str, Any]:
+    job = _get_job(job_id, requester_uid=uid)
     outputs_dir = Path(job["job_dir"]) / "outputs"
 
     for video in job["videos"]:
@@ -1058,8 +1135,8 @@ def job_status(job_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/jobs/{job_id}/download/{filename}")
-def download_output(job_id: str, filename: str) -> FileResponse:
-    job = _get_job(job_id)
+def download_output(job_id: str, filename: str, uid: str = Depends(_require_user_uid)) -> FileResponse:
+    job = _get_job(job_id, requester_uid=uid)
     outputs_dir = (Path(job["job_dir"]) / "outputs").resolve()
     target = (outputs_dir / filename).resolve()
 
@@ -1070,8 +1147,8 @@ def download_output(job_id: str, filename: str) -> FileResponse:
 
 
 @app.get("/api/jobs/{job_id}/log/{filename}")
-def download_log(job_id: str, filename: str) -> FileResponse:
-    job = _get_job(job_id)
+def download_log(job_id: str, filename: str, uid: str = Depends(_require_user_uid)) -> FileResponse:
+    job = _get_job(job_id, requester_uid=uid)
     logs_dir = (Path(job["job_dir"]) / "logs").resolve()
     target = (logs_dir / filename).resolve()
 
@@ -1082,8 +1159,8 @@ def download_log(job_id: str, filename: str) -> FileResponse:
 
 
 @app.get("/api/jobs/{job_id}/download-all")
-def download_all(job_id: str) -> FileResponse:
-    job = _get_job(job_id)
+def download_all(job_id: str, uid: str = Depends(_require_user_uid)) -> FileResponse:
+    job = _get_job(job_id, requester_uid=uid)
     job_dir = Path(job["job_dir"])
     outputs_dir = job_dir / "outputs"
     zip_path = job_dir / f"outputs-{uuid4().hex}.zip"
