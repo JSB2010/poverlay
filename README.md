@@ -93,12 +93,46 @@ The root template includes:
 - Cloudflare R2: account/bucket/credentials (`R2_*`)
 - Brevo: notifications + sender/template settings (`BREVO_*`)
 
+Production integration checklist (set in `/etc/poverlay/poverlay.env` on VPS):
+
+- Keep auth toggles aligned: `FIREBASE_AUTH_ENABLED=true` and `NEXT_PUBLIC_FIREBASE_AUTH_ENABLED=true`.
+- Durable pipeline toggles: `FIRESTORE_ENABLED=true` and `R2_UPLOAD_ENABLED=true`.
+- Notification toggle: `BREVO_NOTIFICATIONS_ENABLED=true`.
+- Firebase admin credentials: provide one source (`FIREBASE_CREDENTIALS_JSON`, `FIREBASE_CREDENTIALS_PATH`, or `FIREBASE_ADMIN_CLIENT_EMAIL` + one `FIREBASE_ADMIN_PRIVATE_KEY*` value).
+- Firestore identity: set `FIRESTORE_PROJECT_ID` (or rely on `FIREBASE_PROJECT_ID`) and keep collection names consistent unless intentionally migrated.
+- R2 credentials: `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`, `R2_ENDPOINT`.
+- Brevo sender settings: `BREVO_API_KEY`, `BREVO_SENDER_EMAIL`, optional `BREVO_TEMPLATE_RENDER_COMPLETE_ID`.
+
 Config validation is fail-fast:
 
 - API startup validates enabled integrations in `apps/api/app/config.py`
 - Web startup validates public Firebase env in `apps/web/lib/public-config.ts`
 
 Use `./scripts/run.sh`, `./scripts/run-web.sh`, or `./scripts/run-api.sh` so root `.env` is loaded automatically.
+
+## Auth and reliability notes
+
+- Web auth persistence uses Firebase `browserLocalPersistence`, so sessions survive page reloads and browser restarts until explicit sign-out.
+- API auth expects `Authorization: Bearer <Firebase ID token>` and verifies tokens with revocation checks.
+- Job state is persisted in Firestore and the API recovers `queued`/`running` jobs at startup.
+- Completed outputs are uploaded to R2 before local artifacts are deleted; job metadata records `local_artifacts_deleted_at` after cleanup.
+- Background cleanup removes expired job directories using `JOB_OUTPUT_RETENTION_HOURS` and `JOB_CLEANUP_INTERVAL_SECONDS`.
+
+## Operator smoke checks
+
+Run after deploy/restart:
+
+```bash
+curl -fsS http://127.0.0.1:8787/health
+curl -fsS http://127.0.0.1:3000 >/dev/null
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8787/api/media
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8787/api/user/settings
+```
+
+Expected:
+
+- Health endpoints return `200`.
+- Unauthenticated `/api/media` and `/api/user/settings` return `401`.
 
 ## VPS deployment
 
