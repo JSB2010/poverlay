@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import json
+import logging
 import os
 import queue
 from pathlib import Path
@@ -18,9 +19,10 @@ from urllib.parse import quote
 from uuid import uuid4
 import zipfile
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Body, Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
 from app.config import load_runtime_config
@@ -243,6 +245,7 @@ FIREBASE_CREDENTIALS_PATH = (RUNTIME_CONFIG.firebase.credentials_path or "").str
 FIRESTORE_ENABLED = RUNTIME_CONFIG.firestore.enabled
 FIRESTORE_PROJECT_ID = (RUNTIME_CONFIG.firestore.project_id or "").strip()
 FIRESTORE_DATABASE_ID = RUNTIME_CONFIG.firestore.database_id
+FIRESTORE_USERS_COLLECTION = RUNTIME_CONFIG.firestore.users_collection
 FIRESTORE_JOBS_COLLECTION = RUNTIME_CONFIG.firestore.jobs_collection
 R2_UPLOAD_ENABLED = RUNTIME_CONFIG.r2.upload_enabled
 R2_BUCKET = (RUNTIME_CONFIG.r2.bucket or "").strip()
@@ -251,20 +254,32 @@ R2_ENDPOINT = (RUNTIME_CONFIG.r2.endpoint or "").strip()
 R2_ACCESS_KEY_ID = (RUNTIME_CONFIG.r2.access_key_id or "").strip()
 R2_SECRET_ACCESS_KEY = (RUNTIME_CONFIG.r2.secret_access_key or "").strip()
 R2_SIGNED_URL_TTL_SECONDS = 15 * 60
+MEDIA_LIST_MAX_PAGE_SIZE = 100
+MEDIA_SORT_FIELDS = {"created_at", "updated_at", "status", "title"}
+MEDIA_SORT_ORDERS = {"asc", "desc"}
 STATE_RETRY_ATTEMPTS = 3
 STATE_RETRY_DELAY_SECONDS = 0.5
 UPLOAD_RETRY_ATTEMPTS = 3
 UPLOAD_RETRY_DELAY_SECONDS = 1.0
+BREVO_NOTIFICATIONS_ENABLED = RUNTIME_CONFIG.brevo.notifications_enabled
+BREVO_API_KEY = (RUNTIME_CONFIG.brevo.api_key or "").strip()
+BREVO_SENDER_EMAIL = (RUNTIME_CONFIG.brevo.sender_email or "").strip()
+BREVO_SENDER_NAME = RUNTIME_CONFIG.brevo.sender_name
+BREVO_TEMPLATE_RENDER_COMPLETE_ID = (RUNTIME_CONFIG.brevo.template_render_complete_id or "").strip()
+WEB_BASE_URL = RUNTIME_CONFIG.web_base_url.rstrip("/")
 _FIREBASE_INIT_LOCK = threading.Lock()
 _FIREBASE_AUTH_MODULE: Any | None = None
 _FIRESTORE_CLIENT_LOCK = threading.Lock()
 _FIRESTORE_CLIENT: Any | None = None
 _R2_CLIENT_LOCK = threading.Lock()
 _R2_CLIENT: Any | None = None
+_BREVO_CLIENT_LOCK = threading.Lock()
+_BREVO_CLIENT: Any | None = None
 _QUEUE_WORKER_LOCK = threading.Lock()
 _QUEUE_WORKER_STARTED = False
 JOB_QUEUE: queue.Queue[str] = queue.Queue()
 ENQUEUED_JOBS: set[str] = set()
+LOGGER = logging.getLogger("poverlay.api")
 
 
 @asynccontextmanager
@@ -288,6 +303,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+class UserSettingsUpdate(BaseModel):
+    notifications_enabled: bool
 
 
 def _safe_filename(name: str) -> str:
@@ -393,6 +412,264 @@ def _firestore_jobs_collection() -> Any:
     return _FIRESTORE_CLIENT.collection(FIRESTORE_JOBS_COLLECTION)
 
 
+def _firestore_users_collection() -> Any:
+    if not FIRESTORE_ENABLED:
+        raise RuntimeError("Firestore-backed user state is disabled")
+    global _FIRESTORE_CLIENT
+    if _FIRESTORE_CLIENT is None:
+        _firestore_jobs_collection()
+    assert _FIRESTORE_CLIENT is not None
+    return _FIRESTORE_CLIENT.collection(FIRESTORE_USERS_COLLECTION)
+
+
+def _load_or_create_user_profile(uid: str) -> dict[str, Any]:
+    if not FIRESTORE_ENABLED:
+        return {"uid": uid, "notifications_enabled": True}
+
+    def _read() -> Any:
+        return _firestore_users_collection().document(uid).get()
+
+    snapshot = _retry_operation(
+        f"Loading user profile {uid}",
+        _read,
+        attempts=STATE_RETRY_ATTEMPTS,
+        delay_seconds=STATE_RETRY_DELAY_SECONDS,
+    )
+
+    now = _utc_now()
+    if not snapshot.exists:
+        profile: dict[str, Any] = {
+            "uid": uid,
+            "notifications_enabled": True,
+            "created_at": now,
+            "updated_at": now,
+        }
+
+        def _create() -> None:
+            _firestore_users_collection().document(uid).set(profile)
+
+        _retry_operation(
+            f"Creating user profile {uid}",
+            _create,
+            attempts=STATE_RETRY_ATTEMPTS,
+            delay_seconds=STATE_RETRY_DELAY_SECONDS,
+        )
+        return profile
+
+    profile = snapshot.to_dict() or {}
+    profile.setdefault("uid", uid)
+    if "notifications_enabled" not in profile:
+        profile["notifications_enabled"] = True
+        profile["updated_at"] = now
+
+        def _backfill_pref() -> None:
+            _firestore_users_collection().document(uid).set({"notifications_enabled": True, "updated_at": now}, merge=True)
+
+        _retry_operation(
+            f"Backfilling notifications preference for {uid}",
+            _backfill_pref,
+            attempts=STATE_RETRY_ATTEMPTS,
+            delay_seconds=STATE_RETRY_DELAY_SECONDS,
+        )
+    return profile
+
+
+def _update_user_notification_preference(uid: str, *, notifications_enabled: bool) -> dict[str, Any]:
+    profile = _load_or_create_user_profile(uid)
+    profile["notifications_enabled"] = bool(notifications_enabled)
+    profile["updated_at"] = _utc_now()
+
+    if FIRESTORE_ENABLED:
+        def _write() -> None:
+            _firestore_users_collection().document(uid).set(
+                {
+                    "uid": uid,
+                    "notifications_enabled": profile["notifications_enabled"],
+                    "updated_at": profile["updated_at"],
+                },
+                merge=True,
+            )
+
+        _retry_operation(
+            f"Updating notifications preference for {uid}",
+            _write,
+            attempts=STATE_RETRY_ATTEMPTS,
+            delay_seconds=STATE_RETRY_DELAY_SECONDS,
+        )
+
+    return profile
+
+
+def _update_user_profile_contact(uid: str, *, email: str | None, display_name: str | None) -> None:
+    if not FIRESTORE_ENABLED:
+        return
+    payload = {"uid": uid, "updated_at": _utc_now()}
+    if email:
+        payload["email"] = email
+    if display_name:
+        payload["display_name"] = display_name
+    if len(payload) <= 2:
+        return
+
+    def _write() -> None:
+        _firestore_users_collection().document(uid).set(payload, merge=True)
+
+    _retry_operation(
+        f"Updating user profile contact for {uid}",
+        _write,
+        attempts=STATE_RETRY_ATTEMPTS,
+        delay_seconds=STATE_RETRY_DELAY_SECONDS,
+    )
+
+
+def _lookup_recipient_email(uid: str) -> tuple[str | None, str | None]:
+    profile = _load_or_create_user_profile(uid)
+    email = str(profile.get("email") or "").strip() or None
+    display_name = str(profile.get("display_name") or "").strip() or None
+    if email:
+        return email, display_name
+
+    if not FIREBASE_AUTH_ENABLED:
+        return None, display_name
+
+    try:
+        record = _firebase_auth_module().get_user(uid)
+        resolved_email = str(record.email or "").strip() or None
+        resolved_name = str(record.display_name or "").strip() or display_name
+        if resolved_email:
+            _update_user_profile_contact(uid, email=resolved_email, display_name=resolved_name)
+        return resolved_email, resolved_name
+    except HTTPException:
+        return None, display_name
+    except Exception:  # noqa: BLE001
+        LOGGER.exception("Failed looking up recipient email for uid=%s", uid)
+        return None, display_name
+
+
+def _brevo_client() -> Any:
+    if not BREVO_NOTIFICATIONS_ENABLED:
+        raise RuntimeError("Brevo notifications are disabled")
+
+    global _BREVO_CLIENT
+    if _BREVO_CLIENT is not None:
+        return _BREVO_CLIENT
+
+    with _BREVO_CLIENT_LOCK:
+        if _BREVO_CLIENT is None:
+            try:
+                import sib_api_v3_sdk
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError("sib-api-v3-sdk is unavailable") from exc
+            configuration = sib_api_v3_sdk.Configuration()
+            configuration.api_key["api-key"] = BREVO_API_KEY
+            _BREVO_CLIENT = sib_api_v3_sdk.TransactionalEmailsApi(sib_api_v3_sdk.ApiClient(configuration))
+
+    return _BREVO_CLIENT
+
+
+def _job_completion_summary(job: dict[str, Any]) -> dict[str, Any]:
+    videos = job.get("videos", [])
+    total = len(videos)
+    completed = sum(1 for item in videos if item.get("status") == "completed")
+    failed = sum(1 for item in videos if item.get("status") == "failed")
+    status = str(job.get("status") or "")
+    status_label = status.replace("_", " ").title()
+    media_url = f"{WEB_BASE_URL}/media"
+    job_id = str(job.get("id") or "")
+    if job_id:
+        media_url = f"{media_url}?job={quote(job_id)}"
+    return {
+        "job_id": job_id,
+        "job_status": status,
+        "job_status_label": status_label,
+        "job_message": str(job.get("message") or ""),
+        "total_videos": total,
+        "completed_videos": completed,
+        "failed_videos": failed,
+        "media_url": media_url,
+    }
+
+
+def _send_brevo_completion_email(job: dict[str, Any], *, recipient_email: str, recipient_name: str | None) -> None:
+    summary = _job_completion_summary(job)
+    status = str(summary["job_status"])
+    subject = f"POVerlay render {summary['job_status_label']} (job {summary['job_id']})"
+    if status == "completed":
+        subject = f"POVerlay render complete (job {summary['job_id']})"
+    elif status == "failed":
+        subject = f"POVerlay render failed (job {summary['job_id']})"
+
+    greeting = recipient_name or "there"
+    html_content = (
+        f"<p>Hi {greeting},</p>"
+        f"<p>Your POVerlay job <strong>{summary['job_id']}</strong> is <strong>{summary['job_status_label']}</strong>.</p>"
+        f"<p>{summary['job_message']}</p>"
+        f"<ul>"
+        f"<li>Total videos: {summary['total_videos']}</li>"
+        f"<li>Completed: {summary['completed_videos']}</li>"
+        f"<li>Failed: {summary['failed_videos']}</li>"
+        f"</ul>"
+        f"<p><a href=\"{summary['media_url']}\">Open your media library</a></p>"
+    )
+    text_content = (
+        f"Hi {greeting},\n\n"
+        f"Your POVerlay job {summary['job_id']} is {summary['job_status_label']}.\n"
+        f"{summary['job_message']}\n"
+        f"Total videos: {summary['total_videos']}\n"
+        f"Completed: {summary['completed_videos']}\n"
+        f"Failed: {summary['failed_videos']}\n\n"
+        f"Open your media library: {summary['media_url']}\n"
+    )
+
+    try:
+        template_id = int(BREVO_TEMPLATE_RENDER_COMPLETE_ID) if BREVO_TEMPLATE_RENDER_COMPLETE_ID else None
+    except ValueError as exc:
+        raise RuntimeError("BREVO_TEMPLATE_RENDER_COMPLETE_ID must be numeric") from exc
+
+    try:
+        import sib_api_v3_sdk
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError("sib-api-v3-sdk is unavailable") from exc
+
+    payload: dict[str, Any] = {
+        "sender": {"email": BREVO_SENDER_EMAIL, "name": BREVO_SENDER_NAME},
+        "to": [{"email": recipient_email}],
+        "headers": {"X-POVerlay-Job-ID": summary["job_id"]},
+    }
+
+    if template_id is not None:
+        payload["template_id"] = template_id
+        payload["params"] = summary
+    else:
+        payload["subject"] = subject
+        payload["html_content"] = html_content
+        payload["text_content"] = text_content
+
+    message = sib_api_v3_sdk.SendSmtpEmail(**payload)
+    _brevo_client().send_transac_email(message)
+
+
+def _send_job_completion_notification(job: dict[str, Any]) -> None:
+    if not BREVO_NOTIFICATIONS_ENABLED:
+        return
+
+    uid = str(job.get("uid") or "")
+    if not uid:
+        LOGGER.warning("Skipping completion notification: missing job uid for job=%s", job.get("id"))
+        return
+
+    profile = _load_or_create_user_profile(uid)
+    if not bool(profile.get("notifications_enabled", True)):
+        return
+
+    recipient_email, recipient_name = _lookup_recipient_email(uid)
+    if not recipient_email:
+        LOGGER.warning("Skipping completion notification: no recipient email for uid=%s job=%s", uid, job.get("id"))
+        return
+
+    _send_brevo_completion_email(job, recipient_email=recipient_email, recipient_name=recipient_name)
+
+
 def _persist_job_state(job: dict[str, Any]) -> dict[str, Any]:
     payload = deepcopy(job)
     payload["updated_at"] = _utc_now()
@@ -459,6 +736,135 @@ def _list_jobs_with_status(statuses: set[str]) -> list[dict[str, Any]]:
         if payload.get("status") in statuses:
             jobs.append(payload)
     return jobs
+
+
+def _list_jobs_for_uid(uid: str) -> list[dict[str, Any]]:
+    if not FIRESTORE_ENABLED:
+        return []
+
+    def _stream() -> list[Any]:
+        return list(_firestore_jobs_collection().stream())
+
+    snapshots = _retry_operation(
+        f"Listing jobs for user {uid}",
+        _stream,
+        attempts=STATE_RETRY_ATTEMPTS,
+        delay_seconds=STATE_RETRY_DELAY_SECONDS,
+    )
+    jobs: list[dict[str, Any]] = []
+    for snapshot in snapshots:
+        payload = snapshot.to_dict() or {}
+        payload.setdefault("id", snapshot.id)
+        if str(payload.get("uid") or "") == uid:
+            jobs.append(payload)
+    return jobs
+
+
+def _default_video_title(video: dict[str, Any]) -> str:
+    candidate = str(video.get("title") or "").strip()
+    if candidate:
+        return candidate
+
+    output_name = str(video.get("output_name") or "").strip()
+    input_name = str(video.get("input_name") or "").strip()
+    base_name = output_name or input_name or "render"
+    stem = Path(base_name).stem
+    return stem or base_name
+
+
+def _ensure_video_identity_metadata(job: dict[str, Any]) -> dict[str, Any]:
+    changed = False
+    videos = job.get("videos", [])
+    if not isinstance(videos, list):
+        return job
+
+    for video in videos:
+        if not isinstance(video, dict):
+            continue
+
+        video_id = str(video.get("id") or "").strip()
+        if not video_id:
+            video["id"] = uuid4().hex
+            changed = True
+
+        title = str(video.get("title") or "").strip()
+        if not title:
+            video["title"] = _default_video_title(video)
+            changed = True
+
+    if changed:
+        return _persist_job_state(job)
+    return job
+
+
+def _find_video_by_id(job: dict[str, Any], video_id: str) -> tuple[int, dict[str, Any]]:
+    videos = job.get("videos", [])
+    if not isinstance(videos, list):
+        raise HTTPException(status_code=404, detail="Media not found")
+
+    for index, video in enumerate(videos):
+        if not isinstance(video, dict):
+            continue
+        if str(video.get("id") or "") == video_id:
+            return index, video
+
+    raise HTTPException(status_code=404, detail="Media not found")
+
+
+def _media_status_rank(status: str) -> int:
+    rank = {
+        "queued": 0,
+        "running": 1,
+        "completed": 2,
+        "completed_with_errors": 3,
+        "failed": 4,
+    }
+    return rank.get(status, 99)
+
+
+def _media_sort_value(item: dict[str, Any], sort_by: str) -> tuple[Any, Any]:
+    if sort_by == "status":
+        return (_media_status_rank(str(item.get("status") or "")), str(item.get("title") or "").lower())
+    if sort_by == "title":
+        return (str(item.get("title") or "").lower(), str(item.get("updated_at") or ""))
+    return (str(item.get(sort_by) or ""), str(item.get("title") or "").lower())
+
+
+def _build_media_item(job: dict[str, Any], video: dict[str, Any]) -> dict[str, Any]:
+    status = str(video.get("status") or "queued")
+    output_name = str(video.get("output_name") or "")
+    object_key = str(video.get("r2_object_key") or "")
+
+    return {
+        "id": str(video.get("id") or ""),
+        "job_id": str(job.get("id") or ""),
+        "status": status,
+        "job_status": str(job.get("status") or ""),
+        "title": _default_video_title(video),
+        "input_name": str(video.get("input_name") or ""),
+        "output_name": output_name or None,
+        "size_bytes": video.get("output_size_bytes"),
+        "render_profile_label": video.get("render_profile_label"),
+        "source_resolution": video.get("source_resolution"),
+        "source_fps": video.get("source_fps"),
+        "detail": video.get("detail"),
+        "error": video.get("error"),
+        "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
+        "can_download": bool(output_name and object_key and status == "completed"),
+    }
+
+
+def _delete_r2_object(object_key: str) -> None:
+    def _delete() -> None:
+        _r2_client().delete_object(Bucket=R2_BUCKET, Key=object_key)
+
+    _retry_operation(
+        f"Deleting R2 object {object_key}",
+        _delete,
+        attempts=UPLOAD_RETRY_ATTEMPTS,
+        delay_seconds=UPLOAD_RETRY_DELAY_SECONDS,
+    )
 
 
 def _r2_client() -> Any:
@@ -698,8 +1104,16 @@ def _set_job(job_id: str, **fields: Any) -> None:
     current = _load_job_state(job_id, prefer_cache=True)
     if current is None:
         raise RuntimeError(f"Job {job_id} not found")
+    previous_status = str(current.get("status") or "")
     current.update(fields)
-    _persist_job_state(current)
+    persisted = _persist_job_state(current)
+
+    new_status = str(persisted.get("status") or "")
+    if previous_status != new_status and new_status in TERMINAL_JOB_STATUSES:
+        try:
+            _send_job_completion_notification(persisted)
+        except Exception:  # noqa: BLE001
+            LOGGER.exception("Job completion notification failed for job=%s status=%s", job_id, new_status)
 
 
 def _set_video(job_id: str, index: int, **fields: Any) -> None:
@@ -1335,6 +1749,24 @@ def meta() -> dict[str, Any]:
     }
 
 
+@app.get("/api/user/settings")
+def get_user_settings(uid: str = Depends(_require_user_uid)) -> dict[str, Any]:
+    profile = _load_or_create_user_profile(uid)
+    return {
+        "uid": uid,
+        "notifications_enabled": bool(profile.get("notifications_enabled", True)),
+    }
+
+
+@app.put("/api/user/settings")
+def update_user_settings(payload: UserSettingsUpdate, uid: str = Depends(_require_user_uid)) -> dict[str, Any]:
+    profile = _update_user_notification_preference(uid, notifications_enabled=payload.notifications_enabled)
+    return {
+        "uid": uid,
+        "notifications_enabled": bool(profile.get("notifications_enabled", True)),
+    }
+
+
 @app.post("/api/jobs")
 async def create_job(
     gpx: UploadFile = File(...),
@@ -1423,6 +1855,8 @@ async def create_job(
         await _save_upload(video, inputs_dir / safe_name)
         video_states.append(
             {
+                "id": uuid4().hex,
+                "title": Path(safe_name).stem,
                 "input_name": safe_name,
                 "status": "queued",
                 "progress": 0,
@@ -1512,6 +1946,140 @@ def job_status(job_id: str, uid: str = Depends(_require_user_uid)) -> dict[str, 
 
     job["download_all_url"] = f"/api/jobs/{job_id}/download-all" if has_downloads else None
     return job
+
+
+@app.get("/api/media")
+def list_media(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=MEDIA_LIST_MAX_PAGE_SIZE),
+    sort_by: str = Query(default="created_at"),
+    sort_order: str = Query(default="desc"),
+    uid: str = Depends(_require_user_uid),
+) -> dict[str, Any]:
+    _require_durable_pipeline_enabled()
+
+    if sort_by not in MEDIA_SORT_FIELDS:
+        raise HTTPException(status_code=400, detail=f"Unsupported sort_by value: {sort_by}")
+    if sort_order not in MEDIA_SORT_ORDERS:
+        raise HTTPException(status_code=400, detail=f"Unsupported sort_order value: {sort_order}")
+
+    items: list[dict[str, Any]] = []
+    for job in _list_jobs_for_uid(uid):
+        normalized_job = _ensure_video_identity_metadata(job)
+        for video in normalized_job.get("videos", []):
+            if isinstance(video, dict):
+                items.append(_build_media_item(normalized_job, video))
+
+    items.sort(key=lambda item: _media_sort_value(item, sort_by), reverse=sort_order == "desc")
+
+    total = len(items)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    start_index = (page - 1) * page_size
+    paged_items = items[start_index:start_index + page_size]
+
+    return {
+        "items": paged_items,
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "total_pages": total_pages,
+        "sort_by": sort_by,
+        "sort_order": sort_order,
+    }
+
+
+@app.patch("/api/media/{job_id}/{video_id}")
+def rename_media(
+    job_id: str,
+    video_id: str,
+    payload: dict[str, Any] = Body(...),
+    uid: str = Depends(_require_user_uid),
+) -> dict[str, Any]:
+    _require_durable_pipeline_enabled()
+
+    next_title = str(payload.get("title") or "").strip()
+    if not next_title:
+        raise HTTPException(status_code=400, detail="title is required")
+    if len(next_title) > 120:
+        raise HTTPException(status_code=400, detail="title must be 120 characters or fewer")
+
+    job = _get_job(job_id, requester_uid=uid)
+    job = _ensure_video_identity_metadata(job)
+    video_index, video = _find_video_by_id(job, video_id)
+    job["videos"][video_index]["title"] = next_title
+    updated = _persist_job_state(job)
+    _, persisted_video = _find_video_by_id(updated, video_id)
+
+    return {
+        "id": str(persisted_video.get("id") or ""),
+        "job_id": job_id,
+        "title": str(persisted_video.get("title") or next_title),
+    }
+
+
+@app.delete("/api/media/{job_id}/{video_id}")
+def delete_media(
+    job_id: str,
+    video_id: str,
+    uid: str = Depends(_require_user_uid),
+) -> dict[str, Any]:
+    _require_durable_pipeline_enabled()
+
+    job = _get_job(job_id, requester_uid=uid)
+    job = _ensure_video_identity_metadata(job)
+    video_index, video = _find_video_by_id(job, video_id)
+
+    video_status = str(video.get("status") or "")
+    if video_status in {"queued", "running"}:
+        raise HTTPException(status_code=409, detail="Media is still rendering and cannot be deleted")
+
+    object_key = str(video.get("r2_object_key") or "")
+    if object_key:
+        try:
+            _delete_r2_object(object_key)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=f"Failed to delete media object: {exc}") from exc
+
+    job_dir = Path(str(job.get("job_dir") or ""))
+    output_name = str(video.get("output_name") or "")
+    log_name = str(video.get("log_name") or "")
+    if output_name:
+        _safe_unlink(job_dir / "outputs" / output_name)
+    if log_name:
+        _safe_unlink(job_dir / "logs" / log_name)
+
+    del job["videos"][video_index]
+    _persist_job_state(job)
+    return {"deleted": True, "job_id": job_id, "id": video_id}
+
+
+@app.post("/api/media/{job_id}/{video_id}/download-link")
+def issue_media_download_link(
+    job_id: str,
+    video_id: str,
+    uid: str = Depends(_require_user_uid),
+) -> dict[str, Any]:
+    _require_durable_pipeline_enabled()
+
+    job = _get_job(job_id, requester_uid=uid)
+    job = _ensure_video_identity_metadata(job)
+    _, video = _find_video_by_id(job, video_id)
+
+    output_name = str(video.get("output_name") or "")
+    object_key = str(video.get("r2_object_key") or "")
+    if not output_name or not object_key or str(video.get("status") or "") != "completed":
+        raise HTTPException(status_code=404, detail="Media file not available")
+
+    try:
+        url = _signed_r2_download_url(object_key, output_name)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Failed to sign download URL: {exc}") from exc
+
+    return {
+        "url": url,
+        "filename": output_name,
+        "expires_in_seconds": R2_SIGNED_URL_TTL_SECONDS,
+    }
 
 
 @app.get("/api/jobs/{job_id}/download/{filename}")

@@ -37,6 +37,8 @@ class FirestoreJobDocument(TypedDict, total=False):
 
 
 class FirestoreJobVideoDocument(TypedDict, total=False):
+    id: str
+    title: str
     input_name: str
     status: str
     progress: int
