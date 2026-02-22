@@ -67,7 +67,6 @@ jobs:
           set -euo pipefail
           PORT="${VPS_PORT:-22}"
           APP_DIR="${VPS_STAGING_APP_DIR:-/opt/poverlay-staging}"
-          PUBLIC_URL="${VPS_STAGING_PUBLIC_URL:-https://dev.poverlay.com}"
 
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             BRANCH="${MANUAL_BRANCH}"
@@ -84,6 +83,5 @@ jobs:
             --api-service poverlay-staging-api \
             --web-service poverlay-staging-web \
             --api-health-url http://127.0.0.1:8788/health \
-            --web-health-url http://127.0.0.1:3001 \
-            --public-url "${PUBLIC_URL}"
+            --web-health-url http://127.0.0.1:3001
           EOF
