@@ -47,6 +47,7 @@ SYSTEMD_WEB_UNIT="deploy/systemd/poverlay-web.service"
 NGINX_SITE_SOURCE="deploy/nginx/poverlay.conf"
 NGINX_SITE_NAME="poverlay"
 ENV_FILE=""
+TEMP_ENV_FILE=""
 
 require_cmd() {
   local cmd="$1"
@@ -81,7 +82,14 @@ show_failure_context() {
   sudo journalctl -u "${WEB_SERVICE}" -n 80 --no-pager || true
 }
 
+cleanup_temp_env_file() {
+  if [[ -n "${TEMP_ENV_FILE}" && -f "${TEMP_ENV_FILE}" ]]; then
+    rm -f "${TEMP_ENV_FILE}" || true
+  fi
+}
+
 trap show_failure_context ERR
+trap cleanup_temp_env_file EXIT
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -240,12 +248,19 @@ if [[ -z "${ENV_FILE}" && "${API_SERVICE}" =~ ^(.+)-api$ ]]; then
 fi
 
 if [[ -n "${ENV_FILE}" ]]; then
-  if [[ ! -r "${ENV_FILE}" ]]; then
-    echo "Environment file is not readable: ${ENV_FILE}" >&2
-    exit 1
+  if [[ -r "${ENV_FILE}" ]]; then
+    export POVERLAY_ENV_FILE="${ENV_FILE}"
+    echo "==> Using env file for build/check: ${POVERLAY_ENV_FILE}"
+  else
+    TEMP_ENV_FILE="$(mktemp /tmp/poverlay-deploy-env.XXXXXX)"
+    if ! sudo cat "${ENV_FILE}" > "${TEMP_ENV_FILE}"; then
+      echo "Environment file is not readable and could not be copied via sudo: ${ENV_FILE}" >&2
+      exit 1
+    fi
+    chmod 600 "${TEMP_ENV_FILE}"
+    export POVERLAY_ENV_FILE="${TEMP_ENV_FILE}"
+    echo "==> Using env file for build/check via temporary copy: ${ENV_FILE}"
   fi
-  export POVERLAY_ENV_FILE="${ENV_FILE}"
-  echo "==> Using env file for build/check: ${POVERLAY_ENV_FILE}"
 fi
 
 require_cmd git
