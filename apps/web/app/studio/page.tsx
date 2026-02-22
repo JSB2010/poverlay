@@ -2,6 +2,7 @@
 
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { useAuth } from "@/components/auth-provider";
+import { apiUrl } from "@/lib/api-base";
 import { PUBLIC_WEB_CONFIG } from "@/lib/public-config";
 
 type ThemeOption = {
@@ -271,29 +272,8 @@ const DEFAULT_FORM_STATE: FormState = {
   fixed_fps: "30",
 };
 
-function resolveApiBase(): string {
-  if (CONFIGURED_API_BASE) {
-    return CONFIGURED_API_BASE;
-  }
-
-  if (process.env.NODE_ENV !== "development") {
-    return "";
-  }
-
-  if (typeof window === "undefined") {
-    return "";
-  }
-
-  const host = window.location.hostname;
-  if (host === "localhost" || host === "127.0.0.1") {
-    return "http://127.0.0.1:8787";
-  }
-
-  return "";
-}
-
-function apiUrl(path: string): string {
-  return `${resolveApiBase()}${path}`;
+function buildApiUrl(path: string): string {
+  return apiUrl(path, CONFIGURED_API_BASE);
 }
 
 function isObjectRecord(value: unknown): value is Record<string, unknown> {
@@ -493,7 +473,7 @@ export default function HomePage() {
   useEffect(() => {
     async function loadMeta() {
       try {
-        const response = await fetch(apiUrl("/api/meta"), { headers: await authHeaders() });
+        const response = await fetch(buildApiUrl("/api/meta"), { headers: await authHeaders() });
         if (!response.ok) {
           const errorPayload = await readApiPayload(response);
           throw new Error(extractErrorMessage(errorPayload, "Could not load server metadata"));
@@ -613,7 +593,7 @@ export default function HomePage() {
 
   async function pollJob(jobId: string): Promise<void> {
     try {
-      const response = await fetch(apiUrl(`/api/jobs/${jobId}`), { headers: await authHeaders() });
+      const response = await fetch(buildApiUrl(`/api/jobs/${jobId}`), { headers: await authHeaders() });
       const payload = await readApiPayload(response);
       if (!response.ok) {
         throw new Error(extractErrorMessage(payload, `Could not fetch job ${jobId}`));
@@ -649,7 +629,7 @@ export default function HomePage() {
   async function downloadAuthenticated(path: string, fallbackFilename: string): Promise<void> {
     try {
       setStatusError(null);
-      const response = await fetch(apiUrl(path), { headers: await authHeaders() });
+      const response = await fetch(buildApiUrl(path), { headers: await authHeaders() });
       if (!response.ok) {
         const errorPayload = await readApiPayload(response);
         throw new Error(extractErrorMessage(errorPayload, "Download failed"));
@@ -762,7 +742,7 @@ export default function HomePage() {
     payload.append("include_maps", mapsEnabled ? "true" : "false");
 
     try {
-      const response = await fetch(apiUrl("/api/jobs"), {
+      const response = await fetch(buildApiUrl("/api/jobs"), {
         method: "POST",
         body: payload,
         headers: await authHeaders(),

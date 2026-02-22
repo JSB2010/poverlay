@@ -3,10 +3,10 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "start": "next start",
-    "typecheck": "tsc --noEmit"
+    "dev": "bash -lc 'source ../../scripts/load-env.sh && next dev'",
+    "build": "bash -lc 'source ../../scripts/load-env.sh && next build'",
+    "start": "bash -lc 'source ../../scripts/load-env.sh && next start'",
+    "typecheck": "bash -lc 'source ../../scripts/load-env.sh && tsc --noEmit'"
   },
   "dependencies": {
     "@tailwindcss/postcss": "^4.1.18",

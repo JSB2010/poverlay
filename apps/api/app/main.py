@@ -235,6 +235,7 @@ else:
 
 
 TERMINAL_JOB_STATUSES = {"completed", "completed_with_errors", "failed"}
+ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 # Firestore is the source of truth; this cache only reduces repeated reads within a worker run.
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
@@ -840,6 +841,7 @@ def _build_media_item(job: dict[str, Any], video: dict[str, Any]) -> dict[str, A
         "job_id": str(job.get("id") or ""),
         "status": status,
         "job_status": str(job.get("status") or ""),
+        "job_message": str(job.get("message") or ""),
         "title": _default_video_title(video),
         "input_name": str(video.get("input_name") or ""),
         "output_name": output_name or None,
@@ -847,8 +849,10 @@ def _build_media_item(job: dict[str, Any], video: dict[str, Any]) -> dict[str, A
         "render_profile_label": video.get("render_profile_label"),
         "source_resolution": video.get("source_resolution"),
         "source_fps": video.get("source_fps"),
+        "progress": int(video.get("progress") or 0),
         "detail": video.get("detail"),
         "error": video.get("error"),
+        "log_name": str(video.get("log_name") or "") or None,
         "created_at": job.get("created_at"),
         "updated_at": job.get("updated_at"),
         "can_download": bool(output_name and object_key and status == "completed"),
@@ -1213,7 +1217,8 @@ def _job_has_only_uploaded_outputs(job: dict[str, Any]) -> bool:
 
 def _cleanup_local_artifacts_if_uploaded(job_id: str) -> None:
     job = _get_job(job_id)
-    if job.get("status") not in TERMINAL_JOB_STATUSES:
+    # Keep failed-job artifacts/logs available for troubleshooting.
+    if job.get("status") not in {"completed", "completed_with_errors"}:
         return
     if not _job_has_only_uploaded_outputs(job):
         return
@@ -1547,6 +1552,10 @@ def _run_renderer(
     return return_code, last_line
 
 
+def _normalize_console_line(value: str) -> str:
+    return ANSI_ESCAPE_RE.sub("", value).strip()
+
+
 def _process_job(job_id: str) -> None:
     job = _get_job(job_id)
     if job.get("status") in TERMINAL_JOB_STATUSES:
@@ -1589,6 +1598,7 @@ def _process_job(job_id: str) -> None:
     total_videos = len(job["videos"])
     failed_count = 0
     owner_uid = str(job.get("uid") or "")
+    first_failure_reason: str | None = None
 
     for index, video_state in enumerate(job["videos"]):
         input_name = video_state["input_name"]
@@ -1612,6 +1622,8 @@ def _process_job(job_id: str) -> None:
             )
             layout_path = work_dir / f"layout-{index + 1}.xml"
             layout_path.write_text(layout_xml, encoding="utf-8")
+            maps_enabled_for_attempt = bool(job["settings"]["include_maps"])
+            map_fallback_used = False
 
             output_name = f"{Path(input_name).stem}-overlay.mp4"
             output_path = outputs_dir / output_name
@@ -1639,16 +1651,44 @@ def _process_job(job_id: str) -> None:
                     render_profile=profile_id,
                 )
                 return_code, last_line = _run_renderer(command, log_path, job_id, index, total_videos)
+                normalized_last_line = _normalize_console_line(last_line).lower()
+                if (
+                    return_code != 0
+                    and maps_enabled_for_attempt
+                    and not map_fallback_used
+                    and "images do not match" in normalized_last_line
+                ):
+                    map_fallback_used = True
+                    maps_enabled_for_attempt = False
+                    _set_video(job_id, index, detail="Map rendering failed; retrying without route maps.")
+                    fallback_layout = render_layout_xml(
+                        metadata["width"],
+                        metadata["height"],
+                        job["settings"]["overlay_theme"],
+                        include_maps=False,
+                        layout_style=str(job["settings"].get("layout_style", DEFAULT_LAYOUT_STYLE)),
+                        component_visibility=job["settings"].get("component_visibility"),
+                        speed_units=str(job["settings"].get("speed_units", "kph")),
+                    )
+                    layout_path.write_text(fallback_layout, encoding="utf-8")
+                    return_code, last_line = _run_renderer(command, log_path, job_id, index, total_videos)
+                    normalized_last_line = _normalize_console_line(last_line).lower()
+
                 if return_code == 0:
                     selected_profile = attempted_profile
                     break
-                last_error = f"Renderer exited with code {return_code} using profile {profile_id}"
+                if normalized_last_line and ("error" in normalized_last_line or "exception" in normalized_last_line):
+                    last_error = normalized_last_line
+                else:
+                    last_error = f"Renderer exited with code {return_code} using profile {profile_id}"
                 # Retry other profiles only for likely codec/encode issues.
-                if "don't overlap in time" in (last_line or "").lower():
+                if "don't overlap in time" in normalized_last_line:
                     break
 
             if return_code != 0:
                 failed_count += 1
+                if first_failure_reason is None:
+                    first_failure_reason = last_error or f"Renderer exited with code {return_code}"
                 _set_video(
                     job_id,
                     index,
@@ -1675,7 +1715,6 @@ def _process_job(job_id: str) -> None:
                 status="completed",
                 progress=100,
                 output_name=output_name,
-                output_size_bytes=output_path.stat().st_size,
                 log_name=log_path.name,
                 render_profile=selected_profile,
                 render_profile_label=_render_profile_label(selected_profile),
@@ -1686,6 +1725,8 @@ def _process_job(job_id: str) -> None:
             )
         except Exception as exc:  # noqa: BLE001
             failed_count += 1
+            if first_failure_reason is None:
+                first_failure_reason = str(exc)
             _set_video(
                 job_id,
                 index,
@@ -1709,7 +1750,10 @@ def _process_job(job_id: str) -> None:
             message=f"Rendered with {failed_count} failure(s)",
         )
     else:
-        _set_job(job_id, status="failed", progress=100, finished_at=_utc_now(), message="Rendering failed")
+        failure_message = "Rendering failed"
+        if first_failure_reason:
+            failure_message = f"Rendering failed: {first_failure_reason[:240]}"
+        _set_job(job_id, status="failed", progress=100, finished_at=_utc_now(), message=failure_message)
 
     expires_at = _utc_after_hours(JOB_OUTPUT_RETENTION_HOURS)
     _set_job(job_id, expires_at=expires_at)
@@ -1821,7 +1865,8 @@ async def create_job(
     resolved_component_visibility = _parse_component_visibility(component_visibility, include_maps)
     include_maps = bool(resolved_component_visibility.get("route_maps", include_maps))
 
-    if not Path(GOPRO_DASHBOARD_BIN).exists():
+    renderer_path = Path(GOPRO_DASHBOARD_BIN)
+    if not GOPRO_DASHBOARD_BIN.strip() or not renderer_path.is_file():
         raise HTTPException(
             status_code=500,
             detail=(
@@ -1831,7 +1876,7 @@ async def create_job(
         )
 
     font_path = Path(DEFAULT_FONT_PATH)
-    if not font_path.exists():
+    if not DEFAULT_FONT_PATH.strip() or not font_path.is_file():
         raise HTTPException(status_code=500, detail=f"Font file not found: {font_path}")
 
     job_id = uuid4().hex

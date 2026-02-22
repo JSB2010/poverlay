@@ -2,6 +2,7 @@
 
 import { FormEvent, useEffect, useState } from "react";
 import { useAuth } from "@/components/auth-provider";
+import { apiUrl } from "@/lib/api-base";
 import { PUBLIC_WEB_CONFIG } from "@/lib/public-config";
 
 const CONFIGURED_API_BASE = PUBLIC_WEB_CONFIG.apiBase;
@@ -10,14 +11,8 @@ type UserSettingsResponse = {
   notifications_enabled?: boolean;
 };
 
-function apiUrl(path: string): string {
-  if (/^https?:\/\//i.test(path)) {
-    return path;
-  }
-  if (!CONFIGURED_API_BASE) {
-    return path;
-  }
-  return `${CONFIGURED_API_BASE}${path.startsWith("/") ? path : `/${path}`}`;
+function buildApiUrl(path: string): string {
+  return apiUrl(path, CONFIGURED_API_BASE);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -80,7 +75,7 @@ export default function SettingsPage() {
           throw new Error("Authentication token unavailable.");
         }
 
-        const response = await fetch(apiUrl("/api/user/settings"), {
+        const response = await fetch(buildApiUrl("/api/user/settings"), {
           headers: {
             Authorization: `Bearer ${token}`,
           },
@@ -124,7 +119,7 @@ export default function SettingsPage() {
         throw new Error("Authentication token unavailable.");
       }
 
-      const response = await fetch(apiUrl("/api/user/settings"), {
+      const response = await fetch(buildApiUrl("/api/user/settings"), {
         method: "PUT",
         headers: {
           "Content-Type": "application/json",

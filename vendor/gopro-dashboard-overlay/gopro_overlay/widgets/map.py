@@ -49,35 +49,46 @@ class MaybeRoundedBorder:
         self.corner_radius = corner_radius
         self.size = size
         self.mask = None
+        self.mask_size = None
 
     def rounded(self, image):
 
         draw = ImageDraw.Draw(image)
+        width, height = image.size
 
         if self.corner_radius:
+            radius = min(int(self.corner_radius), max(0, min(width, height) // 2))
             if self.mask is None:
-                self.mask = self.generate_mask()
+                self.mask = self.generate_mask((width, height), radius)
+                self.mask_size = (width, height)
+            elif self.mask_size != (width, height):
+                self.mask = self.generate_mask((width, height), radius)
+                self.mask_size = (width, height)
 
             image.putalpha(self.mask)
 
             draw.rounded_rectangle(
-                (0, 0) + (self.size - 1, self.size - 1),
-                radius=self.corner_radius,
+                (0, 0) + (width - 1, height - 1),
+                radius=radius,
                 outline=(0, 0, 0)
             )
         else:
             draw.line(
-                (0, 0, 0, self.size - 1, self.size - 1, self.size - 1, self.size - 1, 0, 0, 0),
+                (0, 0, 0, height - 1, width - 1, height - 1, width - 1, 0, 0, 0),
                 fill=(0, 0, 0)
             )
             image.putalpha(int(255 * self.opacity))
 
         return image
 
-    def generate_mask(self):
-        mask = Image.new('L', (self.size, self.size), 0)
-        ImageDraw.Draw(mask).rounded_rectangle((0, 0) + (self.size - 1, self.size - 1), radius=self.corner_radius,
-                                               fill=int(self.opacity * 255))
+    def generate_mask(self, mask_size, radius):
+        width, height = mask_size
+        mask = Image.new('L', (width, height), 0)
+        ImageDraw.Draw(mask).rounded_rectangle(
+            (0, 0) + (width - 1, height - 1),
+            radius=radius,
+            fill=int(self.opacity * 255),
+        )
         return mask
 
 
@@ -155,13 +166,14 @@ class MovingMap(Widget):
         self.zoom = zoom
         self.hypotenuse = int(math.sqrt((self.size ** 2) * 2))
 
-        self.half_width_height = (self.hypotenuse / 2)
-
+        self.half_width_height = self.hypotenuse // 2
+        crop_left = self.half_width_height - (self.size // 2)
+        crop_top = self.half_width_height - (self.size // 2)
         self.bounds = (
-            self.half_width_height - (self.size / 2),
-            self.half_width_height - (self.size / 2),
-            self.half_width_height + (self.size / 2),
-            self.half_width_height + (self.size / 2)
+            crop_left,
+            crop_top,
+            crop_left + self.size,
+            crop_top + self.size,
         )
         self.perceptible = PerceptibleMovementCheck(always_redraw)
         self.border = MaybeRoundedBorder(size=size, corner_radius=corner_radius, opacity=opacity)

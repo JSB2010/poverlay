@@ -139,7 +139,7 @@ class ApiRuntimeConfig:
 
 
 def load_runtime_config(*, repo_root: Path, service_root: Path) -> ApiRuntimeConfig:
-    data_dir = Path(os.environ.get("POVERLAY_DATA_DIR", str(repo_root / "data"))).expanduser()
+    data_dir = Path(_read_optional("POVERLAY_DATA_DIR") or str(repo_root / "data")).expanduser()
 
     local_dashboard_bin = repo_root / "scripts" / "gopro-dashboard-local.sh"
     dashboard_default = local_dashboard_bin if local_dashboard_bin.exists() else (repo_root / ".venv" / "bin" / "gopro-dashboard.py")
@@ -206,17 +206,17 @@ def load_runtime_config(*, repo_root: Path, service_root: Path) -> ApiRuntimeCon
 
     config = ApiRuntimeConfig(
         data_dir=data_dir,
-        gopro_dashboard_bin=os.environ.get("GOPRO_DASHBOARD_BIN", str(dashboard_default)),
-        ffprobe_bin=os.environ.get("FFPROBE_BIN", "ffprobe"),
-        overlay_font_path=os.environ.get("OVERLAY_FONT_PATH", str(service_root / "app" / "static" / "fonts" / "Orbitron-Bold.ttf")),
+        gopro_dashboard_bin=_read_optional("GOPRO_DASHBOARD_BIN") or str(dashboard_default),
+        ffprobe_bin=_read_optional("FFPROBE_BIN") or "ffprobe",
+        overlay_font_path=_read_optional("OVERLAY_FONT_PATH") or str(service_root / "app" / "static" / "fonts" / "Orbitron-Bold.ttf"),
         cors_origins=_read_cors_origins(),
         job_cleanup_enabled=_read_bool("JOB_CLEANUP_ENABLED", True),
         job_cleanup_interval_seconds=_read_int("JOB_CLEANUP_INTERVAL_SECONDS", 900, 60),
         job_output_retention_hours=_read_float("JOB_OUTPUT_RETENTION_HOURS", 24.0, 1.0),
         delete_inputs_on_complete=_read_bool("DELETE_INPUTS_ON_COMPLETE", True),
         delete_work_on_complete=_read_bool("DELETE_WORK_ON_COMPLETE", True),
-        api_base_url=os.environ.get("API_BASE_URL", "http://127.0.0.1:8787"),
-        web_base_url=os.environ.get("WEB_BASE_URL", "http://127.0.0.1:3000"),
+        api_base_url=_read_optional("API_BASE_URL") or "http://127.0.0.1:8787",
+        web_base_url=_read_optional("WEB_BASE_URL") or "http://127.0.0.1:3000",
         firebase=firebase,
         firestore=firestore,
         r2=r2,

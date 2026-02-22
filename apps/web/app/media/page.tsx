@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useAuth } from "@/components/auth-provider";
+import { apiUrl } from "@/lib/api-base";
 import { PUBLIC_WEB_CONFIG } from "@/lib/public-config";
 
 type MediaItem = {
@@ -10,6 +11,7 @@ type MediaItem = {
   job_id: string;
   status: string;
   job_status: string;
+  job_message?: string | null;
   title: string;
   input_name: string;
   output_name?: string | null;
@@ -17,8 +19,10 @@ type MediaItem = {
   render_profile_label?: string | null;
   source_resolution?: string | null;
   source_fps?: string | null;
+  progress?: number | null;
   detail?: string | null;
   error?: string | null;
+  log_name?: string | null;
   created_at?: string | null;
   updated_at?: string | null;
   can_download: boolean;
@@ -35,29 +39,8 @@ const PAGE_SIZE = 12;
 const SORT_FIELDS = ["created_at", "updated_at", "status", "title"] as const;
 const SORT_ORDERS = ["desc", "asc"] as const;
 
-function resolveApiBase(): string {
-  if (CONFIGURED_API_BASE) {
-    return CONFIGURED_API_BASE;
-  }
-
-  if (process.env.NODE_ENV !== "development") {
-    return "";
-  }
-
-  if (typeof window === "undefined") {
-    return "";
-  }
-
-  const host = window.location.hostname;
-  if (host === "localhost" || host === "127.0.0.1") {
-    return "http://127.0.0.1:8787";
-  }
-
-  return "";
-}
-
-function apiUrl(path: string): string {
-  return `${resolveApiBase()}${path}`;
+function buildApiUrl(path: string): string {
+  return apiUrl(path, CONFIGURED_API_BASE);
 }
 
 function isObjectRecord(value: unknown): value is Record<string, unknown> {
@@ -123,6 +106,20 @@ function statusBadgeClasses(status: string): string {
   return "bg-blue-500/10 text-blue-600 dark:text-blue-400";
 }
 
+function clampProgress(value?: number | null): number {
+  if (typeof value !== "number" || Number.isNaN(value)) {
+    return 0;
+  }
+  return Math.max(0, Math.min(100, Math.round(value)));
+}
+
+function cleanConsoleText(value?: string | null): string {
+  if (!value) {
+    return "";
+  }
+  return value.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "").trim();
+}
+
 export default function MediaPage() {
   const { isEnabled: isAuthEnabled, getIdToken } = useAuth();
   const [items, setItems] = useState<MediaItem[]>([]);
@@ -149,13 +146,16 @@ export default function MediaPage() {
     return headers;
   }, [getIdToken, isAuthEnabled]);
 
-  const loadMedia = useCallback(async () => {
-    setIsLoading(true);
+  const loadMedia = useCallback(async (options?: { silent?: boolean }) => {
+    const silent = options?.silent === true;
+    if (!silent) {
+      setIsLoading(true);
+    }
     setErrorMessage(null);
 
     try {
       const response = await fetch(
-        apiUrl(`/api/media?page=${page}&page_size=${PAGE_SIZE}&sort_by=${sortBy}&sort_order=${sortOrder}`),
+        buildApiUrl(`/api/media?page=${page}&page_size=${PAGE_SIZE}&sort_by=${sortBy}&sort_order=${sortOrder}`),
         { headers: await authHeaders() },
       );
       const payload = await readApiPayload(response);
@@ -175,13 +175,32 @@ export default function MediaPage() {
       setItems([]);
       setTotalPages(1);
     } finally {
-      setIsLoading(false);
+      if (!silent) {
+        setIsLoading(false);
+      }
     }
   }, [authHeaders, page, sortBy, sortOrder]);
 
   useEffect(() => {
     void loadMedia();
   }, [loadMedia]);
+
+  const activeRenderCount = useMemo(
+    () => items.filter((item) => item.status === "queued" || item.status === "running").length,
+    [items]
+  );
+
+  useEffect(() => {
+    if (activeRenderCount === 0) {
+      return;
+    }
+
+    const intervalId = window.setInterval(() => {
+      void loadMedia({ silent: true });
+    }, 2000);
+
+    return () => window.clearInterval(intervalId);
+  }, [activeRenderCount, loadMedia]);
 
   const itemCountLabel = useMemo(() => `${items.length} item${items.length === 1 ? "" : "s"} on this page`, [items.length]);
 
@@ -197,7 +216,7 @@ export default function MediaPage() {
     try {
       const headers = await authHeaders();
       headers.set("Content-Type", "application/json");
-      const response = await fetch(apiUrl(`/api/media/${item.job_id}/${item.id}`), {
+      const response = await fetch(buildApiUrl(`/api/media/${item.job_id}/${item.id}`), {
         method: "PATCH",
         headers,
         body: JSON.stringify({ title: nextTitle.trim() }),
@@ -224,7 +243,7 @@ export default function MediaPage() {
     setBusyKey(key);
     setErrorMessage(null);
     try {
-      const response = await fetch(apiUrl(`/api/media/${item.job_id}/${item.id}`), {
+      const response = await fetch(buildApiUrl(`/api/media/${item.job_id}/${item.id}`), {
         method: "DELETE",
         headers: await authHeaders(),
       });
@@ -245,7 +264,7 @@ export default function MediaPage() {
     setBusyKey(key);
     setErrorMessage(null);
     try {
-      const response = await fetch(apiUrl(`/api/media/${item.job_id}/${item.id}/download-link`), {
+      const response = await fetch(buildApiUrl(`/api/media/${item.job_id}/${item.id}/download-link`), {
         method: "POST",
         headers: await authHeaders(),
       });
@@ -260,6 +279,39 @@ export default function MediaPage() {
       window.open(payload.url, "_blank", "noopener,noreferrer");
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : "Download link request failed.");
+    } finally {
+      setBusyKey(null);
+    }
+  }
+
+  async function downloadRenderLog(item: MediaItem): Promise<void> {
+    if (!item.log_name) {
+      return;
+    }
+
+    const key = `${item.job_id}:${item.id}:log`;
+    setBusyKey(key);
+    setErrorMessage(null);
+    try {
+      const response = await fetch(buildApiUrl(`/api/jobs/${item.job_id}/log/${encodeURIComponent(item.log_name)}`), {
+        headers: await authHeaders(),
+      });
+      if (!response.ok) {
+        const payload = await readApiPayload(response);
+        throw new Error(extractErrorMessage(payload, "Failed to download renderer log."));
+      }
+
+      const blob = await response.blob();
+      const objectUrl = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = objectUrl;
+      anchor.download = item.log_name;
+      document.body.append(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(objectUrl);
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "Failed to download renderer log.");
     } finally {
       setBusyKey(null);
     }
@@ -327,6 +379,11 @@ export default function MediaPage() {
           </label>
 
           <span className="text-xs text-[var(--color-muted-foreground)]">{itemCountLabel}</span>
+          {activeRenderCount > 0 && (
+            <span className="text-xs text-[var(--color-muted-foreground)]">
+              {activeRenderCount} active render{activeRenderCount === 1 ? "" : "s"} (auto-refreshing)
+            </span>
+          )}
         </div>
 
         {errorMessage && (
@@ -349,6 +406,12 @@ export default function MediaPage() {
               const cardKey = `${item.job_id}:${item.id}`;
               const isBusy = busyKey !== null && busyKey.startsWith(cardKey);
               const canDelete = item.status !== "queued" && item.status !== "running";
+              const progress = clampProgress(item.progress);
+              const statusLabel = item.status.replaceAll("_", " ");
+              const failureReason = cleanConsoleText(item.error || item.job_message);
+              const detail = cleanConsoleText(item.detail);
+              const isActive = item.status === "queued" || item.status === "running";
+              const isFailure = item.status === "failed" || item.status === "completed_with_errors";
 
               return (
                 <li key={cardKey} className="rounded-xl border border-[var(--color-border)] bg-[var(--color-background)] p-4">
@@ -360,16 +423,41 @@ export default function MediaPage() {
                       </p>
                     </div>
                     <span className={`rounded-full px-2 py-1 text-xs font-medium ${statusBadgeClasses(item.status)}`}>
-                      {item.status.replaceAll("_", " ")}
+                      {isActive ? `${statusLabel} ${progress}%` : statusLabel}
                     </span>
                   </div>
 
-                  {(item.error || item.detail) && (
-                    <p className="mt-3 text-xs text-[var(--color-muted-foreground)]">{item.error || item.detail}</p>
+                  {isActive && (
+                    <div className="mt-3">
+                      <div className="h-2 w-full overflow-hidden rounded-full bg-[var(--color-muted)]/50">
+                        <div
+                          className="h-full rounded-full bg-[var(--color-primary)] transition-[width] duration-300"
+                          style={{ width: `${progress}%` }}
+                        />
+                      </div>
+                      <p className="mt-2 text-xs text-[var(--color-muted-foreground)]">
+                        {detail || "Render queued"}
+                      </p>
+                    </div>
+                  )}
+
+                  {!isActive && isFailure && failureReason && (
+                    <p className="mt-3 rounded-md border border-red-500/30 bg-red-500/10 px-2.5 py-2 text-xs text-red-700 dark:text-red-300">
+                      {failureReason}
+                    </p>
+                  )}
+
+                  {!isActive && detail && (!isFailure || detail !== failureReason) && (
+                    <p className="mt-2 text-xs text-[var(--color-muted-foreground)]">{detail}</p>
                   )}
 
                   <p className="mt-3 text-xs text-[var(--color-muted-foreground)]">
-                    {[item.source_resolution, item.source_fps ? `${item.source_fps} fps` : "", formatBytes(item.size_bytes)]
+                    {[
+                      item.render_profile_label,
+                      item.source_resolution,
+                      item.source_fps ? `${item.source_fps} fps` : "",
+                      formatBytes(item.size_bytes),
+                    ]
                       .filter(Boolean)
                       .join(" • ") || "No output metadata yet"}
                   </p>
@@ -398,6 +486,14 @@ export default function MediaPage() {
                       className="rounded-md bg-[var(--color-primary)] px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-[var(--color-primary)]/90 disabled:cursor-not-allowed disabled:opacity-50"
                     >
                       Download
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void downloadRenderLog(item)}
+                      disabled={isBusy || !item.log_name}
+                      className="rounded-md border border-[var(--color-border)] px-3 py-1.5 text-xs font-medium transition-colors hover:bg-[var(--color-muted)]/30 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      Download log
                     </button>
                   </div>
                 </li>
