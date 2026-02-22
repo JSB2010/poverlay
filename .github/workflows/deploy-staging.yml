@@ -79,12 +79,11 @@ jobs:
           set -euo pipefail
           cd "${APP_DIR}"
           sudo -n true >/dev/null
-          ./scripts/deploy-vps.sh \
+          POVERLAY_ENV_FILE=/etc/poverlay/poverlay-staging.env ./scripts/deploy-vps.sh \
             --branch "${BRANCH}" \
             --api-service poverlay-staging-api \
             --web-service poverlay-staging-web \
             --api-health-url http://127.0.0.1:8788/health \
             --web-health-url http://127.0.0.1:3001 \
-            --env-file /etc/poverlay/poverlay-staging.env \
             --public-url "${PUBLIC_URL}"
           EOF
