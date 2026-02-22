@@ -76,6 +76,19 @@ type JobStatus = {
   download_all_url?: string | null;
 };
 
+type UploadProgressState = {
+  loadedBytes: number;
+  totalBytes: number;
+  percent: number;
+  rateBytesPerSecond: number;
+  etaSeconds: number | null;
+};
+
+type SubmissionStage = "idle" | "uploading" | "queued" | "rendering" | "completed" | "failed";
+
+type PipelineStepState = "pending" | "active" | "done" | "error";
+type PipelineStepMetric = { label: string; value: string };
+
 type FormState = {
   overlay_theme: string;
   layout_style: string;
@@ -381,6 +394,91 @@ function formatBytes(value?: number | null): string {
   return `${size.toFixed(1)} ${units[unitIndex]}`;
 }
 
+function clampPercent(value?: number | null): number {
+  if (typeof value !== "number" || Number.isNaN(value)) {
+    return 0;
+  }
+  return Math.max(0, Math.min(100, Math.round(value)));
+}
+
+function formatEta(seconds: number | null): string {
+  if (seconds === null || !Number.isFinite(seconds) || seconds < 0) {
+    return "Calculating...";
+  }
+
+  const rounded = Math.round(seconds);
+  const hours = Math.floor(rounded / 3600);
+  const minutes = Math.floor((rounded % 3600) / 60);
+  const secs = rounded % 60;
+
+  if (hours > 0) {
+    return `${hours}h ${minutes}m`;
+  }
+  if (minutes > 0) {
+    return `${minutes}m ${secs}s`;
+  }
+  return `${secs}s`;
+}
+
+function formatRate(bytesPerSecond: number): string {
+  if (!Number.isFinite(bytesPerSecond) || bytesPerSecond <= 0) {
+    return "--";
+  }
+  return `${formatBytes(bytesPerSecond)}/s`;
+}
+
+function pipelineStepTone(state: PipelineStepState): string {
+  if (state === "done") {
+    return "border-emerald-400/60 bg-emerald-500/10 text-emerald-700";
+  }
+  if (state === "active") {
+    return "border-[var(--color-primary)]/60 bg-[var(--color-primary)]/15 text-[var(--color-primary)]";
+  }
+  if (state === "error") {
+    return "border-red-500/50 bg-red-500/10 text-red-700";
+  }
+  return "border-[var(--color-border)] bg-[var(--color-muted)]/20 text-[var(--color-muted-foreground)]";
+}
+
+function pipelineStepStateLabel(state: PipelineStepState): string {
+  if (state === "done") {
+    return "Done";
+  }
+  if (state === "active") {
+    return "Active";
+  }
+  if (state === "error") {
+    return "Error";
+  }
+  return "Pending";
+}
+
+function clipStatusTone(status: string): string {
+  if (status === "completed") {
+    return "bg-emerald-500/10 text-emerald-700";
+  }
+  if (status === "failed") {
+    return "bg-red-500/10 text-red-700";
+  }
+  if (status === "running") {
+    return "bg-amber-500/15 text-amber-700";
+  }
+  return "bg-[var(--color-muted)]/40 text-[var(--color-muted-foreground)]";
+}
+
+function pipelineStepProgressTone(state: PipelineStepState): string {
+  if (state === "done") {
+    return "bg-emerald-500";
+  }
+  if (state === "active") {
+    return "bg-[var(--color-primary)]";
+  }
+  if (state === "error") {
+    return "bg-red-500";
+  }
+  return "bg-[var(--color-border)]";
+}
+
 function mapStyleLabel(value: string): string {
   const presetLabels: Record<string, string> = {
     osm: "OpenStreetMap",
@@ -449,12 +547,22 @@ export default function HomePage() {
   const [job, setJob] = useState<JobStatus | null>(null);
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [submissionStage, setSubmissionStage] = useState<SubmissionStage>("idle");
   const [formError, setFormError] = useState<string | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
+  const [uploadProgress, setUploadProgress] = useState<UploadProgressState>({
+    loadedBytes: 0,
+    totalBytes: 0,
+    percent: 0,
+    rateBytesPerSecond: 0,
+    etaSeconds: null,
+  });
+  const [lastStatusUpdateAt, setLastStatusUpdateAt] = useState<number | null>(null);
   const [layoutPreviewById, setLayoutPreviewById] = useState<Record<string, string>>({});
   const [brokenLayoutPreviews, setBrokenLayoutPreviews] = useState<Record<string, true>>({});
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const uploadRequestRef = useRef<XMLHttpRequest | null>(null);
 
   async function authHeaders(): Promise<Headers> {
     const headers = new Headers();
@@ -537,6 +645,9 @@ export default function HomePage() {
       if (pollRef.current) {
         clearInterval(pollRef.current);
       }
+      if (uploadRequestRef.current) {
+        uploadRequestRef.current.abort();
+      }
     };
   }, []);
 
@@ -590,6 +701,215 @@ export default function HomePage() {
   const statsPanelEnabled = componentVisibility.stats_panel ?? true;
   const gpsPanelEnabled = componentVisibility.gps_panel ?? true;
   const mapsEnabled = componentVisibility.route_maps ?? true;
+  const selectedUploadBytes = useMemo(
+    () => (gpxFile?.size ?? 0) + videoFiles.reduce((sum, video) => sum + video.size, 0),
+    [gpxFile, videoFiles],
+  );
+  const videoStatusSummary = useMemo(() => {
+    const summary = {
+      total: job?.videos.length ?? 0,
+      queued: 0,
+      running: 0,
+      completed: 0,
+      failed: 0,
+    };
+
+    for (const video of job?.videos ?? []) {
+      if (video.status === "queued") {
+        summary.queued += 1;
+      } else if (video.status === "running") {
+        summary.running += 1;
+      } else if (video.status === "completed") {
+        summary.completed += 1;
+      } else if (video.status === "failed") {
+        summary.failed += 1;
+      }
+    }
+
+    return summary;
+  }, [job?.videos]);
+  const overallProgressPercent = useMemo(() => {
+    if (submissionStage === "uploading") {
+      return clampPercent(uploadProgress.percent);
+    }
+    return clampPercent(job?.progress ?? 0);
+  }, [job?.progress, submissionStage, uploadProgress.percent]);
+  const runningClipNames = useMemo(
+    () => (job?.videos ?? []).filter((video) => video.status === "running").map((video) => video.input_name),
+    [job?.videos],
+  );
+  const totalOutputBytes = useMemo(
+    () => (job?.videos ?? []).reduce((sum, video) => sum + (video.output_size_bytes ?? 0), 0),
+    [job?.videos],
+  );
+  const stepCards = useMemo(() => {
+    const uploadState: PipelineStepState =
+      submissionStage === "failed" ? "error" : submissionStage === "uploading" ? "active" : activeJobId ? "done" : "pending";
+    const queueState: PipelineStepState =
+      submissionStage === "failed"
+        ? "error"
+        : submissionStage === "queued"
+          ? "active"
+          : submissionStage === "rendering" || submissionStage === "completed"
+            ? "done"
+            : "pending";
+    const renderState: PipelineStepState =
+      submissionStage === "failed"
+        ? "error"
+        : submissionStage === "rendering"
+          ? "active"
+          : submissionStage === "completed"
+            ? "done"
+            : "pending";
+    const finalizeState: PipelineStepState =
+      submissionStage === "failed" ? "error" : submissionStage === "completed" ? "done" : "pending";
+
+    return [
+      {
+        key: "upload",
+        label: "Upload",
+        shortLabel: "1. Upload",
+        detail:
+          submissionStage === "uploading"
+            ? `Uploading ${formatBytes(uploadProgress.loadedBytes)} of ${formatBytes(uploadProgress.totalBytes || selectedUploadBytes)}`
+            : activeJobId
+              ? "Payload accepted by API"
+              : "Waiting for files",
+        state: uploadState,
+        progress:
+          uploadState === "done" ? 100 : uploadState === "active" ? clampPercent(uploadProgress.percent) : uploadState === "error" ? 100 : 0,
+        metrics: [
+          { label: "Files", value: `${videoFiles.length + (gpxFile ? 1 : 0)}` },
+          { label: "Payload", value: formatBytes(selectedUploadBytes) || "0 B" },
+          {
+            label: "Transferred",
+            value: `${formatBytes(uploadProgress.loadedBytes)} / ${formatBytes(uploadProgress.totalBytes || selectedUploadBytes)}`,
+          },
+          { label: "Speed", value: formatRate(uploadProgress.rateBytesPerSecond) },
+          { label: "ETA", value: submissionStage === "uploading" ? formatEta(uploadProgress.etaSeconds) : "--" },
+        ] satisfies PipelineStepMetric[],
+      },
+      {
+        key: "queue",
+        label: "Queue",
+        shortLabel: "2. Queue",
+        detail: activeJobId ? `Job ${activeJobId.slice(0, 8)}... submitted` : "Job not submitted",
+        state: queueState,
+        progress: queueState === "done" ? 100 : queueState === "active" ? 45 : queueState === "error" ? 100 : 0,
+        metrics: [
+          { label: "Job ID", value: activeJobId ? `${activeJobId.slice(0, 8)}...` : "--" },
+          { label: "Queue state", value: job?.status ?? "waiting" },
+          { label: "Queued clips", value: `${videoStatusSummary.queued}` },
+          { label: "Polling", value: activeJobId ? "Every 2s" : "--" },
+        ] satisfies PipelineStepMetric[],
+      },
+      {
+        key: "render",
+        label: "Render",
+        shortLabel: "3. Render",
+        detail:
+          submissionStage === "rendering"
+            ? `${videoStatusSummary.running} clip${videoStatusSummary.running === 1 ? "" : "s"} processing`
+            : "Waiting for renderer",
+        state: renderState,
+        progress:
+          renderState === "done"
+            ? 100
+            : renderState === "active"
+              ? clampPercent(job?.progress ?? 0)
+              : renderState === "error"
+                ? 100
+                : 0,
+        metrics: [
+          { label: "Overall", value: `${clampPercent(job?.progress ?? 0)}%` },
+          { label: "Running", value: `${videoStatusSummary.running}` },
+          { label: "Completed", value: `${videoStatusSummary.completed}` },
+          { label: "Failed", value: `${videoStatusSummary.failed}` },
+          { label: "Active clip", value: runningClipNames[0] ?? "--" },
+        ] satisfies PipelineStepMetric[],
+      },
+      {
+        key: "finalize",
+        label: "Finalize",
+        shortLabel: "4. Finalize",
+        detail:
+          submissionStage === "completed"
+            ? "Outputs ready for download"
+            : submissionStage === "failed"
+              ? "Pipeline reported an error"
+              : "Pending completion",
+        state: finalizeState,
+        progress: finalizeState === "done" ? 100 : finalizeState === "error" ? 100 : 0,
+        metrics: [
+          {
+            label: "Downloadable clips",
+            value: `${(job?.videos ?? []).filter((video) => Boolean(video.download_url)).length}`,
+          },
+          { label: "Archive", value: job?.download_all_url ? "Ready" : "Pending" },
+          { label: "Output size", value: totalOutputBytes > 0 ? formatBytes(totalOutputBytes) : "--" },
+          { label: "Last update", value: lastStatusUpdateAt ? new Date(lastStatusUpdateAt).toLocaleTimeString() : "--" },
+        ] satisfies PipelineStepMetric[],
+      },
+    ] as const;
+  }, [
+    activeJobId,
+    gpxFile,
+    job?.download_all_url,
+    job?.progress,
+    job?.status,
+    job?.videos,
+    lastStatusUpdateAt,
+    runningClipNames,
+    selectedUploadBytes,
+    submissionStage,
+    totalOutputBytes,
+    uploadProgress.etaSeconds,
+    uploadProgress.loadedBytes,
+    uploadProgress.percent,
+    uploadProgress.rateBytesPerSecond,
+    uploadProgress.totalBytes,
+    videoFiles.length,
+    videoStatusSummary.completed,
+    videoStatusSummary.failed,
+    videoStatusSummary.queued,
+    videoStatusSummary.running,
+  ]);
+  const activeStep = useMemo(() => {
+    return stepCards.find((step) => step.state === "active") ?? stepCards.find((step) => step.state === "error") ?? stepCards[0];
+  }, [stepCards]);
+  const primaryStatusLabel = useMemo(() => {
+    if (submissionStage === "uploading") {
+      return "Uploading files";
+    }
+    if (submissionStage === "queued") {
+      return "Queued for rendering";
+    }
+    if (submissionStage === "rendering") {
+      return "Rendering in progress";
+    }
+    if (submissionStage === "completed") {
+      return "Render complete";
+    }
+    if (submissionStage === "failed") {
+      return "Render failed";
+    }
+    return "Ready to start";
+  }, [submissionStage]);
+  const submitButtonLabel = useMemo(() => {
+    if (!isSubmitting) {
+      return "Render overlays";
+    }
+    if (submissionStage === "uploading") {
+      return `Uploading ${overallProgressPercent}%`;
+    }
+    if (submissionStage === "queued") {
+      return "Queued...";
+    }
+    if (submissionStage === "rendering") {
+      return "Rendering...";
+    }
+    return "Processing...";
+  }, [isSubmitting, overallProgressPercent, submissionStage]);
 
   async function pollJob(jobId: string): Promise<void> {
     try {
@@ -606,6 +926,17 @@ export default function HomePage() {
       const jobPayload = payload as JobStatus;
       setJob(jobPayload);
       setStatusError(null);
+      setLastStatusUpdateAt(Date.now());
+
+      if (jobPayload.status === "queued") {
+        setSubmissionStage("queued");
+      } else if (jobPayload.status === "running") {
+        setSubmissionStage("rendering");
+      } else if (jobPayload.status === "failed") {
+        setSubmissionStage("failed");
+      } else if (jobPayload.status === "completed" || jobPayload.status === "completed_with_errors") {
+        setSubmissionStage("completed");
+      }
 
       if (TERMINAL_STATES.has(jobPayload.status)) {
         if (pollRef.current) {
@@ -624,6 +955,91 @@ export default function HomePage() {
         pollRef.current = null;
       }
     }
+  }
+
+  async function createJobWithProgress(payload: FormData): Promise<string> {
+    const headers = await authHeaders();
+
+    return await new Promise<string>((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      uploadRequestRef.current = xhr;
+      const startedAt = performance.now();
+      let latestLoadedBytes = 0;
+      let latestTotalBytes = 0;
+      let latestRateBytesPerSecond = 0;
+
+      xhr.open("POST", buildApiUrl("/api/jobs"));
+      headers.forEach((value, key) => {
+        xhr.setRequestHeader(key, value);
+      });
+
+      xhr.upload.onprogress = (event) => {
+        const elapsedSeconds = Math.max((performance.now() - startedAt) / 1000, 0.001);
+        const loadedBytes = Number(event.loaded) || 0;
+        const totalBytes = event.lengthComputable && Number(event.total) > 0 ? Number(event.total) : Math.max(latestTotalBytes, loadedBytes);
+        const percent = totalBytes > 0 ? (loadedBytes / totalBytes) * 100 : 0;
+        const rateBytesPerSecond = loadedBytes / elapsedSeconds;
+        const etaSeconds =
+          totalBytes > loadedBytes && rateBytesPerSecond > 0 ? (totalBytes - loadedBytes) / rateBytesPerSecond : null;
+
+        latestLoadedBytes = loadedBytes;
+        latestTotalBytes = totalBytes;
+        latestRateBytesPerSecond = rateBytesPerSecond;
+
+        setUploadProgress({
+          loadedBytes,
+          totalBytes,
+          percent: clampPercent(percent),
+          rateBytesPerSecond,
+          etaSeconds,
+        });
+      };
+
+      xhr.onerror = () => {
+        uploadRequestRef.current = null;
+        reject(new Error("Upload failed due to a network error."));
+      };
+
+      xhr.onabort = () => {
+        uploadRequestRef.current = null;
+        reject(new Error("Upload was canceled before completion."));
+      };
+
+      xhr.onload = () => {
+        uploadRequestRef.current = null;
+        const raw = xhr.responseText ?? "";
+        let payloadFromServer: unknown = null;
+        if (raw) {
+          try {
+            payloadFromServer = JSON.parse(raw) as unknown;
+          } catch {
+            payloadFromServer = raw;
+          }
+        }
+
+        if (xhr.status < 200 || xhr.status >= 300) {
+          reject(new Error(extractErrorMessage(payloadFromServer, "Failed to create render job")));
+          return;
+        }
+
+        if (!isObjectRecord(payloadFromServer) || typeof payloadFromServer.job_id !== "string" || !payloadFromServer.job_id) {
+          reject(new Error("Invalid response from API while creating job"));
+          return;
+        }
+
+        const resolvedTotal = Math.max(latestTotalBytes, latestLoadedBytes);
+        setUploadProgress({
+          loadedBytes: resolvedTotal,
+          totalBytes: resolvedTotal,
+          percent: 100,
+          rateBytesPerSecond: latestRateBytesPerSecond,
+          etaSeconds: 0,
+        });
+        resolve(payloadFromServer.job_id);
+      };
+
+      xhr.send(payload);
+    });
   }
 
   async function downloadAuthenticated(path: string, fallbackFilename: string): Promise<void> {
@@ -717,7 +1133,19 @@ export default function HomePage() {
     setFormError(null);
     setStatusError(null);
     setIsSubmitting(true);
+    setSubmissionStage("uploading");
     setJob(null);
+    setActiveJobId(null);
+    setLastStatusUpdateAt(null);
+
+    const estimatedUploadBytes = (gpxFile?.size ?? 0) + videoFiles.reduce((sum, video) => sum + video.size, 0);
+    setUploadProgress({
+      loadedBytes: 0,
+      totalBytes: estimatedUploadBytes,
+      percent: 0,
+      rateBytesPerSecond: 0,
+      etaSeconds: null,
+    });
 
     const payload = new FormData();
     payload.append("gpx", gpxFile);
@@ -742,23 +1170,9 @@ export default function HomePage() {
     payload.append("include_maps", mapsEnabled ? "true" : "false");
 
     try {
-      const response = await fetch(buildApiUrl("/api/jobs"), {
-        method: "POST",
-        body: payload,
-        headers: await authHeaders(),
-      });
-      const responsePayload = await readApiPayload(response);
-
-      if (!response.ok) {
-        throw new Error(extractErrorMessage(responsePayload, "Failed to create render job"));
-      }
-
-      if (!isObjectRecord(responsePayload) || typeof responsePayload.job_id !== "string" || !responsePayload.job_id) {
-        throw new Error("Invalid response from API while creating job");
-      }
-
-      const createdJobId = responsePayload.job_id;
+      const createdJobId = await createJobWithProgress(payload);
       setActiveJobId(createdJobId);
+      setSubmissionStage("queued");
       await pollJob(createdJobId);
 
       pollRef.current = setInterval(() => {
@@ -767,6 +1181,7 @@ export default function HomePage() {
     } catch (error) {
       const message = error instanceof Error ? error.message : "Failed to create render job";
       setFormError(message);
+      setSubmissionStage("failed");
       setIsSubmitting(false);
     }
   }
@@ -829,6 +1244,19 @@ export default function HomePage() {
                   className="block w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-background)] px-3 py-2 text-sm file:mr-4 file:rounded-md file:border-0 file:bg-[var(--color-primary)] file:px-3 file:py-1.5 file:text-sm file:font-medium file:text-white hover:file:bg-[var(--color-primary)]/90"
                 />
               </label>
+            </div>
+
+            <div className="rounded-xl border border-[var(--color-border)] bg-[var(--color-muted)]/20 px-4 py-3">
+              <p className="text-sm font-medium">
+                Payload estimate:{" "}
+                <span className="text-[var(--color-primary)]">
+                  {selectedUploadBytes > 0 ? formatBytes(selectedUploadBytes) : "No files selected"}
+                </span>
+              </p>
+              <p className="mt-1 text-xs text-[var(--color-muted-foreground)]">
+                Large uploads can run for a long time. Keep this tab open until upload reaches 100%, then rendering continues
+                on the server.
+              </p>
             </div>
 
             <div>
@@ -1198,11 +1626,11 @@ export default function HomePage() {
                 disabled={isSubmitting}
                 className="rounded-xl bg-[var(--color-primary)] px-6 py-3 text-sm font-semibold text-white shadow-sm transition-all hover:bg-[var(--color-primary)]/90 disabled:cursor-not-allowed disabled:opacity-50"
               >
-                {isSubmitting ? "Rendering..." : "Render overlays"}
+                {submitButtonLabel}
               </button>
               <p className="text-sm text-[var(--color-muted-foreground)]">
                 {gpxFile ? `GPX: ${gpxFile.name}` : "No GPX selected"} • {videoFiles.length} video
-                {videoFiles.length === 1 ? "" : "s"}
+                {videoFiles.length === 1 ? "" : "s"} • {selectedUploadBytes > 0 ? formatBytes(selectedUploadBytes) : "0 B"}
               </p>
             </div>
           </form>
@@ -1210,29 +1638,88 @@ export default function HomePage() {
 
         <aside className="space-y-6">
           <section className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-card)] p-6 shadow-sm">
-            <div className="mb-4 flex items-start justify-between gap-4">
-              <div>
-                <h2 className="text-xl font-semibold">Render Status</h2>
-                <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
-                  {job?.message ?? (activeJobId ? "Waiting for updates..." : "Run a render to view progress.")}
-                </p>
-                <p className="mt-1 text-xs text-[var(--color-muted-foreground)]">
-                  Renders continue on the server after submission, even if you close this page. If enabled in Settings, we
-                  email you when processing finishes.
-                </p>
-              </div>
-              {job?.status && (
-                <span className="rounded-full bg-[var(--color-primary)]/10 px-3 py-1 text-xs font-medium text-[var(--color-primary)]">
-                  {job.status.replaceAll("_", " ")}
+            <div className="mb-5 rounded-2xl border border-[var(--color-border)] bg-gradient-to-br from-[var(--color-primary)]/12 via-[var(--color-card)] to-cyan-500/10 p-4">
+              <div className="mb-3 flex items-start justify-between gap-3">
+                <div>
+                  <h2 className="text-xl font-semibold">Pipeline Status</h2>
+                  <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
+                    {job?.message ??
+                      (submissionStage === "uploading"
+                        ? "Uploading files to server..."
+                        : activeJobId
+                          ? "Waiting for server updates..."
+                          : "Run a render to start the pipeline.")}
+                  </p>
+                </div>
+                <span className="rounded-full bg-[var(--color-primary)]/15 px-3 py-1 text-xs font-semibold text-[var(--color-primary)]">
+                  {primaryStatusLabel}
                 </span>
-              )}
+              </div>
+
+              <div className="mb-3 overflow-hidden rounded-full bg-[var(--color-muted)]/70">
+                <div
+                  className={`h-2 rounded-full transition-all duration-300 ${
+                    submissionStage === "failed"
+                      ? "bg-red-500"
+                      : submissionStage === "completed"
+                        ? "bg-emerald-500"
+                        : "bg-gradient-to-r from-cyan-500 to-blue-500"
+                  }`}
+                  style={{ width: `${overallProgressPercent}%` }}
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-2 text-xs">
+                <div className="rounded-lg border border-[var(--color-border)] bg-[var(--color-background)]/70 px-3 py-2">
+                  <p className="text-[var(--color-muted-foreground)]">Overall progress</p>
+                  <p className="text-sm font-semibold">{overallProgressPercent}%</p>
+                </div>
+                <div className="rounded-lg border border-[var(--color-border)] bg-[var(--color-background)]/70 px-3 py-2">
+                  <p className="text-[var(--color-muted-foreground)]">Current focus</p>
+                  <p className="text-sm font-semibold">{activeStep.shortLabel}</p>
+                </div>
+                <div className="rounded-lg border border-[var(--color-border)] bg-[var(--color-background)]/70 px-3 py-2">
+                  <p className="text-[var(--color-muted-foreground)]">Job</p>
+                  <p className="text-sm font-semibold">{activeJobId ? `${activeJobId.slice(0, 8)}...` : "--"}</p>
+                </div>
+                <div className="rounded-lg border border-[var(--color-border)] bg-[var(--color-background)]/70 px-3 py-2">
+                  <p className="text-[var(--color-muted-foreground)]">Clips</p>
+                  <p className="text-sm font-semibold">
+                    {videoStatusSummary.completed}/{videoStatusSummary.total} complete
+                  </p>
+                </div>
+              </div>
             </div>
 
-            <div className="mb-4 overflow-hidden rounded-full bg-[var(--color-muted)]">
-              <div
-                className="h-2 rounded-full bg-[var(--color-primary)] transition-all duration-300"
-                style={{ width: `${Math.max(0, Math.min(100, job?.progress ?? 0))}%` }}
-              />
+            <div className="mb-5 grid gap-3">
+              {stepCards.map((step) => (
+                <article key={step.key} className={`rounded-xl border p-4 transition-colors ${pipelineStepTone(step.state)}`}>
+                  <div className="mb-2 flex items-center justify-between gap-2">
+                    <h3 className="text-sm font-semibold">{step.shortLabel}</h3>
+                    <span className="rounded-full border border-current px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide">
+                      {pipelineStepStateLabel(step.state)}
+                    </span>
+                  </div>
+
+                  <p className="mb-3 text-xs">{step.detail}</p>
+
+                  <div className="mb-3 overflow-hidden rounded-full bg-[var(--color-background)]/70">
+                    <div
+                      className={`h-1.5 rounded-full transition-all duration-300 ${pipelineStepProgressTone(step.state)}`}
+                      style={{ width: `${clampPercent(step.progress)}%` }}
+                    />
+                  </div>
+
+                  <dl className="grid grid-cols-2 gap-2 text-xs">
+                    {step.metrics.map((metric) => (
+                      <div key={`${step.key}-${metric.label}`} className="rounded-md border border-current/20 bg-[var(--color-background)]/60 px-2 py-1.5">
+                        <dt className="text-[10px] uppercase tracking-wide opacity-80">{metric.label}</dt>
+                        <dd className="mt-0.5 font-semibold">{metric.value}</dd>
+                      </div>
+                    ))}
+                  </dl>
+                </article>
+              ))}
             </div>
 
             {statusError && (
@@ -1240,6 +1727,13 @@ export default function HomePage() {
                 {statusError}
               </div>
             )}
+
+            <div className="mb-2 flex items-center justify-between">
+              <h3 className="text-sm font-semibold">Clip Breakdown</h3>
+              <p className="text-xs text-[var(--color-muted-foreground)]">
+                Running {videoStatusSummary.running} • Failed {videoStatusSummary.failed}
+              </p>
+            </div>
 
             <ul className="space-y-3">
               {(job?.videos ?? []).map((video) => {
@@ -1268,9 +1762,22 @@ export default function HomePage() {
                   <li key={video.input_name} className="rounded-lg border border-[var(--color-border)] bg-[var(--color-background)] p-4">
                     <div className="mb-2 flex items-start justify-between gap-2">
                       <strong className="text-sm font-semibold">{video.input_name}</strong>
-                      <span className="rounded-full bg-[var(--color-primary)]/10 px-2 py-0.5 text-xs font-medium text-[var(--color-primary)]">
-                        {video.status} {video.progress ?? 0}%
+                      <span className={`rounded-full px-2 py-0.5 text-xs font-semibold ${clipStatusTone(video.status)}`}>
+                        {video.status} {clampPercent(video.progress)}%
                       </span>
+                    </div>
+
+                    <div className="mb-3 overflow-hidden rounded-full bg-[var(--color-muted)]">
+                      <div
+                        className={`h-1.5 rounded-full transition-all duration-300 ${
+                          video.status === "failed"
+                            ? "bg-red-500"
+                            : video.status === "completed"
+                              ? "bg-emerald-500"
+                              : "bg-[var(--color-primary)]"
+                        }`}
+                        style={{ width: `${clampPercent(video.progress)}%` }}
+                      />
                     </div>
 
                     {clipDetails.length > 0 && (
@@ -1312,6 +1819,12 @@ export default function HomePage() {
                 );
               })}
             </ul>
+
+            {job && (job.videos?.length ?? 0) === 0 && (
+              <p className="rounded-lg border border-[var(--color-border)] bg-[var(--color-background)] px-3 py-2 text-xs text-[var(--color-muted-foreground)]">
+                Job created. Clip-level status will appear once processing starts.
+              </p>
+            )}
 
             {job?.download_all_url && (
               <button
