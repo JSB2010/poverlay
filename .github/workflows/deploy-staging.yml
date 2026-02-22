@@ -85,5 +85,6 @@ jobs:
             --web-service poverlay-staging-web \
             --api-health-url http://127.0.0.1:8788/health \
             --web-health-url http://127.0.0.1:3001 \
+            --env-file /etc/poverlay/poverlay-staging.env \
             --public-url "${PUBLIC_URL}"
           EOF

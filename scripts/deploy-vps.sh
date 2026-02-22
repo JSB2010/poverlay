@@ -8,6 +8,7 @@ usage() {
 Usage: ./scripts/deploy-vps.sh [--branch <name>] [--skip-check] [--with-systemd] [--with-nginx] [--public-url <url>]
                               [--api-service <name>] [--web-service <name>]
                               [--api-health-url <url>] [--web-health-url <url>]
+                              [--env-file <path>]
                               [--systemd-api-unit <path>] [--systemd-web-unit <path>]
                               [--nginx-site-source <path>] [--nginx-site-name <name>]
 
@@ -23,6 +24,7 @@ Options:
   --web-service     systemd service name for web (default: poverlay-web)
   --api-health-url  API health URL (default: http://127.0.0.1:8787/health)
   --web-health-url  Web health URL (default: http://127.0.0.1:3000)
+  --env-file        Environment file used for web build/check (default: auto-detect from API service name)
   --systemd-api-unit  source unit file to install when --with-systemd is used
   --systemd-web-unit  source unit file to install when --with-systemd is used
   --nginx-site-source source nginx file to install when --with-nginx is used
@@ -44,6 +46,7 @@ SYSTEMD_API_UNIT="deploy/systemd/poverlay-api.service"
 SYSTEMD_WEB_UNIT="deploy/systemd/poverlay-web.service"
 NGINX_SITE_SOURCE="deploy/nginx/poverlay.conf"
 NGINX_SITE_NAME="poverlay"
+ENV_FILE=""
 
 require_cmd() {
   local cmd="$1"
@@ -147,6 +150,14 @@ while [[ $# -gt 0 ]]; do
       WEB_HEALTH_URL="${2:-}"
       shift 2
       ;;
+    --env-file)
+      if [[ $# -lt 2 ]]; then
+        echo "--env-file requires a value." >&2
+        exit 1
+      fi
+      ENV_FILE="${2:-}"
+      shift 2
+      ;;
     --systemd-api-unit)
       if [[ $# -lt 2 ]]; then
         echo "--systemd-api-unit requires a value." >&2
@@ -219,6 +230,22 @@ fi
 if [[ -z "${NGINX_SITE_NAME}" ]]; then
   echo "--nginx-site-name must be non-empty." >&2
   exit 1
+fi
+
+if [[ -z "${ENV_FILE}" && "${API_SERVICE}" =~ ^(.+)-api$ ]]; then
+  candidate="/etc/poverlay/${BASH_REMATCH[1]}.env"
+  if [[ -r "${candidate}" ]]; then
+    ENV_FILE="${candidate}"
+  fi
+fi
+
+if [[ -n "${ENV_FILE}" ]]; then
+  if [[ ! -r "${ENV_FILE}" ]]; then
+    echo "Environment file is not readable: ${ENV_FILE}" >&2
+    exit 1
+  fi
+  export POVERLAY_ENV_FILE="${ENV_FILE}"
+  echo "==> Using env file for build/check: ${POVERLAY_ENV_FILE}"
 fi
 
 require_cmd git

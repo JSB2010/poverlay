@@ -134,6 +134,23 @@ Restart and cleanup behavior:
 - Terminal jobs receive `expires_at`; background cleanup deletes expired `data/jobs/<job-id>` directories based on `JOB_OUTPUT_RETENTION_HOURS`.
 - Cleanup cadence is controlled by `JOB_CLEANUP_ENABLED` and `JOB_CLEANUP_INTERVAL_SECONDS`.
 
+## Large upload testing (10GB+)
+
+For large single-request uploads (for example 40GB), all layers must allow it:
+
+1. Nginx:
+   - `client_max_body_size 0;` (disables nginx body-size limit)
+   - `proxy_request_buffering off;` in `location /api/`
+   - long timeouts (`client_body_timeout`, `proxy_read_timeout`, `proxy_send_timeout`)
+2. Web proxy (only if Next is proxying `/api`):
+   - set `NEXT_PROXY_CLIENT_MAX_BODY_SIZE` high (for example `64gb`)
+3. API host disk:
+   - ensure enough free space in `/tmp` and app data paths for upload + processing.
+
+Important: if DNS is proxied through Cloudflare ("orange cloud"), Cloudflare upload limits apply before your VPS.
+See Cloudflare request-size limits: https://developers.cloudflare.com/workers/platform/limits/#request-limits
+(plan-dependent and much lower than 40GB). For 40GB testing, use DNS-only/bypass Cloudflare or implement direct multipart uploads to object storage (recommended).
+
 ## Monitoring and smoke checks
 
 Run after deploy or incident restart:
@@ -165,13 +182,14 @@ Log/alert checkpoints:
 Run this on the VPS from `/opt/poverlay`:
 
 ```bash
-./scripts/deploy-vps.sh --branch main --public-url https://poverlay.com
+./scripts/deploy-vps.sh --branch main --env-file /etc/poverlay/poverlay.env --public-url https://poverlay.com
 ```
 
 Notes:
 
 - This does a safe `git pull --ff-only` (no hard reset by default).
 - By default it runs `pnpm check` (which includes build), then restarts services.
+- The deploy script can auto-detect `/etc/poverlay/<service-prefix>.env`, but passing `--env-file` is recommended for clarity.
 - Use `--skip-check` for faster deploys when needed.
 - Use `--with-systemd` when you change `deploy/systemd/*`.
 - Use `--with-nginx` only when you intentionally want to sync `deploy/nginx/poverlay.conf`.

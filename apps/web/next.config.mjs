@@ -1,5 +1,6 @@
 /** @type {import('next').NextConfig} */
-const proxyClientMaxBodySize = process.env.NEXT_PROXY_CLIENT_MAX_BODY_SIZE || "1024mb";
+// Applies only when Next.js itself proxies /api requests.
+const proxyClientMaxBodySize = process.env.NEXT_PROXY_CLIENT_MAX_BODY_SIZE || "64gb";
 
 const nextConfig = {
   output: "standalone",

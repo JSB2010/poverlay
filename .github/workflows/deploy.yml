@@ -67,5 +67,5 @@ jobs:
           set -euo pipefail
           cd "${APP_DIR}"
           sudo -n true >/dev/null
-          ./scripts/deploy-vps.sh --branch "${BRANCH}" --public-url "${PUBLIC_URL}"
+          ./scripts/deploy-vps.sh --branch "${BRANCH}" --env-file /etc/poverlay/poverlay.env --public-url "${PUBLIC_URL}"
           EOF
