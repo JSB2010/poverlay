@@ -15,6 +15,7 @@ apps/web/.env.local
 .env
 .env.*
 !.env.example
+apps/web/next-env.d.ts
 *firebase-adminsdk-*.json
 *service-account*.json
 *.tsbuildinfo
