@@ -624,6 +624,135 @@ function estimateAutoProfileForClip(
   return "h264-source";
 }
 
+function toEvenDimension(value: number): number {
+  if (!Number.isFinite(value) || value < 2) {
+    return 2;
+  }
+  const rounded = Math.round(value);
+  return rounded % 2 === 0 ? rounded : rounded - 1;
+}
+
+function outputResolutionForProfile(width: number, height: number, profileId: string): { width: number; height: number } {
+  if (profileId === "h264-4k-compat" && width > 3840) {
+    return { width: 3840, height: toEvenDimension(height * (3840 / Math.max(width, 1))) };
+  }
+  return { width, height };
+}
+
+function codecLabelForProfile(profileId: string): string {
+  if (profileId.startsWith("qt-hevc")) {
+    return "HEVC";
+  }
+  return "H.264";
+}
+
+function firstAvailableProfile(preferred: string[], availableProfiles: Set<string>): string {
+  for (const candidate of preferred) {
+    if (availableProfiles.has(candidate)) {
+      return candidate;
+    }
+  }
+  return availableProfiles.values().next().value ?? "h264-source";
+}
+
+type TuningPreset = {
+  label: string;
+  description: string;
+  qualityImpact: string;
+  profileOrder: string[];
+  fpsMode: FormState["fps_mode"];
+  fixedFps?: string;
+  mapsEnabled: boolean;
+};
+
+function tuningPresetFromValue(value: number): TuningPreset {
+  if (value <= 20) {
+    return {
+      label: "Fastest",
+      description: "Draft output with aggressive speed settings.",
+      qualityImpact: "Lowest quality but shortest render time.",
+      profileOrder: ["h264-fast", "h264-source", "h264-4k-compat"],
+      fpsMode: "fixed",
+      fixedFps: "15",
+      mapsEnabled: false,
+    };
+  }
+  if (value <= 40) {
+    return {
+      label: "Fast",
+      description: "Quick turnaround while keeping decent quality.",
+      qualityImpact: "Moderate quality; tuned for speed.",
+      profileOrder: ["h264-fast", "h264-source", "h264-4k-compat"],
+      fpsMode: "fixed",
+      fixedFps: "30",
+      mapsEnabled: true,
+    };
+  }
+  if (value <= 60) {
+    return {
+      label: "Balanced",
+      description: "General-purpose output for most social and edit workflows.",
+      qualityImpact: "Balanced quality and render time.",
+      profileOrder: ["auto", "h264-source", "h264-fast"],
+      fpsMode: "source_rounded",
+      mapsEnabled: true,
+    };
+  }
+  if (value <= 80) {
+    return {
+      label: "Quality",
+      description: "Source-resolution render with quality-first settings.",
+      qualityImpact: "High quality with longer render times.",
+      profileOrder: ["h264-source", "auto", "h264-4k-compat"],
+      fpsMode: "source_exact",
+      mapsEnabled: true,
+    };
+  }
+  return {
+    label: "Max Quality",
+    description: "Prioritizes fidelity over render speed.",
+    qualityImpact: "Highest quality profile choice available.",
+    profileOrder: ["h264-source", "qt-hevc-high", "qt-hevc-balanced", "auto"],
+    fpsMode: "source_exact",
+    mapsEnabled: true,
+  };
+}
+
+function deriveTuningValueFromSettings(formState: FormState, mapsEnabled: boolean): number {
+  if (!mapsEnabled && formState.fps_mode === "fixed" && Number(formState.fixed_fps) <= 15.5 && formState.render_profile === "h264-fast") {
+    return 12;
+  }
+  if (formState.fps_mode === "fixed" && Number(formState.fixed_fps) <= 30.5 && formState.render_profile === "h264-fast") {
+    return 32;
+  }
+  if (formState.fps_mode === "source_rounded" || formState.render_profile === "auto") {
+    return 52;
+  }
+  if (formState.render_profile === "h264-source" && formState.fps_mode === "source_exact") {
+    return 88;
+  }
+  return 72;
+}
+
+function qualityImpactSummary(profileId: string, fpsMode: FormState["fps_mode"], fixedFps: number | null): string {
+  const codecQuality =
+    profileId === "h264-fast"
+      ? "Draft compression with visible quality tradeoffs."
+      : profileId === "h264-4k-compat"
+        ? "High quality with 4K output cap for compatibility."
+        : profileId.startsWith("qt-hevc")
+          ? "High quality HEVC output with strong compression efficiency."
+          : "High quality H.264 output at source resolution.";
+
+  if (fpsMode === "fixed" && fixedFps !== null && fixedFps <= 20) {
+    return `${codecQuality} Lower frame-rate motion smoothness.`;
+  }
+  if (fpsMode === "source_rounded") {
+    return `${codecQuality} Slight frame-rate simplification for stability.`;
+  }
+  return codecQuality;
+}
+
 function interpolateRealtimeFactor(points: Array<{ megaPixels: number; xRealtime: number }>, megaPixels: number): number {
   if (points.length === 0) {
     return 1;
@@ -860,6 +989,7 @@ export default function HomePage() {
   const [mapStyles, setMapStyles] = useState<string[]>(FALLBACK_MAP_STYLES);
   const [renderProfiles, setRenderProfiles] = useState<RenderProfile[]>(FALLBACK_RENDER_PROFILES);
   const [etaCalibration, setEtaCalibration] = useState<RenderEtaCalibration | null>(null);
+  const [tuningSliderValue, setTuningSliderValue] = useState(72);
 
   const [gpxFile, setGpxFile] = useState<File | null>(null);
   const [videoFiles, setVideoFiles] = useState<File[]>([]);
@@ -883,6 +1013,7 @@ export default function HomePage() {
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const uploadRequestRef = useRef<XMLHttpRequest | null>(null);
+  const tuningSyncSkipRef = useRef(false);
 
   async function authHeaders(): Promise<Headers> {
     const headers = new Headers();
@@ -1048,10 +1179,41 @@ export default function HomePage() {
   const selectedLayout = useMemo(() => {
     return layoutStyles.find((layout) => layout.id === formState.layout_style) ?? null;
   }, [formState.layout_style, layoutStyles]);
+  const availableProfileIds = useMemo(() => new Set(renderProfiles.map((profile) => profile.id)), [renderProfiles]);
 
   const statsPanelEnabled = componentVisibility.stats_panel ?? true;
   const gpsPanelEnabled = componentVisibility.gps_panel ?? true;
   const mapsEnabled = componentVisibility.route_maps ?? true;
+  const tuningPreset = useMemo(() => tuningPresetFromValue(tuningSliderValue), [tuningSliderValue]);
+
+  useEffect(() => {
+    if (tuningSyncSkipRef.current) {
+      tuningSyncSkipRef.current = false;
+      return;
+    }
+    const derived = deriveTuningValueFromSettings(formState, mapsEnabled);
+    if (Math.abs(derived - tuningSliderValue) >= 6) {
+      setTuningSliderValue(derived);
+    }
+  }, [formState, mapsEnabled, tuningSliderValue]);
+
+  function applyQualitySpeedTuning(nextValue: number): void {
+    const preset = tuningPresetFromValue(nextValue);
+    const selectedProfileId = firstAvailableProfile(preset.profileOrder, availableProfileIds);
+    tuningSyncSkipRef.current = true;
+    setTuningSliderValue(nextValue);
+    setFormState((prev) => ({
+      ...prev,
+      render_profile: selectedProfileId,
+      fps_mode: preset.fpsMode,
+      fixed_fps: preset.fixedFps ?? prev.fixed_fps,
+    }));
+    setComponentVisibility((prev) => ({
+      ...prev,
+      route_maps: preset.mapsEnabled,
+    }));
+  }
+
   const componentGroups = useMemo(() => {
     const coreIds = new Set(["time_panel", "speed_panel", "stats_panel", "gps_panel", "route_maps"]);
     const metricIds = new Set(["altitude_metric", "grade_metric", "distance_metric", "gps_coordinates"]);
@@ -1165,6 +1327,81 @@ export default function HomePage() {
     etaCalibration,
     renderProfiles,
     submissionStage,
+    videoFiles,
+  ]);
+  const predictedRenderPlan = useMemo(() => {
+    if (videoFiles.length === 0) {
+      return null;
+    }
+
+    const fixedFpsValue = parseFpsValue(formState.fixed_fps);
+    const localProbeByName = new Map<string, LocalVideoProbe>();
+    for (const file of videoFiles) {
+      const probe = localVideoProbesByKey[localVideoProbeKey(file)];
+      if (probe) {
+        localProbeByName.set(file.name, probe);
+      }
+    }
+
+    const clipNames = (job?.videos ?? []).length > 0 ? (job?.videos ?? []).map((video) => video.input_name) : videoFiles.map((file) => file.name);
+    const clipPlans = clipNames.map((clipName) => {
+      const video = (job?.videos ?? []).find((entry) => entry.input_name === clipName);
+      const probe = localProbeByName.get(clipName);
+      const parsedResolution = parseResolutionValue(video?.source_resolution ?? null);
+      const width = parsedResolution?.width ?? probe?.width ?? ETA_DEFAULT_WIDTH;
+      const height = parsedResolution?.height ?? probe?.height ?? ETA_DEFAULT_HEIGHT;
+      const sourceFps = parseFpsValue(video?.source_fps ?? null) ?? probe?.fps ?? ETA_REFERENCE_FPS;
+      const profileId =
+        formState.render_profile === "auto"
+          ? estimateAutoProfileForClip(width, height, availableProfileIds)
+          : formState.render_profile;
+      const outputResolution = outputResolutionForProfile(width, height, profileId);
+      const outputFps =
+        formState.fps_mode === "fixed"
+          ? Math.max(fixedFpsValue ?? ETA_REFERENCE_FPS, 1)
+          : formState.fps_mode === "source_rounded"
+            ? Math.max(Math.round(sourceFps), 1)
+            : sourceFps;
+
+      return {
+        clipName,
+        profileId,
+        codec: codecLabelForProfile(profileId),
+        sourceResolution: `${width}x${height}`,
+        outputResolution: `${outputResolution.width}x${outputResolution.height}`,
+        outputFps,
+      };
+    });
+
+    const uniqueCodecs = Array.from(new Set(clipPlans.map((plan) => plan.codec)));
+    const uniqueProfiles = Array.from(new Set(clipPlans.map((plan) => plan.profileId)));
+    const uniqueResolutions = Array.from(new Set(clipPlans.map((plan) => plan.outputResolution)));
+    const qualitySummary = qualityImpactSummary(
+      clipPlans[0]?.profileId ?? formState.render_profile,
+      formState.fps_mode,
+      fixedFpsValue,
+    );
+
+    return {
+      clips: clipPlans,
+      primaryCodec: uniqueCodecs.join(" + "),
+      profileSummary: uniqueProfiles.join(", "),
+      outputResolutionSummary: uniqueResolutions.join(", "),
+      outputFpsSummary:
+        formState.fps_mode === "fixed"
+          ? `Fixed ${Math.max(fixedFpsValue ?? ETA_REFERENCE_FPS, 1)} fps`
+          : formState.fps_mode === "source_rounded"
+            ? "Rounded source fps"
+            : "Source fps (exact)",
+      qualitySummary,
+    };
+  }, [
+    availableProfileIds,
+    formState.fixed_fps,
+    formState.fps_mode,
+    formState.render_profile,
+    job?.videos,
+    localVideoProbesByKey,
     videoFiles,
   ]);
   const observedRenderRemainingSeconds = useMemo((): number | null => {
@@ -1837,6 +2074,80 @@ export default function HomePage() {
               <h2 className="text-lg font-semibold">2. Look and output</h2>
               <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">Set style, layout, and render profile.</p>
 
+              <div className="mt-4 rounded-xl border border-[var(--color-border)] bg-[var(--color-card)] p-4">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <h3 className="text-sm font-semibold">Quality vs speed tuning</h3>
+                    <p className="text-xs text-[var(--color-muted-foreground)]">
+                      Move this slider to apply a preset. You can still fine-tune each setting below.
+                    </p>
+                  </div>
+                  <span className="rounded-full border border-[var(--color-border)] bg-[var(--color-background)] px-3 py-1 text-xs font-semibold">
+                    {tuningPreset.label}
+                  </span>
+                </div>
+
+                <div className="mt-4">
+                  <input
+                    type="range"
+                    min={0}
+                    max={100}
+                    step={1}
+                    value={tuningSliderValue}
+                    onChange={(event) => applyQualitySpeedTuning(Number(event.target.value))}
+                    className="h-2 w-full cursor-pointer appearance-none rounded-full bg-[var(--color-muted)] accent-[var(--color-primary)]"
+                  />
+                  <div className="mt-2 flex justify-between text-[10px] uppercase tracking-wide text-[var(--color-muted-foreground)]">
+                    <span>Fastest</span>
+                    <span>Balanced</span>
+                    <span>Max quality</span>
+                  </div>
+                </div>
+
+                <div className="mt-4 grid gap-2 text-xs sm:grid-cols-2">
+                  <div className="rounded-lg border border-[var(--color-border)] bg-[var(--color-background)]/70 px-3 py-2">
+                    <p className="font-semibold">Expected codec / profile</p>
+                    <p className="mt-1 text-[var(--color-muted-foreground)]">
+                      {predictedRenderPlan ? `${predictedRenderPlan.primaryCodec} • ${predictedRenderPlan.profileSummary}` : "--"}
+                    </p>
+                  </div>
+                  <div className="rounded-lg border border-[var(--color-border)] bg-[var(--color-background)]/70 px-3 py-2">
+                    <p className="font-semibold">Expected output resolution</p>
+                    <p className="mt-1 text-[var(--color-muted-foreground)]">
+                      {predictedRenderPlan ? predictedRenderPlan.outputResolutionSummary : "--"}
+                    </p>
+                  </div>
+                  <div className="rounded-lg border border-[var(--color-border)] bg-[var(--color-background)]/70 px-3 py-2">
+                    <p className="font-semibold">Expected output frame-rate</p>
+                    <p className="mt-1 text-[var(--color-muted-foreground)]">
+                      {predictedRenderPlan ? predictedRenderPlan.outputFpsSummary : "--"}
+                    </p>
+                  </div>
+                  <div className="rounded-lg border border-[var(--color-border)] bg-[var(--color-background)]/70 px-3 py-2">
+                    <p className="font-semibold">Quality impact</p>
+                    <p className="mt-1 text-[var(--color-muted-foreground)]">
+                      {predictedRenderPlan?.qualitySummary ?? tuningPreset.qualityImpact}
+                    </p>
+                  </div>
+                </div>
+                {predictedRenderPlan && predictedRenderPlan.clips.length > 0 && (
+                  <div className="mt-3 rounded-lg border border-[var(--color-border)] bg-[var(--color-background)]/70 p-3">
+                    <p className="text-xs font-semibold">Per-clip projection</p>
+                    <div className="mt-2 space-y-1 text-xs text-[var(--color-muted-foreground)]">
+                      {predictedRenderPlan.clips.slice(0, 4).map((clip) => (
+                        <p key={`${clip.clipName}-${clip.profileId}`}>
+                          {clip.clipName}: {clip.codec} • {clip.sourceResolution} → {clip.outputResolution} • {Math.round(clip.outputFps)} fps
+                        </p>
+                      ))}
+                      {predictedRenderPlan.clips.length > 4 && (
+                        <p>+{predictedRenderPlan.clips.length - 4} more clip projections</p>
+                      )}
+                    </div>
+                  </div>
+                )}
+                <p className="mt-2 text-xs text-[var(--color-muted-foreground)]">{tuningPreset.description}</p>
+              </div>
+
               <div className="mt-4 grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
                 <label className="block" htmlFor="overlay_theme">
                   <span className="mb-2 block text-sm font-medium">Overlay theme</span>
@@ -1895,6 +2206,29 @@ export default function HomePage() {
                   )}
                 </label>
 
+                <label className="block">
+                  <span className="mb-2 block text-sm font-medium">Route maps in render</span>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setComponentVisibility((prev) => ({
+                        ...prev,
+                        route_maps: !(prev.route_maps ?? true),
+                      }))
+                    }
+                    className={`w-full rounded-lg border px-3 py-2 text-left text-sm transition-all ${
+                      mapsEnabled
+                        ? "border-[var(--color-primary)] bg-[var(--color-primary)]/10 text-[var(--color-primary)]"
+                        : "border-[var(--color-border)] bg-[var(--color-card)] text-[var(--color-muted-foreground)]"
+                    }`}
+                  >
+                    {mapsEnabled ? "Enabled" : "Disabled"}
+                  </button>
+                  <p className="mt-1 text-xs text-[var(--color-muted-foreground)]">
+                    Maps improve context but increase render complexity.
+                  </p>
+                </label>
+
                 <label className="block" htmlFor="units_preset">
                   <span className="mb-2 block text-sm font-medium">Units preset</span>
                   <select
@@ -1923,6 +2257,9 @@ export default function HomePage() {
                     <option value="source_rounded">Match source (rounded int)</option>
                     <option value="fixed">Fixed FPS</option>
                   </select>
+                  <p className="mt-1 text-xs text-[var(--color-muted-foreground)]">
+                    Exact source FPS gives the best motion fidelity. Lower fixed FPS renders faster.
+                  </p>
                 </label>
 
                 <label className="block" htmlFor="fixed_fps">
@@ -1937,6 +2274,9 @@ export default function HomePage() {
                     onChange={(event) => setFormState((prev) => ({ ...prev, fixed_fps: event.target.value }))}
                     className="block w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-card)] px-3 py-2 text-sm focus:border-[var(--color-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/20 disabled:cursor-not-allowed disabled:opacity-50"
                   />
+                  <p className="mt-1 text-xs text-[var(--color-muted-foreground)]">
+                    15 fps is much faster, 24-30 fps is smoother, source exact is highest fidelity.
+                  </p>
                 </label>
               </div>
 

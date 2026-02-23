@@ -108,11 +108,11 @@ def _resolve_x264_preset(env_key: str, default: str) -> str:
 
 H264_SOURCE_PRESET = _resolve_x264_preset(
     "POVERLAY_H264_SOURCE_PRESET",
-    "faster" if sys.platform != "darwin" else "medium",
+    "medium",
 )
 H264_4K_COMPAT_PRESET = _resolve_x264_preset(
     "POVERLAY_H264_4K_COMPAT_PRESET",
-    "faster" if sys.platform != "darwin" else "medium",
+    "medium",
 )
 H264_FAST_PRESET = _resolve_x264_preset("POVERLAY_H264_FAST_PRESET", "veryfast")
 
@@ -281,7 +281,7 @@ ALLOWED_RENDER_PROFILES = {AUTO_RENDER_PROFILE, *MANUAL_RENDER_PROFILES}
 if sys.platform == "darwin":
     DEFAULT_RENDER_PROFILE = "qt-hevc-balanced"
 else:
-    DEFAULT_RENDER_PROFILE = "h264-4k-compat" if "h264-4k-compat" in ALLOWED_RENDER_PROFILES else "h264-source"
+    DEFAULT_RENDER_PROFILE = "h264-source"
 
 
 TERMINAL_JOB_STATUSES = {"completed", "completed_with_errors", "failed"}
@@ -1838,7 +1838,7 @@ def _auto_render_profile_candidates(metadata: dict[str, Any]) -> list[str]:
         return ["h264-source", "qt-hevc-balanced", "h264-fast"]
 
     if high_resolution:
-        return ["h264-4k-compat", "h264-source", "h264-fast"]
+        return ["h264-source", "h264-4k-compat", "h264-fast"]
     return ["h264-source", "h264-fast"]
 
 
