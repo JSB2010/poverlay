@@ -79,7 +79,6 @@ jobs:
           ssh -p "${PORT}" "${VPS_USER}@${VPS_HOST}" <<EOF
           set -euo pipefail
           python3 "${REMOTE_SCRIPT}" --repo-root /opt/poverlay-staging --duration "${DURATION}" --output-dir "${BENCH_BASE}"
-          tar -C "${BENCH_BASE}" -czf "${BENCH_BASE}.tar.gz" .
           EOF
 
       - name: Download benchmark artifact from VPS
@@ -91,9 +90,9 @@ jobs:
         run: |
           set -euo pipefail
           PORT="${VPS_PORT:-22}"
-          REMOTE_TAR="/tmp/poverlay-staging-bench-${RUN_ID}.tar.gz"
+          BENCH_BASE="/tmp/poverlay-staging-bench-${RUN_ID}"
           mkdir -p benchmark-artifacts
-          scp -P "${PORT}" "${VPS_USER}@${VPS_HOST}:${REMOTE_TAR}" "benchmark-artifacts/staging-render-benchmark-${RUN_ID}.tar.gz"
+          ssh -p "${PORT}" "${VPS_USER}@${VPS_HOST}" "tar -C '${BENCH_BASE}' -czf - ." > "benchmark-artifacts/staging-render-benchmark-${RUN_ID}.tar.gz"
           tar -C benchmark-artifacts -xzf "benchmark-artifacts/staging-render-benchmark-${RUN_ID}.tar.gz"
           ls -la benchmark-artifacts
           cat benchmark-artifacts/summary.json

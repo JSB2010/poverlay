@@ -296,6 +296,16 @@ def _main() -> int:
 
         combined = f"{completed.stdout}\n{completed.stderr}".strip()
         log_path.write_text(combined, encoding="utf-8")
+        lines = [line.strip() for line in combined.splitlines() if line.strip()]
+        error_excerpt = ""
+        if completed.returncode != 0 and lines:
+            for line in reversed(lines):
+                lowered = line.lower()
+                if any(token in lowered for token in ["traceback", "error", "exception", "failed", "fatal", "unable", "missing"]):
+                    error_excerpt = line
+                    break
+            if not error_excerpt:
+                error_excerpt = lines[-1]
 
         timer_match = timer_re.search(combined)
         draw_frames = int(timer_match.group(1)) if timer_match else None
@@ -313,7 +323,10 @@ def _main() -> int:
             output_duration = _ffprobe_value(output_path, "duration")
 
         wall_x_realtime = elapsed / duration_seconds
-        print(f"[bench] {scenario} ret={completed.returncode} elapsed={elapsed:.2f}s x_rt={wall_x_realtime:.2f}x")
+        print(
+            f"[bench] {scenario} ret={completed.returncode} elapsed={elapsed:.2f}s x_rt={wall_x_realtime:.2f}x"
+            + (f" err={error_excerpt}" if error_excerpt else "")
+        )
 
         return {
             "scenario": scenario,
@@ -333,6 +346,7 @@ def _main() -> int:
             "output_height": output_height,
             "output_fps": output_fps,
             "output_duration": output_duration,
+            "error_excerpt": error_excerpt,
             "log_path": str(log_path),
         }
 
