@@ -1898,7 +1898,17 @@ def _pending_jobs_summary(jobs: list[dict[str, Any]], *, limit: int = 50) -> lis
 
 
 def _admin_overview_payload() -> dict[str, Any]:
-    jobs = _list_all_jobs() if FIRESTORE_ENABLED else []
+    jobs: list[dict[str, Any]] = []
+    firestore_error: str | None = None
+    firestore_available = FIRESTORE_ENABLED
+    if FIRESTORE_ENABLED:
+        try:
+            jobs = _list_all_jobs()
+        except Exception as exc:  # noqa: BLE001
+            firestore_available = False
+            firestore_error = str(exc) or exc.__class__.__name__
+            LOGGER.warning("Admin overview could not load Firestore jobs: %s", firestore_error)
+
     return {
         "now": _utc_now(),
         "queue": _queue_snapshot(),
@@ -1906,7 +1916,9 @@ def _admin_overview_payload() -> dict[str, Any]:
         "disk": _jobs_disk_usage_snapshot(),
         "firestore": {
             "enabled": FIRESTORE_ENABLED,
-            "summary": _job_status_summary(jobs) if FIRESTORE_ENABLED else None,
+            "available": firestore_available,
+            "error": firestore_error,
+            "summary": _job_status_summary(jobs) if firestore_available else None,
         },
         "runtime": {
             "job_cleanup_enabled": JOB_CLEANUP_ENABLED,
@@ -1919,7 +1931,7 @@ def _admin_overview_payload() -> dict[str, Any]:
             "job_database_retention_days": JOB_DATABASE_RETENTION_DAYS,
             "ffmpeg_threads_per_render": FFMPEG_THREADS_PER_RENDER,
         },
-        "pending_jobs": _pending_jobs_summary(jobs, limit=80) if FIRESTORE_ENABLED else [],
+        "pending_jobs": _pending_jobs_summary(jobs, limit=80) if firestore_available else [],
     }
 
 

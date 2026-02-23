@@ -564,6 +564,25 @@ def test_admin_overview_requires_admin_uid(monkeypatch: pytest.MonkeyPatch) -> N
     assert "pending_jobs" in payload
 
 
+def test_admin_overview_handles_firestore_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(api_main, "_verify_firebase_token", _stub_verify_token)
+    monkeypatch.setattr(api_main, "ADMIN_UIDS", {"user-a"})
+    monkeypatch.setattr(api_main, "FIRESTORE_ENABLED", True)
+    monkeypatch.setattr(
+        api_main,
+        "_list_all_jobs",
+        lambda: (_ for _ in ()).throw(RuntimeError("firestore unavailable")),
+    )
+
+    response = client.get("/api/admin/ops/overview", headers={"Authorization": "Bearer token-user-a"})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["firestore"]["enabled"] is True
+    assert payload["firestore"]["available"] is False
+    assert payload["firestore"]["summary"] is None
+    assert payload["pending_jobs"] == []
+
+
 def test_admin_requeue_job_resets_pending_and_enqueues(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
