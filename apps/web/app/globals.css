@@ -3,24 +3,24 @@
 @custom-variant dark (&:is(.dark *));
 
 @theme {
-  --color-background: #f8fafc;
+  --color-background: #f3f6fb;
   --color-foreground: #0f172a;
   --color-card: #ffffff;
   --color-card-foreground: #0f172a;
   --color-popover: #ffffff;
   --color-popover-foreground: #0f172a;
-  --color-primary: #0c7bb3;
+  --color-primary: #0a7ac2;
   --color-primary-foreground: #f0f9ff;
-  --color-secondary: #e8f4fc;
-  --color-secondary-foreground: #0c4a6e;
-  --color-muted: #f1f5f9;
-  --color-muted-foreground: #64748b;
-  --color-accent: #dbeafe;
+  --color-secondary: #e4f0fd;
+  --color-secondary-foreground: #0f4f79;
+  --color-muted: #eaf0f8;
+  --color-muted-foreground: #5f728a;
+  --color-accent: #d7e9ff;
   --color-accent-foreground: #1e3a5f;
   --color-destructive: #ef4444;
   --color-destructive-foreground: #fef2f2;
-  --color-border: #e2e8f0;
-  --color-input: #e2e8f0;
+  --color-border: #d7e2ee;
+  --color-input: #d7e2ee;
   --color-ring: #3b82f6;
   --color-success: #10b981;
   --color-warning: #f59e0b;
@@ -32,19 +32,19 @@
 
 /* Dark mode overrides */
 .dark {
-  --color-background: #0a1628;
-  --color-foreground: #e2ecf4;
-  --color-card: rgba(12, 27, 46, 0.85);
+  --color-background: #0b1626;
+  --color-foreground: #e2ebf7;
+  --color-card: rgba(13, 27, 46, 0.9);
   --color-card-foreground: #e2ecf4;
-  --color-popover: #0f1f33;
+  --color-popover: #101f35;
   --color-popover-foreground: #e2ecf4;
-  --color-primary: #38bdf8;
+  --color-primary: #46c4ff;
   --color-primary-foreground: #0c1929;
-  --color-secondary: rgba(15, 35, 58, 0.7);
+  --color-secondary: rgba(15, 36, 60, 0.72);
   --color-secondary-foreground: #bae6fd;
-  --color-muted: rgba(15, 30, 50, 0.6);
-  --color-muted-foreground: #94a3b8;
-  --color-accent: rgba(20, 45, 75, 0.6);
+  --color-muted: rgba(16, 31, 52, 0.66);
+  --color-muted-foreground: #98a9be;
+  --color-accent: rgba(24, 49, 80, 0.66);
   --color-accent-foreground: #bae6fd;
   --color-destructive: #f87171;
   --color-destructive-foreground: #450a0a;
@@ -69,7 +69,10 @@ body {
 body {
   font-family: var(--font-body), system-ui, sans-serif;
   color: var(--color-foreground);
-  background-color: var(--color-background);
+  background:
+    radial-gradient(ellipse at 10% -10%, rgba(14, 116, 181, 0.07), transparent 48%),
+    radial-gradient(ellipse at 90% 115%, rgba(59, 130, 246, 0.06), transparent 42%),
+    var(--color-background);
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
 }
@@ -84,4 +87,16 @@ body {
 h1, h2, h3, h4, h5, h6 {
   font-family: var(--font-display), system-ui, sans-serif;
   letter-spacing: -0.01em;
+}
+
+input,
+select,
+textarea,
+button {
+  font: inherit;
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: color-mix(in srgb, var(--color-muted-foreground) 75%, transparent);
 }

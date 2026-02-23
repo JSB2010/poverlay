@@ -127,6 +127,7 @@ export default function MediaPage() {
   const [totalPages, setTotalPages] = useState(1);
   const [sortBy, setSortBy] = useState<(typeof SORT_FIELDS)[number]>("created_at");
   const [sortOrder, setSortOrder] = useState<(typeof SORT_ORDERS)[number]>("desc");
+  const [statusFilter, setStatusFilter] = useState<"all" | "active" | "completed" | "issues">("all");
   const [isLoading, setIsLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [busyKey, setBusyKey] = useState<string | null>(null);
@@ -202,7 +203,56 @@ export default function MediaPage() {
     return () => window.clearInterval(intervalId);
   }, [activeRenderCount, loadMedia]);
 
-  const itemCountLabel = useMemo(() => `${items.length} item${items.length === 1 ? "" : "s"} on this page`, [items.length]);
+  const statusCounts = useMemo(() => {
+    return items.reduce(
+      (acc, item) => {
+        if (item.status === "queued" || item.status === "running") {
+          acc.active += 1;
+        } else if (item.status === "completed") {
+          acc.completed += 1;
+        } else if (item.status === "failed" || item.status === "completed_with_errors") {
+          acc.issues += 1;
+        }
+        return acc;
+      },
+      { active: 0, completed: 0, issues: 0 },
+    );
+  }, [items]);
+
+  const filteredItems = useMemo(() => {
+    if (statusFilter === "active") {
+      return items.filter((item) => item.status === "queued" || item.status === "running");
+    }
+    if (statusFilter === "completed") {
+      return items.filter((item) => item.status === "completed");
+    }
+    if (statusFilter === "issues") {
+      return items.filter((item) => item.status === "failed" || item.status === "completed_with_errors");
+    }
+    return items;
+  }, [items, statusFilter]);
+
+  const groupedItems = useMemo(() => {
+    const groups = new Map<string, MediaItem[]>();
+    for (const item of filteredItems) {
+      const existing = groups.get(item.job_id);
+      if (existing) {
+        existing.push(item);
+      } else {
+        groups.set(item.job_id, [item]);
+      }
+    }
+    return Array.from(groups.entries()).map(([jobId, jobItems]) => ({
+      jobId,
+      items: jobItems,
+      hasActive: jobItems.some((item) => item.status === "queued" || item.status === "running"),
+    }));
+  }, [filteredItems]);
+
+  const itemCountLabel = useMemo(
+    () => `${filteredItems.length} item${filteredItems.length === 1 ? "" : "s"} on this page`,
+    [filteredItems.length],
+  );
 
   async function renameMedia(item: MediaItem): Promise<void> {
     const nextTitle = window.prompt("Rename media title", item.title);
@@ -318,23 +368,22 @@ export default function MediaPage() {
   }
 
   return (
-    <main className="mx-auto max-w-6xl px-4 py-12 sm:px-6">
-      <section className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-card)] p-8 shadow-sm">
+    <main className="mx-auto max-w-6xl px-4 py-10 sm:px-6 sm:py-12">
+      <section className="rounded-3xl border border-[var(--color-border)] bg-[var(--color-card)] p-6 shadow-sm sm:p-8">
         <div className="flex flex-wrap items-start justify-between gap-4">
           <div>
-            <p className="text-xs font-semibold uppercase tracking-wide text-[var(--color-primary)]">Media</p>
-            <h1 className="mt-2 text-3xl font-bold tracking-tight">Render Library</h1>
+            <p className="text-xs font-semibold uppercase tracking-[0.16em] text-[var(--color-primary)]">Media</p>
+            <h1 className="mt-2 text-3xl font-bold tracking-tight">Render library</h1>
             <p className="mt-3 max-w-2xl text-sm text-[var(--color-muted-foreground)]">
-              View your own queued, running, completed, and failed renders. Rename, delete, or request a fresh
-              download link for completed media.
+              Browsed by job. Track active renders, review failures, and manage completed exports from one place.
             </p>
           </div>
           <div className="flex gap-2">
             <Link
               href="/studio"
-              className="rounded-lg bg-[var(--color-primary)] px-4 py-2 text-sm font-medium text-white no-underline"
+              className="rounded-lg bg-[var(--color-primary)] px-4 py-2 text-sm font-medium text-white no-underline shadow-sm shadow-[var(--color-primary)]/20"
             >
-              Open Studio
+              Open studio
             </Link>
             <Link
               href="/settings"
@@ -345,7 +394,26 @@ export default function MediaPage() {
           </div>
         </div>
 
-        <div className="mt-6 flex flex-wrap items-center gap-3">
+        <div className="mt-6 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+          <div className="rounded-xl border border-[var(--color-border)] bg-[var(--color-background)]/80 px-4 py-3">
+            <p className="text-xs text-[var(--color-muted-foreground)]">Jobs on this page</p>
+            <p className="mt-1 text-lg font-semibold">{groupedItems.length}</p>
+          </div>
+          <div className="rounded-xl border border-[var(--color-border)] bg-[var(--color-background)]/80 px-4 py-3">
+            <p className="text-xs text-[var(--color-muted-foreground)]">Active clips</p>
+            <p className="mt-1 text-lg font-semibold">{statusCounts.active}</p>
+          </div>
+          <div className="rounded-xl border border-[var(--color-border)] bg-[var(--color-background)]/80 px-4 py-3">
+            <p className="text-xs text-[var(--color-muted-foreground)]">Completed clips</p>
+            <p className="mt-1 text-lg font-semibold">{statusCounts.completed}</p>
+          </div>
+          <div className="rounded-xl border border-[var(--color-border)] bg-[var(--color-background)]/80 px-4 py-3">
+            <p className="text-xs text-[var(--color-muted-foreground)]">Needs review</p>
+            <p className="mt-1 text-lg font-semibold">{statusCounts.issues}</p>
+          </div>
+        </div>
+
+        <div className="mt-6 flex flex-wrap items-center gap-3 rounded-xl border border-[var(--color-border)] bg-[var(--color-background)]/70 p-3">
           <label className="text-xs font-medium text-[var(--color-muted-foreground)]">
             Sort by
             <select
@@ -354,7 +422,7 @@ export default function MediaPage() {
                 setPage(1);
                 setSortBy(event.target.value as (typeof SORT_FIELDS)[number]);
               }}
-              className="ml-2 rounded-md border border-[var(--color-border)] bg-[var(--color-background)] px-2 py-1 text-sm"
+              className="ml-2 rounded-md border border-[var(--color-border)] bg-[var(--color-card)] px-2 py-1 text-sm"
             >
               <option value="created_at">Created</option>
               <option value="updated_at">Updated</option>
@@ -371,12 +439,34 @@ export default function MediaPage() {
                 setPage(1);
                 setSortOrder(event.target.value as (typeof SORT_ORDERS)[number]);
               }}
-              className="ml-2 rounded-md border border-[var(--color-border)] bg-[var(--color-background)] px-2 py-1 text-sm"
+              className="ml-2 rounded-md border border-[var(--color-border)] bg-[var(--color-card)] px-2 py-1 text-sm"
             >
               <option value="desc">Descending</option>
               <option value="asc">Ascending</option>
             </select>
           </label>
+
+          <div className="flex items-center gap-2">
+            {[
+              { id: "all", label: "All" },
+              { id: "active", label: "Active" },
+              { id: "completed", label: "Completed" },
+              { id: "issues", label: "Issues" },
+            ].map((filter) => (
+              <button
+                key={filter.id}
+                type="button"
+                onClick={() => setStatusFilter(filter.id as typeof statusFilter)}
+                className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
+                  statusFilter === filter.id
+                    ? "bg-[var(--color-primary)] text-white"
+                    : "border border-[var(--color-border)] bg-[var(--color-card)]"
+                }`}
+              >
+                {filter.label}
+              </button>
+            ))}
+          </div>
 
           <span className="text-xs text-[var(--color-muted-foreground)]">{itemCountLabel}</span>
           {activeRenderCount > 0 && (
@@ -393,113 +483,131 @@ export default function MediaPage() {
         )}
 
         {isLoading ? (
-          <div className="mt-6 rounded-lg border border-[var(--color-border)] bg-[var(--color-background)] p-6 text-sm text-[var(--color-muted-foreground)]">
+          <div className="mt-6 rounded-xl border border-[var(--color-border)] bg-[var(--color-background)] p-6 text-sm text-[var(--color-muted-foreground)]">
             Loading media library...
           </div>
-        ) : items.length === 0 ? (
-          <div className="mt-6 rounded-lg border border-[var(--color-border)] bg-[var(--color-background)] p-6 text-sm text-[var(--color-muted-foreground)]">
-            No media found yet. Start a render in Studio to populate your library.
+        ) : groupedItems.length === 0 ? (
+          <div className="mt-6 rounded-xl border border-[var(--color-border)] bg-[var(--color-background)] p-6 text-sm text-[var(--color-muted-foreground)]">
+            No media found for this filter on the current page.
           </div>
         ) : (
-          <ul className="mt-6 grid gap-4 sm:grid-cols-2">
-            {items.map((item) => {
-              const cardKey = `${item.job_id}:${item.id}`;
-              const isBusy = busyKey !== null && busyKey.startsWith(cardKey);
-              const canDelete = item.status !== "queued" && item.status !== "running";
-              const progress = clampProgress(item.progress);
-              const statusLabel = item.status.replaceAll("_", " ");
-              const failureReason = cleanConsoleText(item.error || item.job_message);
-              const detail = cleanConsoleText(item.detail);
-              const isActive = item.status === "queued" || item.status === "running";
-              const isFailure = item.status === "failed" || item.status === "completed_with_errors";
-
-              return (
-                <li key={cardKey} className="rounded-xl border border-[var(--color-border)] bg-[var(--color-background)] p-4">
-                  <div className="flex items-start justify-between gap-3">
-                    <div>
-                      <p className="text-sm font-semibold">{item.title}</p>
-                      <p className="mt-1 text-xs text-[var(--color-muted-foreground)]">
-                        Job {item.job_id} • {item.input_name}
-                      </p>
-                    </div>
-                    <span className={`rounded-full px-2 py-1 text-xs font-medium ${statusBadgeClasses(item.status)}`}>
-                      {isActive ? `${statusLabel} ${progress}%` : statusLabel}
-                    </span>
-                  </div>
-
-                  {isActive && (
-                    <div className="mt-3">
-                      <div className="h-2 w-full overflow-hidden rounded-full bg-[var(--color-muted)]/50">
-                        <div
-                          className="h-full rounded-full bg-[var(--color-primary)] transition-[width] duration-300"
-                          style={{ width: `${progress}%` }}
-                        />
-                      </div>
-                      <p className="mt-2 text-xs text-[var(--color-muted-foreground)]">
-                        {detail || "Render queued"}
-                      </p>
-                    </div>
-                  )}
-
-                  {!isActive && isFailure && failureReason && (
-                    <p className="mt-3 rounded-md border border-red-500/30 bg-red-500/10 px-2.5 py-2 text-xs text-red-700 dark:text-red-300">
-                      {failureReason}
+          <div className="mt-6 space-y-5">
+            {groupedItems.map((group) => (
+              <section key={group.jobId} className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-background)]/65 p-4 sm:p-5">
+                <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <h2 className="text-sm font-semibold">Job {group.jobId}</h2>
+                    <p className="text-xs text-[var(--color-muted-foreground)]">
+                      {group.items.length} clip{group.items.length === 1 ? "" : "s"}
                     </p>
-                  )}
-
-                  {!isActive && detail && (!isFailure || detail !== failureReason) && (
-                    <p className="mt-2 text-xs text-[var(--color-muted-foreground)]">{detail}</p>
-                  )}
-
-                  <p className="mt-3 text-xs text-[var(--color-muted-foreground)]">
-                    {[
-                      item.render_profile_label,
-                      item.source_resolution,
-                      item.source_fps ? `${item.source_fps} fps` : "",
-                      formatBytes(item.size_bytes),
-                    ]
-                      .filter(Boolean)
-                      .join(" • ") || "No output metadata yet"}
-                  </p>
-
-                  <div className="mt-4 flex flex-wrap gap-2">
-                    <button
-                      type="button"
-                      onClick={() => void renameMedia(item)}
-                      disabled={isBusy}
-                      className="rounded-md border border-[var(--color-border)] px-3 py-1.5 text-xs font-medium transition-colors hover:bg-[var(--color-muted)]/30 disabled:cursor-not-allowed disabled:opacity-50"
-                    >
-                      Rename
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => void deleteMedia(item)}
-                      disabled={isBusy || !canDelete}
-                      className="rounded-md border border-[var(--color-border)] px-3 py-1.5 text-xs font-medium transition-colors hover:bg-[var(--color-muted)]/30 disabled:cursor-not-allowed disabled:opacity-50"
-                    >
-                      Delete
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => void downloadMedia(item)}
-                      disabled={isBusy || !item.can_download}
-                      className="rounded-md bg-[var(--color-primary)] px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-[var(--color-primary)]/90 disabled:cursor-not-allowed disabled:opacity-50"
-                    >
-                      Download
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => void downloadRenderLog(item)}
-                      disabled={isBusy || !item.log_name}
-                      className="rounded-md border border-[var(--color-border)] px-3 py-1.5 text-xs font-medium transition-colors hover:bg-[var(--color-muted)]/30 disabled:cursor-not-allowed disabled:opacity-50"
-                    >
-                      Download log
-                    </button>
                   </div>
-                </li>
-              );
-            })}
-          </ul>
+                  <span
+                    className={`rounded-full px-2.5 py-1 text-xs font-medium ${
+                      group.hasActive ? "bg-blue-500/10 text-blue-600 dark:text-blue-400" : "bg-[var(--color-muted)] text-[var(--color-muted-foreground)]"
+                    }`}
+                  >
+                    {group.hasActive ? "In progress" : "Idle"}
+                  </span>
+                </div>
+
+                <ul className="grid gap-4 md:grid-cols-2">
+                  {group.items.map((item) => {
+                    const cardKey = `${item.job_id}:${item.id}`;
+                    const isBusy = busyKey !== null && busyKey.startsWith(cardKey);
+                    const canDelete = item.status !== "queued" && item.status !== "running";
+                    const progress = clampProgress(item.progress);
+                    const statusLabel = item.status.replaceAll("_", " ");
+                    const failureReason = cleanConsoleText(item.error || item.job_message);
+                    const detail = cleanConsoleText(item.detail);
+                    const isActive = item.status === "queued" || item.status === "running";
+                    const isFailure = item.status === "failed" || item.status === "completed_with_errors";
+
+                    return (
+                      <li key={cardKey} className="rounded-xl border border-[var(--color-border)] bg-[var(--color-card)] p-4">
+                        <div className="flex items-start justify-between gap-3">
+                          <div>
+                            <p className="text-sm font-semibold">{item.title}</p>
+                            <p className="mt-1 text-xs text-[var(--color-muted-foreground)]">{item.input_name}</p>
+                          </div>
+                          <span className={`rounded-full px-2 py-1 text-xs font-medium ${statusBadgeClasses(item.status)}`}>
+                            {isActive ? `${statusLabel} ${progress}%` : statusLabel}
+                          </span>
+                        </div>
+
+                        {isActive && (
+                          <div className="mt-3">
+                            <div className="h-2 w-full overflow-hidden rounded-full bg-[var(--color-muted)]/50">
+                              <div
+                                className="h-full rounded-full bg-[var(--color-primary)] transition-[width] duration-300"
+                                style={{ width: `${progress}%` }}
+                              />
+                            </div>
+                            <p className="mt-2 text-xs text-[var(--color-muted-foreground)]">{detail || "Render queued"}</p>
+                          </div>
+                        )}
+
+                        {!isActive && isFailure && failureReason && (
+                          <p className="mt-3 rounded-md border border-red-500/30 bg-red-500/10 px-2.5 py-2 text-xs text-red-700 dark:text-red-300">
+                            {failureReason}
+                          </p>
+                        )}
+
+                        {!isActive && detail && (!isFailure || detail !== failureReason) && (
+                          <p className="mt-2 text-xs text-[var(--color-muted-foreground)]">{detail}</p>
+                        )}
+
+                        <p className="mt-3 text-xs text-[var(--color-muted-foreground)]">
+                          {[
+                            item.render_profile_label,
+                            item.source_resolution,
+                            item.source_fps ? `${item.source_fps} fps` : "",
+                            formatBytes(item.size_bytes),
+                          ]
+                            .filter(Boolean)
+                            .join(" • ") || "No output metadata yet"}
+                        </p>
+
+                        <div className="mt-4 flex flex-wrap gap-2">
+                          <button
+                            type="button"
+                            onClick={() => void renameMedia(item)}
+                            disabled={isBusy}
+                            className="rounded-md border border-[var(--color-border)] px-3 py-1.5 text-xs font-medium transition-colors hover:bg-[var(--color-muted)]/30 disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            Rename
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void deleteMedia(item)}
+                            disabled={isBusy || !canDelete}
+                            className="rounded-md border border-[var(--color-border)] px-3 py-1.5 text-xs font-medium transition-colors hover:bg-[var(--color-muted)]/30 disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            Delete
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void downloadMedia(item)}
+                            disabled={isBusy || !item.can_download}
+                            className="rounded-md bg-[var(--color-primary)] px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-[var(--color-primary)]/90 disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            Download
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void downloadRenderLog(item)}
+                            disabled={isBusy || !item.log_name}
+                            className="rounded-md border border-[var(--color-border)] px-3 py-1.5 text-xs font-medium transition-colors hover:bg-[var(--color-muted)]/30 disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            Download log
+                          </button>
+                        </div>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </section>
+            ))}
+          </div>
         )}
 
         <div className="mt-6 flex items-center justify-between">

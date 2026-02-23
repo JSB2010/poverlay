@@ -701,6 +701,25 @@ export default function HomePage() {
   const statsPanelEnabled = componentVisibility.stats_panel ?? true;
   const gpsPanelEnabled = componentVisibility.gps_panel ?? true;
   const mapsEnabled = componentVisibility.route_maps ?? true;
+  const componentGroups = useMemo(() => {
+    const coreIds = new Set(["time_panel", "speed_panel", "stats_panel", "gps_panel", "route_maps"]);
+    const metricIds = new Set(["altitude_metric", "grade_metric", "distance_metric", "gps_coordinates"]);
+    const core: ComponentOption[] = [];
+    const metrics: ComponentOption[] = [];
+    const advanced: ComponentOption[] = [];
+
+    for (const option of componentOptions) {
+      if (coreIds.has(option.id)) {
+        core.push(option);
+      } else if (metricIds.has(option.id)) {
+        metrics.push(option);
+      } else {
+        advanced.push(option);
+      }
+    }
+
+    return { core, metrics, advanced };
+  }, [componentOptions]);
   const selectedUploadBytes = useMemo(
     () => (gpxFile?.size ?? 0) + videoFiles.reduce((sum, video) => sum + video.size, 0),
     [gpxFile, videoFiles],
@@ -1196,421 +1215,480 @@ export default function HomePage() {
 
   return (
     <main className="min-h-screen pb-12">
-      <header className="border-b border-[var(--color-border)] bg-[var(--color-card)]/60 backdrop-blur-sm">
+      <header className="border-b border-[var(--color-border)] bg-[var(--color-card)]/70 backdrop-blur-sm">
         <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
-          <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-[var(--color-primary)]">POVerlay Studio</p>
+          <div className="mt-3 flex flex-wrap items-end justify-between gap-4">
             <div>
-              <p className="mb-2 text-sm font-medium text-[var(--color-primary)]">POVerlay Studio</p>
-              <h1 className="text-3xl font-bold tracking-tight sm:text-4xl">GoPro Telemetry Overlay Studio</h1>
-              <p className="mt-2 max-w-2xl text-base text-[var(--color-muted-foreground)]">
-                Professional render pipeline for GPX-aligned overlays. Upload one ride track and one or more clips,
-                preview themes/layouts, and export timeline-ready videos.
+              <h1 className="text-3xl font-bold tracking-tight sm:text-4xl">GoPro telemetry pipeline</h1>
+              <p className="mt-2 max-w-3xl text-sm text-[var(--color-muted-foreground)] sm:text-base">
+                Upload one GPX track plus one or more clips, choose your look, and render timeline-ready overlays.
               </p>
+            </div>
+            <div className="rounded-xl border border-[var(--color-border)] bg-[var(--color-background)]/80 px-4 py-3 text-sm">
+              {gpxFile ? `GPX: ${gpxFile.name}` : "No GPX selected"} • {videoFiles.length} clip
+              {videoFiles.length === 1 ? "" : "s"} • {selectedUploadBytes > 0 ? formatBytes(selectedUploadBytes) : "0 B"}
             </div>
           </div>
         </div>
       </header>
 
-      <div className="mx-auto grid max-w-7xl gap-8 px-4 py-8 sm:px-6 lg:grid-cols-[1fr_400px] lg:px-8">
-        <section className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-card)] p-6 shadow-sm">
-          <form onSubmit={handleSubmit} className="space-y-8">
-            <div>
-              <h2 className="text-xl font-semibold">Upload</h2>
-              <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">Start with one GPX file and one or more clips.</p>
-            </div>
+      <div className="mx-auto grid max-w-7xl gap-8 px-4 py-8 sm:px-6 lg:grid-cols-[minmax(0,1fr)_390px] lg:px-8">
+        <section className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-card)] p-5 shadow-sm sm:p-6">
+          <form onSubmit={handleSubmit} className="space-y-6">
+            <section className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-background)]/55 p-5">
+              <h2 className="text-lg font-semibold">1. Upload assets</h2>
+              <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">Use one GPX file and one or more clips.</p>
+              <div className="mt-4 grid gap-5 sm:grid-cols-2">
+                <label className="block" htmlFor="gpx">
+                  <span className="mb-2 block text-sm font-medium">GPX file (Slopes export)</span>
+                  <input
+                    id="gpx"
+                    type="file"
+                    accept=".gpx"
+                    required
+                    onChange={(event) => setGpxFile(event.target.files?.[0] ?? null)}
+                    className="block w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-card)] px-3 py-2 text-sm file:mr-4 file:rounded-md file:border-0 file:bg-[var(--color-primary)] file:px-3 file:py-1.5 file:text-sm file:font-medium file:text-white hover:file:bg-[var(--color-primary)]/90"
+                  />
+                </label>
 
-            <div className="grid gap-6 sm:grid-cols-2">
-              <label className="block" htmlFor="gpx">
-                <span className="mb-2 block text-sm font-medium">GPX file (Slopes export)</span>
-                <input
-                  id="gpx"
-                  type="file"
-                  accept=".gpx"
-                  required
-                  onChange={(event) => setGpxFile(event.target.files?.[0] ?? null)}
-                  className="block w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-background)] px-3 py-2 text-sm file:mr-4 file:rounded-md file:border-0 file:bg-[var(--color-primary)] file:px-3 file:py-1.5 file:text-sm file:font-medium file:text-white hover:file:bg-[var(--color-primary)]/90"
-                />
-              </label>
+                <label className="block" htmlFor="videos">
+                  <span className="mb-2 block text-sm font-medium">GoPro clips</span>
+                  <input
+                    id="videos"
+                    type="file"
+                    accept="video/*,.mp4,.mov"
+                    multiple
+                    required
+                    onChange={(event) => setVideoFiles(Array.from(event.target.files ?? []))}
+                    className="block w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-card)] px-3 py-2 text-sm file:mr-4 file:rounded-md file:border-0 file:bg-[var(--color-primary)] file:px-3 file:py-1.5 file:text-sm file:font-medium file:text-white hover:file:bg-[var(--color-primary)]/90"
+                  />
+                </label>
+              </div>
+              <div className="mt-4 rounded-xl border border-[var(--color-border)] bg-[var(--color-card)] px-4 py-3">
+                <p className="text-sm font-medium">
+                  Payload estimate:{" "}
+                  <span className="text-[var(--color-primary)]">
+                    {selectedUploadBytes > 0 ? formatBytes(selectedUploadBytes) : "No files selected"}
+                  </span>
+                </p>
+                <p className="mt-1 text-xs text-[var(--color-muted-foreground)]">
+                  Keep this tab open through upload completion. Rendering continues server-side after upload.
+                </p>
+              </div>
+            </section>
 
-              <label className="block" htmlFor="videos">
-                <span className="mb-2 block text-sm font-medium">GoPro clips</span>
-                <input
-                  id="videos"
-                  type="file"
-                  accept="video/*,.mp4,.mov"
-                  multiple
-                  required
-                  onChange={(event) => setVideoFiles(Array.from(event.target.files ?? []))}
-                  className="block w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-background)] px-3 py-2 text-sm file:mr-4 file:rounded-md file:border-0 file:bg-[var(--color-primary)] file:px-3 file:py-1.5 file:text-sm file:font-medium file:text-white hover:file:bg-[var(--color-primary)]/90"
-                />
-              </label>
-            </div>
+            <section className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-background)]/55 p-5">
+              <h2 className="text-lg font-semibold">2. Look and output</h2>
+              <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">Set style, layout, and render profile.</p>
 
-            <div className="rounded-xl border border-[var(--color-border)] bg-[var(--color-muted)]/20 px-4 py-3">
-              <p className="text-sm font-medium">
-                Payload estimate:{" "}
-                <span className="text-[var(--color-primary)]">
-                  {selectedUploadBytes > 0 ? formatBytes(selectedUploadBytes) : "No files selected"}
-                </span>
-              </p>
-              <p className="mt-1 text-xs text-[var(--color-muted-foreground)]">
-                Large uploads can run for a long time. Keep this tab open until upload reaches 100%, then rendering continues
-                on the server.
-              </p>
-            </div>
-
-            <div>
-              <h2 className="text-xl font-semibold">Render Settings</h2>
-              <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">Main controls for look, layout, and export behavior.</p>
-            </div>
-
-            <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
-              <label className="block" htmlFor="overlay_theme">
-                <span className="mb-2 block text-sm font-medium">Overlay theme</span>
-                <select
-                  id="overlay_theme"
-                  value={formState.overlay_theme}
-                  onChange={(event) => setFormState((prev) => ({ ...prev, overlay_theme: event.target.value }))}
-                  className="block w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-background)] px-3 py-2 text-sm focus:border-[var(--color-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/20"
-                >
-                  {themes.map((theme) => (
-                    <option key={theme.id} value={theme.id}>
-                      {theme.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
-
-              <label className="block" htmlFor="layout_style">
-                <span className="mb-2 block text-sm font-medium">Layout style</span>
-                <select
-                  id="layout_style"
-                  value={formState.layout_style}
-                  onChange={(event) => setFormState((prev) => ({ ...prev, layout_style: event.target.value }))}
-                  className="block w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-background)] px-3 py-2 text-sm focus:border-[var(--color-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/20"
-                >
-                  {layoutStyles.map((layoutStyle) => (
-                    <option key={layoutStyle.id} value={layoutStyle.id}>
-                      {layoutStyle.label}
-                    </option>
-                  ))}
-                </select>
-                {selectedLayout?.description && (
-                  <p className="mt-1 text-xs text-[var(--color-muted-foreground)]">{selectedLayout.description}</p>
-                )}
-              </label>
-
-              <label className="block" htmlFor="render_profile">
-                <span className="mb-2 block text-sm font-medium">Export codec</span>
-                <select
-                  id="render_profile"
-                  value={formState.render_profile}
-                  onChange={(event) => setFormState((prev) => ({ ...prev, render_profile: event.target.value }))}
-                  className="block w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-background)] px-3 py-2 text-sm focus:border-[var(--color-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/20"
-                >
-                  {renderProfiles.map((profile) => (
-                    <option key={profile.id} value={profile.id}>
-                      {profile.label}
-                    </option>
-                  ))}
-                </select>
-                {selectedProfile && (
-                  <p className="mt-1 text-xs text-[var(--color-muted-foreground)]">
-                    {selectedProfile.summary}
-                    {selectedProfile.best_for ? ` Best for: ${selectedProfile.best_for}` : ""}
-                  </p>
-                )}
-              </label>
-
-              <label className="block" htmlFor="units_preset">
-                <span className="mb-2 block text-sm font-medium">Units preset</span>
-                <select
-                  id="units_preset"
-                  value={formState.units_preset}
-                  onChange={(event) => applyUnitsPreset(event.target.value as FormState["units_preset"])}
-                  className="block w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-background)] px-3 py-2 text-sm focus:border-[var(--color-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/20"
-                >
-                  <option value="imperial">Imperial (mph / mile / feet / degF)</option>
-                  <option value="metric">Metric (kph / km / metre / degC)</option>
-                  <option value="custom">Custom</option>
-                </select>
-              </label>
-
-              <label className="block" htmlFor="fps_mode">
-                <span className="mb-2 block text-sm font-medium">FPS strategy</span>
-                <select
-                  id="fps_mode"
-                  value={formState.fps_mode}
-                  onChange={(event) =>
-                    setFormState((prev) => ({ ...prev, fps_mode: event.target.value as FormState["fps_mode"] }))
-                  }
-                  className="block w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-background)] px-3 py-2 text-sm focus:border-[var(--color-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/20"
-                >
-                  <option value="source_exact">Match source (exact)</option>
-                  <option value="source_rounded">Match source (rounded int)</option>
-                  <option value="fixed">Fixed FPS</option>
-                </select>
-              </label>
-
-              <label className="block" htmlFor="fixed_fps">
-                <span className="mb-2 block text-sm font-medium">Fixed FPS value</span>
-                <input
-                  id="fixed_fps"
-                  type="number"
-                  min="1"
-                  step="0.01"
-                  value={formState.fixed_fps}
-                  disabled={formState.fps_mode !== "fixed"}
-                  onChange={(event) => setFormState((prev) => ({ ...prev, fixed_fps: event.target.value }))}
-                  className="block w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-background)] px-3 py-2 text-sm focus:border-[var(--color-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/20 disabled:cursor-not-allowed disabled:opacity-50"
-                />
-              </label>
-
-              <label className="block" htmlFor="gpx_offset_seconds">
-                <span className="mb-2 block text-sm font-medium">GPX time offset (seconds)</span>
-                <input
-                  id="gpx_offset_seconds"
-                  type="number"
-                  step="0.1"
-                  value={formState.gpx_offset_seconds}
-                  onChange={(event) => setFormState((prev) => ({ ...prev, gpx_offset_seconds: event.target.value }))}
-                  className="block w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-background)] px-3 py-2 text-sm focus:border-[var(--color-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/20"
-                />
-              </label>
-            </div>
-
-            <div className="grid gap-6 lg:grid-cols-2">
-              <article className="rounded-xl border border-[var(--color-border)] bg-[var(--color-card)] p-6">
-                <h3 className="mb-4 text-lg font-semibold">Theme Preview</h3>
-                <div className="mb-4 flex flex-wrap gap-2">
-                  <span style={{ background: panelColor }} className="rounded-md px-3 py-1.5 text-xs font-medium text-white">Panel</span>
-                  <span style={{ background: panelAltColor }} className="rounded-md px-3 py-1.5 text-xs font-medium text-white">Panel Alt</span>
-                  <span style={{ background: speedColor }} className="rounded-md px-3 py-1.5 text-xs font-medium text-white">Speed</span>
-                  <span style={{ background: accentColor }} className="rounded-md px-3 py-1.5 text-xs font-medium text-white">Accent</span>
-                  <span style={{ background: textColor, color: "#102742" }} className="rounded-md px-3 py-1.5 text-xs font-medium">Text</span>
-                </div>
-
-                <div
-                  className="rounded-xl border p-4"
-                  style={{
-                    background: `linear-gradient(138deg, ${panelColor}, ${panelAltColor})`,
-                    borderColor: "rgba(168, 213, 255, 0.35)",
-                  }}
-                >
-                  <div className="mb-3">
-                    <small style={{ color: accentColor }} className="block text-xs font-medium uppercase tracking-wide">SPEED</small>
-                    <strong style={{ color: speedColor }} className="text-4xl font-bold">62</strong>
-                  </div>
-                  <div style={{ color: textColor }} className="flex gap-4 text-xs font-medium">
-                    <span>ALT 2100</span>
-                    <span>GRADE 8.2%</span>
-                    <span>DIST 4.6</span>
-                  </div>
-                </div>
-              </article>
-
-              <article className="rounded-xl border border-[var(--color-border)] bg-[var(--color-card)] p-6">
-                <h3 className="mb-4 text-lg font-semibold">Layout Previews</h3>
-                <div className="grid grid-cols-2 gap-3">
-                  {layoutStyles.map((layoutStyle) => {
-                    const previewSource = layoutPreviewById[layoutStyle.id];
-                    const normalizedSource = previewSource
-                      ? previewSource.startsWith("/")
-                        ? previewSource
-                        : `/${previewSource}`
-                      : null;
-                    const shouldUseImage = Boolean(normalizedSource && !brokenLayoutPreviews[layoutStyle.id]);
-
-                    return (
-                      <button
-                        key={layoutStyle.id}
-                        type="button"
-                        className={`group rounded-lg border p-3 text-left transition-all hover:border-[var(--color-primary)] hover:shadow-md ${
-                          layoutStyle.id === formState.layout_style
-                            ? "border-[var(--color-primary)] bg-[var(--color-primary)]/5 shadow-sm"
-                            : "border-[var(--color-border)] bg-[var(--color-background)]"
-                        }`}
-                        onClick={() => setFormState((prev) => ({ ...prev, layout_style: layoutStyle.id }))}
-                      >
-                        {shouldUseImage ? (
-                          <div className="mb-2 overflow-hidden rounded">
-                            <img
-                              src={normalizedSource ?? ""}
-                              alt={`${layoutStyle.label} preview`}
-                              loading="lazy"
-                              className="h-auto w-full"
-                              onError={() =>
-                                setBrokenLayoutPreviews((prev) => (
-                                  prev[layoutStyle.id]
-                                    ? prev
-                                    : {
-                                        ...prev,
-                                        [layoutStyle.id]: true,
-                                      }
-                                ))
-                              }
-                            />
-                          </div>
-                        ) : (
-                          <div
-                            className="mb-2 overflow-hidden rounded"
-                            dangerouslySetInnerHTML={{ __html: getLayoutPreviewSvg(layoutStyle.id) }}
-                          />
-                        )}
-                        <div>
-                          <strong className="block text-xs font-semibold">{layoutStyle.label}</strong>
-                          <small className="block text-[10px] text-[var(--color-muted-foreground)]">{layoutStyle.description}</small>
-                        </div>
-                      </button>
-                    );
-                  })}
-                </div>
-              </article>
-            </div>
-
-            <div>
-              <h2 className="text-xl font-semibold">Overlay Components</h2>
-              <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">Choose exactly what appears in the rendered overlay.</p>
-            </div>
-
-            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-              {componentOptions.map((option) => {
-                const checked = componentVisibility[option.id] ?? option.default_enabled;
-                const isDisabled =
-                  (option.id === "altitude_metric" || option.id === "grade_metric" || option.id === "distance_metric")
-                    ? !statsPanelEnabled
-                    : option.id === "gps_coordinates"
-                      ? !gpsPanelEnabled
-                      : false;
-
-                return (
-                  <label
-                    key={option.id}
-                    className={`flex cursor-pointer items-start gap-3 rounded-lg border p-4 transition-all ${
-                      isDisabled
-                        ? "cursor-not-allowed opacity-50"
-                        : checked
-                          ? "border-[var(--color-primary)] bg-[var(--color-primary)]/5"
-                          : "border-[var(--color-border)] hover:border-[var(--color-primary)]/50"
-                    }`}
+              <div className="mt-4 grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
+                <label className="block" htmlFor="overlay_theme">
+                  <span className="mb-2 block text-sm font-medium">Overlay theme</span>
+                  <select
+                    id="overlay_theme"
+                    value={formState.overlay_theme}
+                    onChange={(event) => setFormState((prev) => ({ ...prev, overlay_theme: event.target.value }))}
+                    className="block w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-card)] px-3 py-2 text-sm focus:border-[var(--color-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/20"
                   >
-                    <input
-                      type="checkbox"
-                      checked={checked}
-                      disabled={isDisabled}
-                      onChange={() => toggleComponentVisibility(option.id)}
-                      className="mt-0.5 h-4 w-4 rounded border-[var(--color-border)] text-[var(--color-primary)] focus:ring-2 focus:ring-[var(--color-primary)]/20 disabled:cursor-not-allowed"
-                    />
-                    <div className="flex-1">
-                      <span className="block text-sm font-medium">{option.label}</span>
-                      <small className="block text-xs text-[var(--color-muted-foreground)]">{option.description}</small>
+                    {themes.map((theme) => (
+                      <option key={theme.id} value={theme.id}>
+                        {theme.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <label className="block" htmlFor="layout_style">
+                  <span className="mb-2 block text-sm font-medium">Layout style</span>
+                  <select
+                    id="layout_style"
+                    value={formState.layout_style}
+                    onChange={(event) => setFormState((prev) => ({ ...prev, layout_style: event.target.value }))}
+                    className="block w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-card)] px-3 py-2 text-sm focus:border-[var(--color-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/20"
+                  >
+                    {layoutStyles.map((layoutStyle) => (
+                      <option key={layoutStyle.id} value={layoutStyle.id}>
+                        {layoutStyle.label}
+                      </option>
+                    ))}
+                  </select>
+                  {selectedLayout?.description && (
+                    <p className="mt-1 text-xs text-[var(--color-muted-foreground)]">{selectedLayout.description}</p>
+                  )}
+                </label>
+
+                <label className="block" htmlFor="render_profile">
+                  <span className="mb-2 block text-sm font-medium">Export codec</span>
+                  <select
+                    id="render_profile"
+                    value={formState.render_profile}
+                    onChange={(event) => setFormState((prev) => ({ ...prev, render_profile: event.target.value }))}
+                    className="block w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-card)] px-3 py-2 text-sm focus:border-[var(--color-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/20"
+                  >
+                    {renderProfiles.map((profile) => (
+                      <option key={profile.id} value={profile.id}>
+                        {profile.label}
+                      </option>
+                    ))}
+                  </select>
+                  {selectedProfile && (
+                    <p className="mt-1 text-xs text-[var(--color-muted-foreground)]">
+                      {selectedProfile.summary}
+                      {selectedProfile.best_for ? ` Best for: ${selectedProfile.best_for}` : ""}
+                    </p>
+                  )}
+                </label>
+
+                <label className="block" htmlFor="units_preset">
+                  <span className="mb-2 block text-sm font-medium">Units preset</span>
+                  <select
+                    id="units_preset"
+                    value={formState.units_preset}
+                    onChange={(event) => applyUnitsPreset(event.target.value as FormState["units_preset"])}
+                    className="block w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-card)] px-3 py-2 text-sm focus:border-[var(--color-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/20"
+                  >
+                    <option value="imperial">Imperial (mph / mile / feet / degF)</option>
+                    <option value="metric">Metric (kph / km / metre / degC)</option>
+                    <option value="custom">Custom</option>
+                  </select>
+                </label>
+
+                <label className="block" htmlFor="fps_mode">
+                  <span className="mb-2 block text-sm font-medium">FPS strategy</span>
+                  <select
+                    id="fps_mode"
+                    value={formState.fps_mode}
+                    onChange={(event) =>
+                      setFormState((prev) => ({ ...prev, fps_mode: event.target.value as FormState["fps_mode"] }))
+                    }
+                    className="block w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-card)] px-3 py-2 text-sm focus:border-[var(--color-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/20"
+                  >
+                    <option value="source_exact">Match source (exact)</option>
+                    <option value="source_rounded">Match source (rounded int)</option>
+                    <option value="fixed">Fixed FPS</option>
+                  </select>
+                </label>
+
+                <label className="block" htmlFor="fixed_fps">
+                  <span className="mb-2 block text-sm font-medium">Fixed FPS value</span>
+                  <input
+                    id="fixed_fps"
+                    type="number"
+                    min="1"
+                    step="0.01"
+                    value={formState.fixed_fps}
+                    disabled={formState.fps_mode !== "fixed"}
+                    onChange={(event) => setFormState((prev) => ({ ...prev, fixed_fps: event.target.value }))}
+                    className="block w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-card)] px-3 py-2 text-sm focus:border-[var(--color-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/20 disabled:cursor-not-allowed disabled:opacity-50"
+                  />
+                </label>
+              </div>
+
+              <div className="mt-5 grid gap-5 xl:grid-cols-[340px_minmax(0,1fr)]">
+                <article className="rounded-xl border border-[var(--color-border)] bg-[var(--color-card)] p-4">
+                  <h3 className="mb-3 text-sm font-semibold">Theme preview</h3>
+                  <div className="mb-3 flex flex-wrap gap-2">
+                    <span style={{ background: panelColor }} className="rounded-md px-2.5 py-1 text-[10px] font-semibold text-white">Panel</span>
+                    <span style={{ background: panelAltColor }} className="rounded-md px-2.5 py-1 text-[10px] font-semibold text-white">Panel Alt</span>
+                    <span style={{ background: speedColor }} className="rounded-md px-2.5 py-1 text-[10px] font-semibold text-white">Speed</span>
+                    <span style={{ background: accentColor }} className="rounded-md px-2.5 py-1 text-[10px] font-semibold text-white">Accent</span>
+                  </div>
+                  <div
+                    className="rounded-xl border p-4"
+                    style={{
+                      background: `linear-gradient(138deg, ${panelColor}, ${panelAltColor})`,
+                      borderColor: "rgba(168, 213, 255, 0.35)",
+                    }}
+                  >
+                    <div className="mb-3">
+                      <small style={{ color: accentColor }} className="block text-[10px] font-semibold uppercase tracking-wide">SPEED</small>
+                      <strong style={{ color: speedColor }} className="text-4xl font-bold">62</strong>
                     </div>
-                  </label>
-                );
-              })}
-            </div>
+                    <div style={{ color: textColor }} className="flex gap-3 text-[10px] font-medium">
+                      <span>ALT 2100</span>
+                      <span>GRADE 8.2%</span>
+                      <span>DIST 4.6</span>
+                    </div>
+                  </div>
+                </article>
 
-            <details className="group rounded-xl border border-[var(--color-border)] bg-[var(--color-card)]">
-              <summary className="cursor-pointer px-6 py-4 font-semibold transition-colors hover:bg-[var(--color-muted)]/30">
-                Advanced Settings
-              </summary>
-              <div className="border-t border-[var(--color-border)] p-6">
-                <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
-                  <label className="block" htmlFor="map_style">
-                    <span className="mb-2 block text-sm font-medium">Map style</span>
-                    <select
-                      id="map_style"
-                      value={formState.map_style}
-                      disabled={!mapsEnabled}
-                      onChange={(event) => setFormState((prev) => ({ ...prev, map_style: event.target.value }))}
-                      className="block w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-background)] px-3 py-2 text-sm focus:border-[var(--color-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/20 disabled:cursor-not-allowed disabled:opacity-50"
-                    >
-                      {mapStyles.map((style) => (
-                        <option key={style} value={style}>
-                          {mapStyleLabel(style)}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
+                <article className="rounded-xl border border-[var(--color-border)] bg-[var(--color-card)] p-4">
+                  <h3 className="mb-3 text-sm font-semibold">Layout previews</h3>
+                  <div className="grid grid-cols-2 gap-2 lg:grid-cols-3">
+                    {layoutStyles.map((layoutStyle) => {
+                      const previewSource = layoutPreviewById[layoutStyle.id];
+                      const normalizedSource = previewSource
+                        ? previewSource.startsWith("/")
+                          ? previewSource
+                          : `/${previewSource}`
+                        : null;
+                      const shouldUseImage = Boolean(normalizedSource && !brokenLayoutPreviews[layoutStyle.id]);
 
-                  <label className="block" htmlFor="speed_units">
-                    <span className="mb-2 block text-sm font-medium">Speed units</span>
-                    <select
-                      id="speed_units"
-                      value={formState.speed_units}
-                      disabled={formState.units_preset !== "custom"}
-                      onChange={(event) => handleUnitChange("speed_units", event.target.value)}
-                      className="block w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-background)] px-3 py-2 text-sm focus:border-[var(--color-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/20 disabled:cursor-not-allowed disabled:opacity-50"
-                    >
-                      <option value="kph">kph</option>
-                      <option value="mph">mph</option>
-                      <option value="mps">m/s</option>
-                      <option value="knots">knots</option>
-                    </select>
-                  </label>
+                      return (
+                        <button
+                          key={layoutStyle.id}
+                          type="button"
+                          className={`rounded-lg border p-2 text-left transition-all hover:border-[var(--color-primary)] ${
+                            layoutStyle.id === formState.layout_style
+                              ? "border-[var(--color-primary)] bg-[var(--color-primary)]/5"
+                              : "border-[var(--color-border)] bg-[var(--color-background)]"
+                          }`}
+                          onClick={() => setFormState((prev) => ({ ...prev, layout_style: layoutStyle.id }))}
+                        >
+                          {shouldUseImage ? (
+                            <div className="mb-2 overflow-hidden rounded">
+                              <img
+                                src={normalizedSource ?? ""}
+                                alt={`${layoutStyle.label} preview`}
+                                loading="lazy"
+                                className="h-auto w-full"
+                                onError={() =>
+                                  setBrokenLayoutPreviews((prev) => (
+                                    prev[layoutStyle.id]
+                                      ? prev
+                                      : {
+                                          ...prev,
+                                          [layoutStyle.id]: true,
+                                        }
+                                  ))
+                                }
+                              />
+                            </div>
+                          ) : (
+                            <div
+                              className="mb-2 overflow-hidden rounded"
+                              dangerouslySetInnerHTML={{ __html: getLayoutPreviewSvg(layoutStyle.id) }}
+                            />
+                          )}
+                          <strong className="block text-[11px] font-semibold">{layoutStyle.label}</strong>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </article>
+              </div>
+            </section>
 
-                  <label className="block" htmlFor="gpx_speed_unit">
-                    <span className="mb-2 block text-sm font-medium">GPX speed source units</span>
-                    <select
-                      id="gpx_speed_unit"
-                      value={formState.gpx_speed_unit}
-                      onChange={(event) => setFormState((prev) => ({ ...prev, gpx_speed_unit: event.target.value }))}
-                      className="block w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-background)] px-3 py-2 text-sm focus:border-[var(--color-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/20"
-                    >
-                      <option value="auto">Auto-detect (recommended)</option>
-                      <option value="mph">mph</option>
-                      <option value="kph">kph</option>
-                      <option value="mps">m/s</option>
-                      <option value="knots">knots</option>
-                    </select>
-                  </label>
+            <section className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-background)]/55 p-5">
+              <h2 className="text-lg font-semibold">3. Overlay components</h2>
+              <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
+                Core controls stay visible here. Less-used controls are tucked into advanced options.
+              </p>
 
-                  <label className="block" htmlFor="distance_units">
-                    <span className="mb-2 block text-sm font-medium">Distance units</span>
-                    <select
-                      id="distance_units"
-                      value={formState.distance_units}
-                      disabled={formState.units_preset !== "custom"}
-                      onChange={(event) => handleUnitChange("distance_units", event.target.value)}
-                      className="block w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-background)] px-3 py-2 text-sm focus:border-[var(--color-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/20 disabled:cursor-not-allowed disabled:opacity-50"
-                    >
-                      <option value="km">km</option>
-                      <option value="mile">mile</option>
-                      <option value="nmi">nautical mile</option>
-                      <option value="meter">meter</option>
-                    </select>
-                  </label>
-
-                  <label className="block" htmlFor="altitude_units">
-                    <span className="mb-2 block text-sm font-medium">Altitude units</span>
-                    <select
-                      id="altitude_units"
-                      value={formState.altitude_units}
-                      disabled={formState.units_preset !== "custom"}
-                      onChange={(event) => handleUnitChange("altitude_units", event.target.value)}
-                      className="block w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-background)] px-3 py-2 text-sm focus:border-[var(--color-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/20 disabled:cursor-not-allowed disabled:opacity-50"
-                    >
-                      <option value="metre">metre</option>
-                      <option value="meter">meter</option>
-                      <option value="feet">feet</option>
-                    </select>
-                  </label>
-
-                  <label className="block" htmlFor="temperature_units">
-                    <span className="mb-2 block text-sm font-medium">Temperature units</span>
-                    <select
-                      id="temperature_units"
-                      value={formState.temperature_units}
-                      disabled={formState.units_preset !== "custom"}
-                      onChange={(event) => handleUnitChange("temperature_units", event.target.value)}
-                      className="block w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-background)] px-3 py-2 text-sm focus:border-[var(--color-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/20 disabled:cursor-not-allowed disabled:opacity-50"
-                    >
-                      <option value="degC">degC</option>
-                      <option value="degF">degF</option>
-                      <option value="kelvin">kelvin</option>
-                    </select>
-                  </label>
+              <div className="mt-4 grid gap-5 lg:grid-cols-2">
+                <div>
+                  <h3 className="mb-2 text-sm font-semibold">Core panels</h3>
+                  <div className="space-y-2.5">
+                    {componentGroups.core.map((option) => {
+                      const checked = componentVisibility[option.id] ?? option.default_enabled;
+                      return (
+                        <label
+                          key={option.id}
+                          className={`flex cursor-pointer items-start gap-3 rounded-lg border p-3 transition-all ${
+                            checked
+                              ? "border-[var(--color-primary)] bg-[var(--color-primary)]/5"
+                              : "border-[var(--color-border)] bg-[var(--color-card)] hover:border-[var(--color-primary)]/50"
+                          }`}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={() => toggleComponentVisibility(option.id)}
+                            className="mt-0.5 h-4 w-4 rounded border-[var(--color-border)] text-[var(--color-primary)] focus:ring-2 focus:ring-[var(--color-primary)]/20"
+                          />
+                          <div className="flex-1">
+                            <span className="block text-sm font-medium">{option.label}</span>
+                            <small className="block text-xs text-[var(--color-muted-foreground)]">{option.description}</small>
+                          </div>
+                        </label>
+                      );
+                    })}
+                  </div>
                 </div>
+
+                <div>
+                  <h3 className="mb-2 text-sm font-semibold">Metric details</h3>
+                  <div className="space-y-2.5">
+                    {componentGroups.metrics.map((option) => {
+                      const checked = componentVisibility[option.id] ?? option.default_enabled;
+                      const isDisabled =
+                        (option.id === "altitude_metric" || option.id === "grade_metric" || option.id === "distance_metric")
+                          ? !statsPanelEnabled
+                          : option.id === "gps_coordinates"
+                            ? !gpsPanelEnabled
+                            : false;
+                      return (
+                        <label
+                          key={option.id}
+                          className={`flex items-start gap-3 rounded-lg border p-3 transition-all ${
+                            isDisabled
+                              ? "cursor-not-allowed border-[var(--color-border)] bg-[var(--color-card)] opacity-55"
+                              : checked
+                                ? "cursor-pointer border-[var(--color-primary)] bg-[var(--color-primary)]/5"
+                                : "cursor-pointer border-[var(--color-border)] bg-[var(--color-card)] hover:border-[var(--color-primary)]/50"
+                          }`}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            disabled={isDisabled}
+                            onChange={() => toggleComponentVisibility(option.id)}
+                            className="mt-0.5 h-4 w-4 rounded border-[var(--color-border)] text-[var(--color-primary)] focus:ring-2 focus:ring-[var(--color-primary)]/20 disabled:cursor-not-allowed"
+                          />
+                          <div className="flex-1">
+                            <span className="block text-sm font-medium">{option.label}</span>
+                            <small className="block text-xs text-[var(--color-muted-foreground)]">{option.description}</small>
+                          </div>
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+
+              {componentGroups.advanced.length > 0 && (
+                <details className="mt-4 rounded-xl border border-[var(--color-border)] bg-[var(--color-card)]">
+                  <summary className="cursor-pointer px-4 py-3 text-sm font-semibold">More component options</summary>
+                  <div className="grid gap-3 border-t border-[var(--color-border)] p-4 sm:grid-cols-2">
+                    {componentGroups.advanced.map((option) => {
+                      const checked = componentVisibility[option.id] ?? option.default_enabled;
+                      return (
+                        <label
+                          key={option.id}
+                          className={`flex cursor-pointer items-start gap-3 rounded-lg border p-3 transition-all ${
+                            checked
+                              ? "border-[var(--color-primary)] bg-[var(--color-primary)]/5"
+                              : "border-[var(--color-border)] bg-[var(--color-background)]"
+                          }`}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={() => toggleComponentVisibility(option.id)}
+                            className="mt-0.5 h-4 w-4 rounded border-[var(--color-border)] text-[var(--color-primary)] focus:ring-2 focus:ring-[var(--color-primary)]/20"
+                          />
+                          <div className="flex-1">
+                            <span className="block text-sm font-medium">{option.label}</span>
+                            <small className="block text-xs text-[var(--color-muted-foreground)]">{option.description}</small>
+                          </div>
+                        </label>
+                      );
+                    })}
+                  </div>
+                </details>
+              )}
+            </section>
+
+            <details className="group rounded-2xl border border-[var(--color-border)] bg-[var(--color-background)]/55">
+              <summary className="cursor-pointer px-5 py-4 text-sm font-semibold">Advanced render controls</summary>
+              <div className="grid gap-5 border-t border-[var(--color-border)] p-5 sm:grid-cols-2 lg:grid-cols-3">
+                <label className="block" htmlFor="map_style">
+                  <span className="mb-2 block text-sm font-medium">Map style</span>
+                  <select
+                    id="map_style"
+                    value={formState.map_style}
+                    disabled={!mapsEnabled}
+                    onChange={(event) => setFormState((prev) => ({ ...prev, map_style: event.target.value }))}
+                    className="block w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-card)] px-3 py-2 text-sm focus:border-[var(--color-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/20 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {mapStyles.map((style) => (
+                      <option key={style} value={style}>
+                        {mapStyleLabel(style)}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <label className="block" htmlFor="speed_units">
+                  <span className="mb-2 block text-sm font-medium">Speed units</span>
+                  <select
+                    id="speed_units"
+                    value={formState.speed_units}
+                    disabled={formState.units_preset !== "custom"}
+                    onChange={(event) => handleUnitChange("speed_units", event.target.value)}
+                    className="block w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-card)] px-3 py-2 text-sm focus:border-[var(--color-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/20 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <option value="kph">kph</option>
+                    <option value="mph">mph</option>
+                    <option value="mps">m/s</option>
+                    <option value="knots">knots</option>
+                  </select>
+                </label>
+
+                <label className="block" htmlFor="gpx_speed_unit">
+                  <span className="mb-2 block text-sm font-medium">GPX speed source units</span>
+                  <select
+                    id="gpx_speed_unit"
+                    value={formState.gpx_speed_unit}
+                    onChange={(event) => setFormState((prev) => ({ ...prev, gpx_speed_unit: event.target.value }))}
+                    className="block w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-card)] px-3 py-2 text-sm focus:border-[var(--color-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/20"
+                  >
+                    <option value="auto">Auto-detect (recommended)</option>
+                    <option value="mph">mph</option>
+                    <option value="kph">kph</option>
+                    <option value="mps">m/s</option>
+                    <option value="knots">knots</option>
+                  </select>
+                </label>
+
+                <label className="block" htmlFor="distance_units">
+                  <span className="mb-2 block text-sm font-medium">Distance units</span>
+                  <select
+                    id="distance_units"
+                    value={formState.distance_units}
+                    disabled={formState.units_preset !== "custom"}
+                    onChange={(event) => handleUnitChange("distance_units", event.target.value)}
+                    className="block w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-card)] px-3 py-2 text-sm focus:border-[var(--color-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/20 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <option value="km">km</option>
+                    <option value="mile">mile</option>
+                    <option value="nmi">nautical mile</option>
+                    <option value="meter">meter</option>
+                  </select>
+                </label>
+
+                <label className="block" htmlFor="altitude_units">
+                  <span className="mb-2 block text-sm font-medium">Altitude units</span>
+                  <select
+                    id="altitude_units"
+                    value={formState.altitude_units}
+                    disabled={formState.units_preset !== "custom"}
+                    onChange={(event) => handleUnitChange("altitude_units", event.target.value)}
+                    className="block w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-card)] px-3 py-2 text-sm focus:border-[var(--color-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/20 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <option value="metre">metre</option>
+                    <option value="meter">meter</option>
+                    <option value="feet">feet</option>
+                  </select>
+                </label>
+
+                <label className="block" htmlFor="temperature_units">
+                  <span className="mb-2 block text-sm font-medium">Temperature units</span>
+                  <select
+                    id="temperature_units"
+                    value={formState.temperature_units}
+                    disabled={formState.units_preset !== "custom"}
+                    onChange={(event) => handleUnitChange("temperature_units", event.target.value)}
+                    className="block w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-card)] px-3 py-2 text-sm focus:border-[var(--color-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/20 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <option value="degC">degC</option>
+                    <option value="degF">degF</option>
+                    <option value="kelvin">kelvin</option>
+                  </select>
+                </label>
+
+                <label className="block" htmlFor="gpx_offset_seconds">
+                  <span className="mb-2 block text-sm font-medium">GPX time offset (seconds)</span>
+                  <input
+                    id="gpx_offset_seconds"
+                    type="number"
+                    step="0.1"
+                    value={formState.gpx_offset_seconds}
+                    onChange={(event) => setFormState((prev) => ({ ...prev, gpx_offset_seconds: event.target.value }))}
+                    className="block w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-card)] px-3 py-2 text-sm focus:border-[var(--color-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/20"
+                  />
+                </label>
               </div>
             </details>
 
@@ -1620,7 +1698,7 @@ export default function HomePage() {
               </div>
             )}
 
-            <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex flex-col gap-3 rounded-xl border border-[var(--color-border)] bg-[var(--color-background)]/70 p-4 sm:flex-row sm:items-center sm:justify-between">
               <button
                 type="submit"
                 disabled={isSubmitting}
@@ -1629,19 +1707,19 @@ export default function HomePage() {
                 {submitButtonLabel}
               </button>
               <p className="text-sm text-[var(--color-muted-foreground)]">
-                {gpxFile ? `GPX: ${gpxFile.name}` : "No GPX selected"} • {videoFiles.length} video
-                {videoFiles.length === 1 ? "" : "s"} • {selectedUploadBytes > 0 ? formatBytes(selectedUploadBytes) : "0 B"}
+                Preset {formState.units_preset} • {mapStyleLabel(formState.map_style)} •{" "}
+                {formState.fps_mode === "fixed" ? `Fixed ${formState.fixed_fps} fps` : "Source FPS"}
               </p>
             </div>
           </form>
         </section>
 
-        <aside className="space-y-6">
+        <aside className="space-y-6 lg:sticky lg:top-20 lg:self-start">
           <section className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-card)] p-6 shadow-sm">
             <div className="mb-5 rounded-2xl border border-[var(--color-border)] bg-gradient-to-br from-[var(--color-primary)]/12 via-[var(--color-card)] to-cyan-500/10 p-4">
               <div className="mb-3 flex items-start justify-between gap-3">
                 <div>
-                  <h2 className="text-xl font-semibold">Pipeline Status</h2>
+                  <h2 className="text-xl font-semibold">Pipeline status</h2>
                   <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
                     {job?.message ??
                       (submissionStage === "uploading"
@@ -1729,7 +1807,7 @@ export default function HomePage() {
             )}
 
             <div className="mb-2 flex items-center justify-between">
-              <h3 className="text-sm font-semibold">Clip Breakdown</h3>
+              <h3 className="text-sm font-semibold">Clip breakdown</h3>
               <p className="text-xs text-[var(--color-muted-foreground)]">
                 Running {videoStatusSummary.running} • Failed {videoStatusSummary.failed}
               </p>
@@ -1829,7 +1907,7 @@ export default function HomePage() {
             {job?.download_all_url && (
               <button
                 type="button"
-                className="block rounded-xl border border-[var(--color-border)] bg-[var(--color-background)] px-4 py-3 text-center text-sm font-semibold transition-colors hover:bg-[var(--color-muted)]/30"
+                className="mt-4 block w-full rounded-xl border border-[var(--color-border)] bg-[var(--color-background)] px-4 py-3 text-center text-sm font-semibold transition-colors hover:bg-[var(--color-muted)]/30"
                 onClick={() => void downloadAuthenticated(job.download_all_url ?? "", `overlay-renders-${job.id}.zip`)}
               >
                 Download all outputs (.zip)
@@ -1839,8 +1917,7 @@ export default function HomePage() {
         </aside>
       </div>
 
-      {/* Footer */}
-      <footer className="border-t border-[var(--color-border)]/60 py-8 mt-12">
+      <footer className="mt-12 border-t border-[var(--color-border)]/60 py-8">
         <div className="mx-auto flex max-w-7xl items-center justify-center px-4 sm:px-6">
           <jb-credit data-variant="prominent"></jb-credit>
         </div>

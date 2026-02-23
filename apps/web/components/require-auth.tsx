@@ -15,7 +15,7 @@ export function RequireAuth({ children }: { children: ReactNode }) {
     }
 
     const nextPath = pathname || "/studio";
-    router.replace(`/auth?next=${encodeURIComponent(nextPath)}`);
+    router.replace(`/auth/login?next=${encodeURIComponent(nextPath)}`);
   }, [account, isEnabled, isLoading, pathname, router]);
 
   if (!isEnabled) {

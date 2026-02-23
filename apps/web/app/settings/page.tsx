@@ -178,104 +178,126 @@ export default function SettingsPage() {
     }
   }
 
+  const identityLabel = account?.displayName || account?.email || "POVerlay user";
+  const avatarInitial = identityLabel.trim().charAt(0).toUpperCase();
+
   return (
-    <main className="mx-auto max-w-4xl px-4 py-12 sm:px-6">
-      <h1 className="text-3xl font-bold tracking-tight">Account Settings</h1>
-      <p className="mt-2 text-sm text-[var(--color-muted-foreground)]">
-        Update profile metadata, notification preferences, and password access.
-      </p>
-
-      <div className="mt-8 grid gap-6">
-        <section className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-card)] p-6">
-          <h2 className="text-lg font-semibold">Profile metadata</h2>
-          <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
-            Current account: {account?.email ?? "unknown"}
-          </p>
-
-          <form onSubmit={handleSaveProfile} className="mt-5 space-y-4">
-            <label className="block">
-              <span className="mb-1 block text-sm font-medium">Display name</span>
-              <input
-                type="text"
-                value={displayName}
-                onChange={(event) => setDisplayName(event.target.value)}
-                className="block w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-background)] px-3 py-2 text-sm"
-                placeholder="Rider name"
-              />
-            </label>
-
-            <label className="block">
-              <span className="mb-1 block text-sm font-medium">Profile image URL</span>
-              <input
-                type="url"
-                value={photoURL}
-                onChange={(event) => setPhotoURL(event.target.value)}
-                className="block w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-background)] px-3 py-2 text-sm"
-                placeholder="https://example.com/avatar.jpg"
-              />
-            </label>
-
-            {profileError && (
-              <p className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-600">{profileError}</p>
-            )}
-            {profileMessage && (
-              <p className="rounded-lg border border-green-500/30 bg-green-500/10 px-3 py-2 text-sm text-green-700">
-                {profileMessage}
-              </p>
-            )}
-
-            <button
-              type="submit"
-              disabled={isSaving}
-              className="rounded-lg bg-[var(--color-primary)] px-4 py-2 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-60"
-            >
-              {isSaving ? "Saving..." : "Save profile"}
-            </button>
-          </form>
-        </section>
-
-        <section className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-card)] p-6">
-          <h2 className="text-lg font-semibold">Notifications</h2>
-          <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
-            Toggle whether render completion emails are enabled for your account.
-          </p>
-          <label className="mt-4 inline-flex items-center gap-3">
-            <input
-              type="checkbox"
-              checked={notificationsEnabled}
-              disabled={isLoadingNotifications || isSavingNotifications}
-              onChange={(event) => void handleNotificationsToggle(event.target.checked)}
-              className="h-4 w-4 rounded border-[var(--color-border)]"
-            />
-            <span className="text-sm font-medium">
-              {notificationsEnabled ? "Notifications enabled" : "Notifications opt-out enabled"}
-            </span>
-          </label>
-          {isLoadingNotifications && <p className="mt-2 text-xs text-[var(--color-muted-foreground)]">Loading preference...</p>}
-          {notificationError && <p className="mt-2 text-xs text-red-600">{notificationError}</p>}
-          {notificationMessage && <p className="mt-2 text-xs text-green-700">{notificationMessage}</p>}
-        </section>
-
-        <section className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-card)] p-6">
-          <h2 className="text-lg font-semibold">Password reset / change</h2>
-          <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
-            Send a secure reset link to {account?.email ?? "your account email"}.
-          </p>
-          {passwordMessage && (
-            <p className="mt-4 rounded-lg border border-[var(--color-border)] bg-[var(--color-background)] px-3 py-2 text-sm">
-              {passwordMessage}
+    <main className="mx-auto max-w-5xl px-4 py-10 sm:px-6 sm:py-12">
+      <section className="rounded-3xl border border-[var(--color-border)] bg-[var(--color-card)] p-6 shadow-sm sm:p-8">
+        <div className="flex flex-wrap items-center justify-between gap-6">
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-[0.16em] text-[var(--color-primary)]">Settings</p>
+            <h1 className="mt-2 text-3xl font-bold tracking-tight">Account and preferences</h1>
+            <p className="mt-2 max-w-2xl text-sm text-[var(--color-muted-foreground)]">
+              Manage profile metadata, notification preferences, and account security.
             </p>
-          )}
-          <button
-            type="button"
-            onClick={() => void handleSendResetEmail()}
-            disabled={isSendingReset}
-            className="mt-4 rounded-lg border border-[var(--color-border)] px-4 py-2 text-sm font-medium hover:bg-[var(--color-muted)]/20 disabled:cursor-not-allowed disabled:opacity-60"
-          >
-            {isSendingReset ? "Sending..." : "Email password reset link"}
-          </button>
-        </section>
-      </div>
+          </div>
+
+          <div className="flex min-w-[220px] items-center gap-3 rounded-2xl border border-[var(--color-border)] bg-[var(--color-muted)]/30 px-4 py-3">
+            <span className="inline-flex h-12 w-12 items-center justify-center overflow-hidden rounded-full border border-[var(--color-border)] bg-[var(--color-card)] text-sm font-semibold text-[var(--color-primary)]">
+              {photoURL.trim() ? (
+                <img src={photoURL} alt="Profile avatar" className="h-full w-full object-cover" />
+              ) : (
+                avatarInitial
+              )}
+            </span>
+            <div className="min-w-0">
+              <p className="truncate text-sm font-semibold">{identityLabel}</p>
+              <p className="truncate text-xs text-[var(--color-muted-foreground)]">{account?.email ?? "No email available"}</p>
+            </div>
+          </div>
+        </div>
+
+        <div className="mt-8 grid gap-6 lg:grid-cols-[1.4fr_1fr]">
+          <section className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-card)] p-6">
+            <h2 className="text-lg font-semibold">Profile metadata</h2>
+            <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">Used in your account badge and render ownership metadata.</p>
+
+            <form onSubmit={handleSaveProfile} className="mt-5 space-y-4">
+              <label className="block">
+                <span className="mb-1 block text-sm font-medium">Display name</span>
+                <input
+                  type="text"
+                  value={displayName}
+                  onChange={(event) => setDisplayName(event.target.value)}
+                  className="block w-full rounded-xl border border-[var(--color-border)] bg-[var(--color-background)] px-3 py-2.5 text-sm outline-none transition-shadow focus:border-[var(--color-primary)] focus:ring-4 focus:ring-[var(--color-primary)]/15"
+                  placeholder="Rider name"
+                />
+              </label>
+
+              <label className="block">
+                <span className="mb-1 block text-sm font-medium">Profile image URL</span>
+                <input
+                  type="url"
+                  value={photoURL}
+                  onChange={(event) => setPhotoURL(event.target.value)}
+                  className="block w-full rounded-xl border border-[var(--color-border)] bg-[var(--color-background)] px-3 py-2.5 text-sm outline-none transition-shadow focus:border-[var(--color-primary)] focus:ring-4 focus:ring-[var(--color-primary)]/15"
+                  placeholder="https://example.com/avatar.jpg"
+                />
+              </label>
+
+              {profileError && (
+                <p className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-600">{profileError}</p>
+              )}
+              {profileMessage && (
+                <p className="rounded-lg border border-green-500/30 bg-green-500/10 px-3 py-2 text-sm text-green-700">{profileMessage}</p>
+              )}
+
+              <button
+                type="submit"
+                disabled={isSaving}
+                className="rounded-xl bg-[var(--color-primary)] px-4 py-2.5 text-sm font-medium text-white shadow-sm shadow-[var(--color-primary)]/20 transition-colors hover:bg-[var(--color-primary)]/90 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {isSaving ? "Saving..." : "Save profile"}
+              </button>
+            </form>
+          </section>
+
+          <div className="grid gap-6">
+            <section className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-card)] p-6">
+              <h2 className="text-lg font-semibold">Notifications</h2>
+              <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
+                Choose whether POVerlay emails you when rendering jobs finish.
+              </p>
+              <label className="mt-4 inline-flex items-center gap-3">
+                <input
+                  type="checkbox"
+                  checked={notificationsEnabled}
+                  disabled={isLoadingNotifications || isSavingNotifications}
+                  onChange={(event) => void handleNotificationsToggle(event.target.checked)}
+                  className="h-4 w-4 rounded border-[var(--color-border)]"
+                />
+                <span className="text-sm font-medium">
+                  {notificationsEnabled ? "Completion notifications enabled" : "Completion notifications disabled"}
+                </span>
+              </label>
+              {isLoadingNotifications && <p className="mt-2 text-xs text-[var(--color-muted-foreground)]">Loading preference...</p>}
+              {notificationError && <p className="mt-2 text-xs text-red-600">{notificationError}</p>}
+              {notificationMessage && <p className="mt-2 text-xs text-green-700">{notificationMessage}</p>}
+            </section>
+
+            <section className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-card)] p-6">
+              <h2 className="text-lg font-semibold">Password reset</h2>
+              <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
+                Send a secure reset link to {account?.email ?? "your account email"}.
+              </p>
+              {passwordMessage && (
+                <p className="mt-4 rounded-lg border border-[var(--color-border)] bg-[var(--color-background)] px-3 py-2 text-sm">
+                  {passwordMessage}
+                </p>
+              )}
+              <button
+                type="button"
+                onClick={() => void handleSendResetEmail()}
+                disabled={isSendingReset}
+                className="mt-4 rounded-xl border border-[var(--color-border)] px-4 py-2.5 text-sm font-medium transition-colors hover:bg-[var(--color-muted)]/20 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {isSendingReset ? "Sending..." : "Email reset link"}
+              </button>
+            </section>
+          </div>
+        </div>
+      </section>
     </main>
   );
 }
