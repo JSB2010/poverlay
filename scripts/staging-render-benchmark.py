@@ -176,8 +176,28 @@ def _main() -> int:
         creation_time = "2026-02-07T22:28:39Z"
     creation_ts = creation_time.replace("Z", "+00:00") if creation_time.endswith("Z") else creation_time
 
+    source_duration_raw = subprocess.check_output(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=nw=1:nk=1",
+            str(samples_video),
+        ],
+        text=True,
+    ).strip()
+    try:
+        source_duration = float(source_duration_raw)
+    except ValueError:
+        source_duration = duration_seconds + 5.0
+    clip_start_seconds = max(0.0, min(30.0, source_duration - duration_seconds - 1.0))
+
     print(f"[bench] source creation_time={creation_time}")
     print(f"[bench] clip duration={duration_seconds:.2f}s")
+    print(f"[bench] clip start offset={clip_start_seconds:.2f}s")
 
     for resolution_id, width, height in resolutions:
         clip_path = clips_dir / f"{resolution_id}.mp4"
@@ -187,7 +207,7 @@ def _main() -> int:
                 "-hide_banner",
                 "-y",
                 "-ss",
-                "00:00:30",
+                f"{clip_start_seconds:.3f}",
                 "-t",
                 f"{duration_seconds:.3f}",
                 "-i",
