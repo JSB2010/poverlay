@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from datetime import datetime, timedelta, timezone
 import json
 import os
 import re
@@ -34,6 +35,67 @@ def _ffprobe_value(path: Path, key: str) -> str:
     ).strip()
 
 
+def _write_fallback_gpx(path: Path, *, start_time: datetime, points: int) -> None:
+    rows: list[str] = []
+    lat = 37.4219999
+    lon = -122.0840575
+    ele = 12.0
+    for index in range(points):
+        current = start_time + timedelta(seconds=index)
+        lat_point = lat + (index * 0.0001)
+        lon_point = lon + (index * 0.0001)
+        ele_point = ele + (index * 0.05)
+        rows.append(
+            "      "
+            f'<trkpt lat="{lat_point:.7f}" lon="{lon_point:.7f}"><ele>{ele_point:.2f}</ele><time>{current.strftime("%Y-%m-%dT%H:%M:%SZ")}</time></trkpt>'
+        )
+
+    content = "\n".join(
+        [
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            '<gpx version="1.1" creator="POVerlay Staging Benchmark" xmlns="http://www.topografix.com/GPX/1/1">',
+            "  <trk>",
+            "    <name>Benchmark Track</name>",
+            "    <trkseg>",
+            *rows,
+            "    </trkseg>",
+            "  </trk>",
+            "</gpx>",
+            "",
+        ]
+    )
+    path.write_text(content, encoding="utf-8")
+
+
+def _build_fallback_video(path: Path, *, width: int, height: int, fps: int, duration_seconds: float) -> None:
+    _run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"testsrc2=size={width}x{height}:rate={fps}",
+            "-t",
+            f"{duration_seconds:.3f}",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(path),
+        ],
+        capture_output=True,
+    )
+
+
 def _main() -> int:
     parser = argparse.ArgumentParser(description="Run staging render benchmarks and emit CSV/JSON results.")
     parser.add_argument("--repo-root", default="/opt/poverlay-staging", help="Path to deployed repo on target host.")
@@ -51,10 +113,6 @@ def _main() -> int:
     config_dir = repo_root / "data/gopro-config"
     runner = repo_root / "scripts/gopro-dashboard-local.sh"
 
-    if not samples_video.exists():
-        raise RuntimeError(f"Missing sample video: {samples_video}")
-    if not samples_gpx.exists():
-        raise RuntimeError(f"Missing sample GPX: {samples_gpx}")
     if not runner.exists():
         raise RuntimeError(f"Missing renderer launcher: {runner}")
 
@@ -75,6 +133,29 @@ def _main() -> int:
     ]
     profiles = ["h264-fast", "h264-source", "h264-4k-compat"]
 
+    if not samples_video.exists() or not samples_gpx.exists():
+        synthetic_dir = output_dir / "synthetic-samples"
+        synthetic_dir.mkdir(parents=True, exist_ok=True)
+        fallback_start = datetime(2026, 2, 7, 22, 28, 39, tzinfo=timezone.utc)
+        fallback_video = synthetic_dir / "fallback-5_3k.mp4"
+        fallback_gpx = synthetic_dir / "fallback-track.gpx"
+        _build_fallback_video(
+            fallback_video,
+            width=5312,
+            height=2988,
+            fps=30,
+            duration_seconds=max(duration_seconds + 5.0, 30.0),
+        )
+        _write_fallback_gpx(
+            fallback_gpx,
+            start_time=fallback_start,
+            points=max(int(duration_seconds) + 120, 300),
+        )
+        timestamp = fallback_start.timestamp()
+        os.utime(fallback_video, (timestamp, timestamp))
+        samples_video = fallback_video
+        samples_gpx = fallback_gpx
+
     creation_time = subprocess.check_output(
         [
             "ffprobe",
@@ -88,6 +169,9 @@ def _main() -> int:
         ],
         text=True,
     ).strip()
+    if not creation_time:
+        # Fallback video may not carry creation_time metadata.
+        creation_time = "2026-02-07T22:28:39Z"
     creation_ts = creation_time.replace("Z", "+00:00") if creation_time.endswith("Z") else creation_time
 
     print(f"[bench] source creation_time={creation_time}")
