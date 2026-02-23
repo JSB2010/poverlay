@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -466,6 +467,31 @@ def test_health_endpoint() -> None:
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+def test_ensure_dirs_routes_temp_spooling_to_data_tmp(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(api_main, "JOBS_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(api_main, "CONFIG_DIR", tmp_path / "config")
+    monkeypatch.setattr(api_main, "TEMP_DIR", tmp_path / "tmp")
+    monkeypatch.setattr(api_main.tempfile, "tempdir", None)
+
+    monkeypatch.delenv("TMPDIR", raising=False)
+    monkeypatch.delenv("TMP", raising=False)
+    monkeypatch.delenv("TEMP", raising=False)
+
+    api_main._ensure_dirs()
+
+    expected_tmp = str(tmp_path / "tmp")
+    assert (tmp_path / "jobs").is_dir()
+    assert (tmp_path / "config").is_dir()
+    assert (tmp_path / "tmp").is_dir()
+    assert api_main.tempfile.gettempdir() == expected_tmp
+    assert os.environ["TMPDIR"] == expected_tmp
+    assert os.environ["TMP"] == expected_tmp
+    assert os.environ["TEMP"] == expected_tmp
 
 
 def test_meta_contains_expected_top_level_fields() -> None:

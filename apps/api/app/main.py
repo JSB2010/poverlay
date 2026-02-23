@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import Any
@@ -52,6 +53,7 @@ RUNTIME_CONFIG = load_runtime_config(repo_root=REPO_ROOT, service_root=SERVICE_R
 DATA_DIR = RUNTIME_CONFIG.data_dir
 JOBS_DIR = DATA_DIR / "jobs"
 CONFIG_DIR = DATA_DIR / "gopro-config"
+TEMP_DIR = DATA_DIR / "tmp"
 FFMPEG_PROFILES_FILE = CONFIG_DIR / "ffmpeg-profiles.json"
 
 GOPRO_DASHBOARD_BIN = RUNTIME_CONFIG.gopro_dashboard_bin
@@ -318,6 +320,13 @@ def _safe_filename(name: str) -> str:
 def _ensure_dirs() -> None:
     JOBS_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    # FastAPI/Starlette multipart bodies are first spooled to tempfile before our endpoint code runs.
+    # Force temp files onto the app data disk so large uploads do not fail on small /tmp mounts.
+    tempfile.tempdir = str(TEMP_DIR)
+    os.environ["TMPDIR"] = str(TEMP_DIR)
+    os.environ["TMP"] = str(TEMP_DIR)
+    os.environ["TEMP"] = str(TEMP_DIR)
 
 
 def _ffmpeg_profile_presets() -> dict[str, dict[str, Any]]:
