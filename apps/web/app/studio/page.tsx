@@ -63,6 +63,7 @@ type VideoState = {
   render_profile_label?: string | null;
   source_resolution?: string | null;
   source_fps?: string | null;
+  source_duration_seconds?: number | null;
   download_url?: string | null;
   log_name?: string | null;
 };
@@ -72,6 +73,8 @@ type JobStatus = {
   status: string;
   message: string;
   progress: number;
+  started_at?: string | null;
+  updated_at?: string | null;
   videos: VideoState[];
   download_all_url?: string | null;
 };
@@ -100,6 +103,7 @@ type RenderEtaEstimate = {
   remainingSeconds: number;
   totalDurationSeconds: number;
   clipCount: number;
+  highResClipCount: number;
   profileUsage: Record<string, number>;
   fallbackAssumptions: string[];
 };
@@ -491,6 +495,14 @@ function formatRate(bytesPerSecond: number): string {
     return "--";
   }
   return `${formatBytes(bytesPerSecond)}/s`;
+}
+
+function parseIsoTimestamp(value: string | null | undefined): number | null {
+  if (!value) {
+    return null;
+  }
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 function localVideoProbeKey(file: File): string {
@@ -1025,6 +1037,7 @@ export default function HomePage() {
     const fallbackAssumptions: string[] = [];
     let totalDurationSeconds = 0;
     let totalRenderSeconds = ETA_JOB_OVERHEAD_SECONDS;
+    let highResClipCount = 0;
     const profileUsage: Record<string, number> = {};
 
     for (const clipName of clipNames) {
@@ -1034,12 +1047,16 @@ export default function HomePage() {
       const parsedResolution = parseResolutionValue(jobVideo?.source_resolution ?? null);
       const width = parsedResolution?.width ?? probe?.width ?? ETA_DEFAULT_WIDTH;
       const height = parsedResolution?.height ?? probe?.height ?? ETA_DEFAULT_HEIGHT;
+      if (width > 3840 || height > 2160) {
+        highResClipCount += 1;
+      }
       if (!parsedResolution && !probe?.width) {
         fallbackAssumptions.push("resolution");
       }
 
-      const durationSeconds = Math.max(probe?.durationSeconds ?? ETA_DEFAULT_DURATION_SECONDS, 1);
-      if (!probe?.durationSeconds) {
+      const serverDuration = jobVideo?.source_duration_seconds ?? null;
+      const durationSeconds = Math.max(probe?.durationSeconds ?? serverDuration ?? ETA_DEFAULT_DURATION_SECONDS, 1);
+      if (!probe?.durationSeconds && !serverDuration) {
         fallbackAssumptions.push("duration");
       }
 
@@ -1075,6 +1092,7 @@ export default function HomePage() {
       remainingSeconds,
       totalDurationSeconds,
       clipCount: clipNames.length,
+      highResClipCount,
       profileUsage,
       fallbackAssumptions: Array.from(new Set(fallbackAssumptions)),
     };
@@ -1090,6 +1108,73 @@ export default function HomePage() {
     submissionStage,
     videoFiles,
   ]);
+  const observedRenderRemainingSeconds = useMemo((): number | null => {
+    if (submissionStage !== "rendering") {
+      return null;
+    }
+    const startedAtMs = parseIsoTimestamp(job?.started_at);
+    if (startedAtMs === null) {
+      return null;
+    }
+
+    const progress = clampPercent(job?.progress ?? 0);
+    if (progress < 6) {
+      return null;
+    }
+
+    const elapsedSeconds = Math.max((Date.now() - startedAtMs) / 1000, 1);
+    if (elapsedSeconds < 10) {
+      return null;
+    }
+
+    const remainingSeconds = (elapsedSeconds * (100 - progress)) / Math.max(progress, 1);
+    return Number.isFinite(remainingSeconds) ? Math.max(remainingSeconds, 0) : null;
+  }, [job?.progress, job?.started_at, lastStatusUpdateAt, submissionStage]);
+  const blendedRenderRemainingSeconds = useMemo((): number | null => {
+    if (!renderEtaEstimate) {
+      return null;
+    }
+    if (submissionStage === "completed") {
+      return 0;
+    }
+    if (submissionStage !== "rendering") {
+      return renderEtaEstimate.totalSeconds;
+    }
+    if (observedRenderRemainingSeconds === null) {
+      return renderEtaEstimate.remainingSeconds;
+    }
+    return Math.max(observedRenderRemainingSeconds * 0.7 + renderEtaEstimate.remainingSeconds * 0.3, 0);
+  }, [observedRenderRemainingSeconds, renderEtaEstimate, submissionStage]);
+  const downscaleTo4kLikely = useMemo(() => {
+    if (!renderEtaEstimate) {
+      return false;
+    }
+    if (renderEtaEstimate.highResClipCount <= 0) {
+      return false;
+    }
+    return (renderEtaEstimate.profileUsage["h264-4k-compat"] ?? 0) > 0;
+  }, [renderEtaEstimate]);
+  const renderOptimizationTips = useMemo(() => {
+    if (!renderEtaEstimate) {
+      return [] as string[];
+    }
+
+    const tips: string[] = [];
+    if (renderEtaEstimate.totalSeconds >= 8 * 60 && formState.render_profile !== "h264-fast") {
+      tips.push("Switch Export codec to H.264 (Fast Draft) when you want the fastest turnaround.");
+    }
+    if (renderEtaEstimate.totalSeconds >= 12 * 60 && formState.fps_mode !== "fixed") {
+      tips.push("Set FPS strategy to Fixed and use 15 fps to significantly reduce render time.");
+    }
+    if (renderEtaEstimate.totalSeconds >= 15 * 60 && mapsEnabled) {
+      tips.push("Disable Route Maps in Overlay components for faster renders on long/high-res clips.");
+    }
+    if (renderEtaEstimate.highResClipCount > 0 && formState.render_profile === "h264-source") {
+      tips.push("Use H.264 (4K Compatibility) when you can accept 4K output from 5.3K source clips.");
+    }
+
+    return tips.slice(0, 3);
+  }, [formState.fps_mode, formState.render_profile, mapsEnabled, renderEtaEstimate]);
   const videoStatusSummary = useMemo(() => {
     const summary = {
       total: job?.videos.length ?? 0,
@@ -1214,8 +1299,8 @@ export default function HomePage() {
           {
             label: "Est. remaining",
             value:
-              submissionStage === "rendering" && renderEtaEstimate
-                ? `~${formatEta(renderEtaEstimate.remainingSeconds)}`
+              submissionStage === "rendering" && blendedRenderRemainingSeconds !== null
+                ? `~${formatEta(blendedRenderRemainingSeconds)}`
                 : renderEtaEstimate
                   ? `~${formatEta(renderEtaEstimate.totalSeconds)}`
                   : "--",
@@ -1254,6 +1339,7 @@ export default function HomePage() {
     job?.status,
     job?.videos,
     lastStatusUpdateAt,
+    blendedRenderRemainingSeconds,
     renderEtaEstimate,
     runningClipNames,
     selectedUploadBytes,
@@ -1652,13 +1738,29 @@ export default function HomePage() {
                 <p className="mt-1 text-sm font-medium">
                   Render ETA:{" "}
                   <span className="text-[var(--color-primary)]">
-                    {renderEtaEstimate ? `~${formatEta(renderEtaEstimate.totalSeconds)}` : "Select clips to estimate"}
+                    {renderEtaEstimate
+                      ? submissionStage === "rendering" && blendedRenderRemainingSeconds !== null
+                        ? `~${formatEta(blendedRenderRemainingSeconds)} remaining`
+                        : `~${formatEta(renderEtaEstimate.totalSeconds)}`
+                      : "Select clips to estimate"}
                   </span>
                 </p>
+                {downscaleTo4kLikely && (
+                  <p className="mt-1 text-xs text-[var(--color-muted-foreground)]">
+                    One or more clips exceed 4K and are currently set to render at 4K output for compatibility.
+                  </p>
+                )}
                 {renderEtaEstimate && renderEtaEstimate.fallbackAssumptions.length > 0 && (
                   <p className="mt-1 text-xs text-[var(--color-muted-foreground)]">
                     Using fallback assumptions for {renderEtaEstimate.fallbackAssumptions.join(", ")}.
                   </p>
+                )}
+                {renderOptimizationTips.length > 0 && (
+                  <ul className="mt-2 list-disc space-y-1 pl-4 text-xs text-[var(--color-muted-foreground)]">
+                    {renderOptimizationTips.map((tip) => (
+                      <li key={tip}>{tip}</li>
+                    ))}
+                  </ul>
                 )}
                 <p className="mt-1 text-xs text-[var(--color-muted-foreground)]">
                   Keep this tab open through upload completion. Rendering continues server-side after upload.
@@ -2159,7 +2261,9 @@ export default function HomePage() {
                   <p className="text-sm font-semibold">
                     {renderEtaEstimate
                       ? submissionStage === "rendering"
-                        ? `~${formatEta(renderEtaEstimate.remainingSeconds)} left`
+                        ? blendedRenderRemainingSeconds !== null
+                          ? `~${formatEta(blendedRenderRemainingSeconds)} left`
+                          : "Learning..."
                         : `~${formatEta(renderEtaEstimate.totalSeconds)}`
                       : "--"}
                   </p>
@@ -2224,6 +2328,9 @@ export default function HomePage() {
                   clipDetails.push(
                     [video.source_resolution, video.source_fps ? `${video.source_fps} fps` : ""].filter(Boolean).join(" | "),
                   );
+                }
+                if (typeof video.source_duration_seconds === "number" && Number.isFinite(video.source_duration_seconds)) {
+                  clipDetails.push(`Duration: ${formatEta(video.source_duration_seconds)}`);
                 }
 
                 if (video.render_profile_label) {

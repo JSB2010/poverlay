@@ -25,6 +25,7 @@ from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
+from starlette.concurrency import run_in_threadpool
 
 from app.config import load_runtime_config
 from app.contracts import build_r2_output_object_key
@@ -82,6 +83,35 @@ ALLOWED_MAP_STYLES = {
 ALLOWED_FPS_MODES = {"source_exact", "source_rounded", "fixed"}
 AUTO_RENDER_PROFILE = "auto"
 PROFILE_4K_COMPAT_MAX_WIDTH = 3840
+X264_PRESETS = {
+    "ultrafast",
+    "superfast",
+    "veryfast",
+    "faster",
+    "fast",
+    "medium",
+    "slow",
+    "slower",
+    "veryslow",
+}
+
+
+def _resolve_x264_preset(env_key: str, default: str) -> str:
+    value = str(os.getenv(env_key, default)).strip().lower() or default
+    if value in X264_PRESETS:
+        return value
+    return default
+
+
+H264_SOURCE_PRESET = _resolve_x264_preset(
+    "POVERLAY_H264_SOURCE_PRESET",
+    "faster" if sys.platform != "darwin" else "medium",
+)
+H264_4K_COMPAT_PRESET = _resolve_x264_preset(
+    "POVERLAY_H264_4K_COMPAT_PRESET",
+    "faster" if sys.platform != "darwin" else "medium",
+)
+H264_FAST_PRESET = _resolve_x264_preset("POVERLAY_H264_FAST_PRESET", "veryfast")
 
 RENDER_PROFILE_CATALOG: dict[str, dict[str, Any]] = {
     "qt-hevc-balanced": {
@@ -148,7 +178,7 @@ RENDER_PROFILE_CATALOG: dict[str, dict[str, Any]] = {
                 "-vcodec",
                 "libx264",
                 "-preset",
-                "medium",
+                H264_SOURCE_PRESET,
                 "-crf",
                 "19",
                 "-maxrate",
@@ -177,7 +207,7 @@ RENDER_PROFILE_CATALOG: dict[str, dict[str, Any]] = {
                 "-vcodec",
                 "libx264",
                 "-preset",
-                "medium",
+                H264_4K_COMPAT_PRESET,
                 "-crf",
                 "20",
                 "-maxrate",
@@ -203,7 +233,7 @@ RENDER_PROFILE_CATALOG: dict[str, dict[str, Any]] = {
         "platforms": {"darwin", "linux", "win32"},
         "ffmpeg": {
             "input": [],
-            "output": ["-vcodec", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-movflags", "+faststart"],
+            "output": ["-vcodec", "libx264", "-preset", H264_FAST_PRESET, "-pix_fmt", "yuv420p", "-movflags", "+faststart"],
         },
     },
 }
@@ -859,6 +889,7 @@ def _build_media_item(job: dict[str, Any], video: dict[str, Any]) -> dict[str, A
         "render_profile_label": video.get("render_profile_label"),
         "source_resolution": video.get("source_resolution"),
         "source_fps": video.get("source_fps"),
+        "source_duration_seconds": video.get("source_duration_seconds"),
         "progress": int(video.get("progress") or 0),
         "detail": video.get("detail"),
         "error": video.get("error"),
@@ -1269,6 +1300,13 @@ async def _save_upload(upload: UploadFile, destination: Path) -> None:
                 break
             handle.write(chunk)
     await upload.close()
+
+
+async def _probe_video_safe(path: Path) -> dict[str, Any] | None:
+    try:
+        return await run_in_threadpool(_probe_video, path)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _parse_iso(value: str | None) -> datetime | None:
@@ -1743,6 +1781,7 @@ def _process_job(job_id: str) -> None:
                     log_name=log_path.name,
                     source_resolution=f"{metadata['width']}x{metadata['height']}",
                     source_fps=metadata.get("fps_raw"),
+                    source_duration_seconds=metadata.get("duration"),
                     render_profile_label=_render_profile_label(attempted_profile),
                 )
                 continue
@@ -1765,6 +1804,7 @@ def _process_job(job_id: str) -> None:
                 render_profile_label=_render_profile_label(selected_profile),
                 source_resolution=f"{metadata['width']}x{metadata['height']}",
                 source_fps=metadata.get("fps_raw"),
+                source_duration_seconds=metadata.get("duration"),
                 error=None,
                 **upload_metadata,
             )
@@ -1942,7 +1982,12 @@ async def create_job(
             safe_name = f"{Path(safe_name).stem}-{index}{Path(safe_name).suffix}"
         seen_names.add(safe_name)
 
-        await _save_upload(video, inputs_dir / safe_name)
+        input_path = inputs_dir / safe_name
+        await _save_upload(video, input_path)
+        metadata = await _probe_video_safe(input_path)
+        if metadata:
+            _set_file_mtime_from_creation(input_path, metadata.get("creation_time"))
+
         video_states.append(
             {
                 "id": uuid4().hex,
@@ -1957,8 +2002,9 @@ async def create_job(
                 "log_name": None,
                 "render_profile": None,
                 "render_profile_label": None,
-                "source_resolution": None,
-                "source_fps": None,
+                "source_resolution": f"{metadata['width']}x{metadata['height']}" if metadata else None,
+                "source_fps": metadata.get("fps_raw") if metadata else None,
+                "source_duration_seconds": metadata.get("duration") if metadata else None,
                 "r2_object_key": None,
                 "r2_bucket": None,
                 "r2_etag": None,
