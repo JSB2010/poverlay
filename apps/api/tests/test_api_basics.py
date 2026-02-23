@@ -101,6 +101,7 @@ def test_media_routes_require_auth() -> None:
     assert client.patch("/api/media/job-1/video-1", json={"title": "Renamed"}).status_code == 401
     assert client.delete("/api/media/job-1/video-1").status_code == 401
     assert client.post("/api/media/job-1/video-1/download-link").status_code == 401
+    assert client.get("/api/user/access").status_code == 401
 
 
 def test_invalid_token_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -141,6 +142,17 @@ def test_build_renderer_command_sets_cache_dir_and_overlay_size() -> None:
     assert str(api_main.CONFIG_DIR) in command
     assert "--overlay-size" in command
     assert "3840x2160" in command
+
+
+def test_ffmpeg_profile_presets_include_thread_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(api_main, "FFMPEG_THREADS_PER_RENDER", 4)
+    presets = api_main._ffmpeg_profile_presets()
+    assert presets
+    for preset in presets.values():
+        output = preset.get("output", [])
+        assert "-threads" in output
+        thread_index = output.index("-threads")
+        assert output[thread_index + 1] == "4"
 
 
 def test_render_eta_calibration_from_samples() -> None:
@@ -256,6 +268,192 @@ def test_create_job_persists_authenticated_uid(
     assert first_video["source_duration_seconds"] == 42.5
 
 
+def test_recover_pending_jobs_normalizes_running_states_and_enqueues(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fake_job_store: dict[str, dict[str, object]],
+) -> None:
+    enqueued: list[str] = []
+    monkeypatch.setattr(api_main, "_enqueue_job", lambda job_id: enqueued.append(job_id))
+
+    job_dir = tmp_path / "job-recover"
+    inputs_dir = job_dir / "inputs"
+    outputs_dir = job_dir / "outputs"
+    inputs_dir.mkdir(parents=True, exist_ok=True)
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+    (inputs_dir / "track.gpx").write_text("<gpx></gpx>")
+    (inputs_dir / "clip-running.mp4").write_bytes(b"running")
+    (inputs_dir / "clip-failed.mp4").write_bytes(b"failed")
+    (inputs_dir / "clip-queued.mp4").write_bytes(b"queued")
+
+    fake_job_store["job-recover"] = {
+        "id": "job-recover",
+        "uid": "user-a",
+        "job_dir": str(job_dir),
+        "gpx_name": "track.gpx",
+        "status": "running",
+        "progress": 42,
+        "videos": [
+            {"id": "v1", "input_name": "clip-completed.mp4", "status": "completed", "output_name": "clip-completed-overlay.mp4", "r2_object_key": "users/u/jobs/j/outputs/clip-completed-overlay.mp4", "error": None},
+            {"id": "v2", "input_name": "clip-running.mp4", "status": "running", "output_name": None, "r2_object_key": None, "error": None},
+            {"id": "v3", "input_name": "clip-failed.mp4", "status": "failed", "output_name": None, "r2_object_key": None, "error": "boom"},
+            {"id": "v4", "input_name": "clip-queued.mp4", "status": "queued", "output_name": None, "r2_object_key": None, "error": None},
+        ],
+    }
+
+    api_main._recover_pending_jobs()
+
+    recovered = fake_job_store["job-recover"]
+    assert recovered["status"] == "queued"
+    assert "Resuming after API restart" in str(recovered["message"])
+    statuses = [video["status"] for video in recovered["videos"]]
+    assert statuses == ["completed", "queued", "queued", "queued"]
+    assert recovered["videos"][2]["error"] is None
+    assert enqueued == ["job-recover"]
+
+
+def test_recover_pending_jobs_marks_missing_artifacts_failed(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_job_store: dict[str, dict[str, object]],
+) -> None:
+    enqueued: list[str] = []
+    monkeypatch.setattr(api_main, "_enqueue_job", lambda job_id: enqueued.append(job_id))
+
+    fake_job_store["job-missing"] = {
+        "id": "job-missing",
+        "uid": "user-a",
+        "job_dir": "/tmp/does-not-exist-queue-job",
+        "gpx_name": "track.gpx",
+        "status": "queued",
+        "progress": 0,
+        "videos": [],
+    }
+
+    api_main._recover_pending_jobs()
+
+    stale = fake_job_store["job-missing"]
+    assert stale["status"] == "failed"
+    assert stale["progress"] == 100
+    assert "missing on disk" in str(stale["message"])
+    assert enqueued == []
+
+
+def test_process_job_resume_skips_already_completed_videos(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fake_job_store: dict[str, dict[str, object]],
+) -> None:
+    job_id = "job-resume"
+    job_dir = tmp_path / job_id
+    inputs_dir = job_dir / "inputs"
+    outputs_dir = job_dir / "outputs"
+    inputs_dir.mkdir(parents=True, exist_ok=True)
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+    (inputs_dir / "track.gpx").write_text("<gpx></gpx>")
+    (inputs_dir / "pending.mp4").write_bytes(b"pending-video")
+
+    fake_job_store[job_id] = {
+        "id": job_id,
+        "uid": "user-a",
+        "job_dir": str(job_dir),
+        "gpx_name": "track.gpx",
+        "status": "queued",
+        "progress": 0,
+        "message": "Queued",
+        "videos": [
+            {
+                "id": "video-complete",
+                "input_name": "already-done.mp4",
+                "status": "completed",
+                "progress": 100,
+                "output_name": "already-done-overlay.mp4",
+                "r2_object_key": "users/user-a/jobs/job-resume/outputs/already-done-overlay.mp4",
+            },
+            {
+                "id": "video-pending",
+                "input_name": "pending.mp4",
+                "status": "queued",
+                "progress": 0,
+                "output_name": None,
+                "r2_object_key": None,
+            },
+        ],
+        "settings": {
+            "gpx_offset_seconds": 0.0,
+            "gpx_speed_unit": "auto",
+            "render_profile": "h264-fast",
+            "overlay_theme": "powder-neon",
+            "layout_style": DEFAULT_LAYOUT_STYLE,
+            "component_visibility": {},
+            "speed_units": "kph",
+            "include_maps": False,
+            "map_style": "osm",
+            "altitude_units": "metre",
+            "distance_units": "km",
+            "temperature_units": "degC",
+            "fps_mode": "source_exact",
+            "fixed_fps": 30.0,
+            "font_path": str(Path(__file__).resolve()),
+        },
+    }
+
+    monkeypatch.setattr(api_main, "shift_gpx_timestamps", lambda src, dst, _offset, speed_unit="auto": dst.write_text("<gpx></gpx>"))
+    monkeypatch.setattr(
+        api_main,
+        "_probe_video",
+        lambda _path: {
+            "width": 1920,
+            "height": 1080,
+            "duration": 10.0,
+            "creation_time": "2026-01-01T00:00:00+00:00",
+            "codec": "h264",
+            "fps": 30.0,
+            "fps_raw": "30/1",
+        },
+    )
+    monkeypatch.setattr(api_main, "_set_file_mtime_from_creation", lambda _path, _creation_time: None)
+    monkeypatch.setattr(api_main, "_select_render_profile", lambda _metadata, _requested: ("h264-fast", ["h264-fast"]))
+    monkeypatch.setattr(api_main, "_build_renderer_command", lambda **_kwargs: ["renderer"])
+
+    render_calls: list[int] = []
+
+    def _fake_run_renderer(
+        _cmd: list[str],
+        _log_path: Path,
+        _job_id: str,
+        video_index: int,
+        _completed_before: int,
+        _total_videos: int,
+    ) -> tuple[int, str, float]:
+        render_calls.append(video_index)
+        return 0, "[100%]", 1.0
+
+    monkeypatch.setattr(api_main, "_run_renderer", _fake_run_renderer)
+    monkeypatch.setattr(
+        api_main,
+        "_upload_output_to_r2",
+        lambda **_kwargs: {
+            "r2_object_key": "users/user-a/jobs/job-resume/outputs/pending-overlay.mp4",
+            "r2_bucket": "test",
+            "r2_etag": "etag",
+            "r2_uploaded_at": "2026-01-01T00:00:00+00:00",
+            "output_size_bytes": 1,
+        },
+    )
+    monkeypatch.setattr(api_main, "_record_render_sample", lambda _sample: None)
+    monkeypatch.setattr(api_main, "_cleanup_local_artifacts_if_uploaded", lambda _job_id: None)
+
+    api_main._process_job(job_id)
+
+    updated = fake_job_store[job_id]
+    assert render_calls == [1]
+    assert updated["videos"][0]["status"] == "completed"
+    assert updated["videos"][1]["status"] == "completed"
+    assert updated["status"] == "completed"
+    assert (inputs_dir / "track.gpx").exists()
+    assert (inputs_dir / "pending.mp4").exists()
+
+
 def test_set_job_terminal_transition_triggers_single_notification(
     monkeypatch: pytest.MonkeyPatch,
     fake_job_store: dict[str, dict[str, object]],
@@ -329,6 +527,176 @@ def test_user_settings_update_persists_opt_out(monkeypatch: pytest.MonkeyPatch) 
     payload = response.json()
     assert payload["uid"] == "user-a"
     assert payload["notifications_enabled"] is False
+
+
+def test_user_access_reflects_admin_membership(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(api_main, "_verify_firebase_token", _stub_verify_token)
+    monkeypatch.setattr(api_main, "ADMIN_UIDS", {"user-a"})
+
+    owner = client.get("/api/user/access", headers={"Authorization": "Bearer token-user-a"})
+    assert owner.status_code == 200
+    owner_payload = owner.json()
+    assert owner_payload["uid"] == "user-a"
+    assert owner_payload["admin_configured"] is True
+    assert owner_payload["is_admin"] is True
+
+    other = client.get("/api/user/access", headers={"Authorization": "Bearer token-user-b"})
+    assert other.status_code == 200
+    other_payload = other.json()
+    assert other_payload["uid"] == "user-b"
+    assert other_payload["admin_configured"] is True
+    assert other_payload["is_admin"] is False
+
+
+def test_admin_overview_requires_admin_uid(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(api_main, "_verify_firebase_token", _stub_verify_token)
+    monkeypatch.setattr(api_main, "ADMIN_UIDS", {"user-a"})
+
+    denied = client.get("/api/admin/ops/overview", headers={"Authorization": "Bearer token-user-b"})
+    assert denied.status_code == 403
+
+    allowed = client.get("/api/admin/ops/overview", headers={"Authorization": "Bearer token-user-a"})
+    assert allowed.status_code == 200
+    payload = allowed.json()
+    assert "queue" in payload
+    assert "disk" in payload
+    assert "ops" in payload
+    assert "pending_jobs" in payload
+
+
+def test_admin_requeue_job_resets_pending_and_enqueues(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fake_job_store: dict[str, dict[str, object]],
+) -> None:
+    monkeypatch.setattr(api_main, "_verify_firebase_token", _stub_verify_token)
+    monkeypatch.setattr(api_main, "ADMIN_UIDS", {"user-a"})
+    enqueued: list[str] = []
+    monkeypatch.setattr(api_main, "_enqueue_job", lambda job_id: enqueued.append(job_id) or True)
+
+    job_dir = tmp_path / "job-admin-requeue"
+    inputs_dir = job_dir / "inputs"
+    outputs_dir = job_dir / "outputs"
+    inputs_dir.mkdir(parents=True, exist_ok=True)
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+    (inputs_dir / "track.gpx").write_text("<gpx></gpx>")
+    (inputs_dir / "pending.mp4").write_bytes(b"pending")
+
+    fake_job_store["job-admin-requeue"] = {
+        "id": "job-admin-requeue",
+        "uid": "user-a",
+        "job_dir": str(job_dir),
+        "gpx_name": "track.gpx",
+        "status": "failed",
+        "started_at": "2026-01-01T00:00:00+00:00",
+        "finished_at": "2026-01-01T01:00:00+00:00",
+        "progress": 100,
+        "message": "Render failed",
+        "videos": [
+            {
+                "id": "video-1",
+                "input_name": "done.mp4",
+                "status": "completed",
+                "progress": 100,
+                "output_name": "done-overlay.mp4",
+                "r2_object_key": "users/user-a/jobs/job-admin-requeue/outputs/done-overlay.mp4",
+            },
+            {
+                "id": "video-2",
+                "input_name": "pending.mp4",
+                "status": "failed",
+                "progress": 0,
+                "error": "boom",
+                "output_name": None,
+                "r2_object_key": None,
+            },
+        ],
+    }
+
+    response = client.post(
+        "/api/admin/jobs/job-admin-requeue/requeue",
+        headers={"Authorization": "Bearer token-user-a"},
+        json={"reset_failed_videos": True},
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "queued"
+    assert enqueued == ["job-admin-requeue"]
+
+    persisted = fake_job_store["job-admin-requeue"]
+    assert persisted["status"] == "queued"
+    assert persisted["finished_at"] is None
+    pending_video = persisted["videos"][1]
+    assert pending_video["status"] == "queued"
+    assert pending_video["error"] is None
+
+
+def test_admin_cleanup_endpoint_invokes_cleanup_cycle(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(api_main, "_verify_firebase_token", _stub_verify_token)
+    monkeypatch.setattr(api_main, "ADMIN_UIDS", {"user-a"})
+    monkeypatch.setattr(
+        api_main,
+        "_run_cleanup_cycle",
+        lambda *, include_database, force_database=False: {
+            "disk": {"deleted_dirs": 3, "scanned_dirs": 10},
+            "database": {"deleted_docs": 2} if include_database and force_database else None,
+        },
+    )
+
+    response = client.post(
+        "/api/admin/ops/cleanup",
+        headers={"Authorization": "Bearer token-user-a"},
+        json={"include_database": True, "force_database": True},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["summary"]["disk"]["deleted_dirs"] == 3
+    assert payload["summary"]["database"]["deleted_docs"] == 2
+
+
+def test_admin_cancel_job_marks_pending_videos_failed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fake_job_store: dict[str, dict[str, object]],
+) -> None:
+    monkeypatch.setattr(api_main, "_verify_firebase_token", _stub_verify_token)
+    monkeypatch.setattr(api_main, "ADMIN_UIDS", {"user-a"})
+
+    job_dir = tmp_path / "job-admin-cancel"
+    (job_dir / "inputs").mkdir(parents=True, exist_ok=True)
+    (job_dir / "inputs" / "track.gpx").write_text("<gpx></gpx>")
+
+    fake_job_store["job-admin-cancel"] = {
+        "id": "job-admin-cancel",
+        "uid": "user-a",
+        "job_dir": str(job_dir),
+        "gpx_name": "track.gpx",
+        "status": "queued",
+        "progress": 10,
+        "message": "Queued",
+        "videos": [
+            {"id": "v1", "input_name": "a.mp4", "status": "queued", "progress": 0},
+            {"id": "v2", "input_name": "b.mp4", "status": "running", "progress": 25},
+            {"id": "v3", "input_name": "c.mp4", "status": "completed", "progress": 100, "output_name": "c-overlay.mp4", "r2_object_key": "users/u/jobs/j/outputs/c-overlay.mp4"},
+        ],
+    }
+
+    response = client.post(
+        "/api/admin/jobs/job-admin-cancel/cancel",
+        headers={"Authorization": "Bearer token-user-a"},
+        json={"reason": "queue maintenance"},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "failed"
+    assert "Cancelled by admin" in payload["message"]
+
+    persisted = fake_job_store["job-admin-cancel"]
+    assert persisted["status"] == "failed"
+    assert persisted["progress"] == 100
+    assert persisted["videos"][0]["status"] == "failed"
+    assert persisted["videos"][1]["status"] == "failed"
+    assert persisted["videos"][2]["status"] == "completed"
 
 
 def test_download_output_redirects_to_signed_r2_url(

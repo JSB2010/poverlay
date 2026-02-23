@@ -55,9 +55,16 @@ API_BASE_URL=https://your-domain.com/api
 NEXT_PUBLIC_SITE_URL=https://your-domain.com
 API_PROXY_TARGET=http://127.0.0.1:8787
 CORS_ORIGINS=https://your-domain.com,http://localhost:3000,http://127.0.0.1:3000
+ADMIN_UIDS=your-firebase-uid
 JOB_OUTPUT_RETENTION_HOURS=24
 JOB_CLEANUP_INTERVAL_SECONDS=900
 JOB_CLEANUP_ENABLED=true
+JOB_RECOVERY_INTERVAL_SECONDS=45
+JOB_QUEUE_WORKER_COUNT=0
+FFMPEG_THREADS_PER_RENDER=0
+JOB_DATABASE_CLEANUP_ENABLED=true
+JOB_DATABASE_CLEANUP_INTERVAL_SECONDS=3600
+JOB_DATABASE_RETENTION_DAYS=30
 DELETE_INPUTS_ON_COMPLETE=true
 DELETE_WORK_ON_COMPLETE=true
 ENV
@@ -129,10 +136,15 @@ Restart and cleanup behavior:
 
 - `poverlay-api` and `poverlay-web` systemd units use `Restart=always` with `RestartSec=3`.
 - On API startup, queued/running jobs are recovered from Firestore and re-queued.
+- A background reconciliation loop (`JOB_RECOVERY_INTERVAL_SECONDS`) continuously re-enqueues stranded queued/running jobs and prunes ghost queue state.
 - If a recovered job references a missing local job directory, the job is marked `failed` with a restart-related message.
 - Local render artifacts are deleted only after successful R2 upload verification for all produced outputs.
 - Terminal jobs receive `expires_at`; background cleanup deletes expired `data/jobs/<job-id>` directories based on `JOB_OUTPUT_RETENTION_HOURS`.
 - Cleanup cadence is controlled by `JOB_CLEANUP_ENABLED` and `JOB_CLEANUP_INTERVAL_SECONDS`.
+- Optional Firestore metadata cleanup removes terminal job documents after `JOB_DATABASE_RETENTION_DAYS`.
+- Admin endpoints under `/api/admin/*` require authenticated users whose UID is listed in `ADMIN_UIDS`.
+- Web admins can monitor and trigger queue/cleanup actions at `/admin`.
+- Admin queue controls include manual requeue and cancellation for queued/non-active jobs.
 
 ## Large upload testing (10GB+)
 

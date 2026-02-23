@@ -66,10 +66,30 @@ DEFAULT_FONT_PATH = RUNTIME_CONFIG.overlay_font_path
 
 JOB_CLEANUP_ENABLED = RUNTIME_CONFIG.job_cleanup_enabled
 JOB_CLEANUP_INTERVAL_SECONDS = RUNTIME_CONFIG.job_cleanup_interval_seconds
+JOB_RECOVERY_INTERVAL_SECONDS = RUNTIME_CONFIG.job_recovery_interval_seconds
+JOB_QUEUE_WORKER_COUNT = RUNTIME_CONFIG.job_queue_worker_count
 JOB_OUTPUT_RETENTION_HOURS = RUNTIME_CONFIG.job_output_retention_hours
+JOB_DATABASE_CLEANUP_ENABLED = RUNTIME_CONFIG.job_database_cleanup_enabled
+JOB_DATABASE_CLEANUP_INTERVAL_SECONDS = RUNTIME_CONFIG.job_database_cleanup_interval_seconds
+JOB_DATABASE_RETENTION_DAYS = RUNTIME_CONFIG.job_database_retention_days
+FFMPEG_THREADS_PER_RENDER = RUNTIME_CONFIG.ffmpeg_threads_per_render
 DELETE_INPUTS_ON_COMPLETE = RUNTIME_CONFIG.delete_inputs_on_complete
 DELETE_WORK_ON_COMPLETE = RUNTIME_CONFIG.delete_work_on_complete
 JOB_EXPIRY_MARKER_FILE = ".expires-at"
+ADMIN_UIDS = {uid.strip() for uid in RUNTIME_CONFIG.admin_uids if uid.strip()}
+
+if JOB_QUEUE_WORKER_COUNT <= 0:
+    cpu_count = max(os.cpu_count() or 1, 1)
+    if cpu_count >= 24:
+        JOB_QUEUE_WORKER_COUNT = 3
+    elif cpu_count >= 12:
+        JOB_QUEUE_WORKER_COUNT = 2
+    else:
+        JOB_QUEUE_WORKER_COUNT = 1
+
+if FFMPEG_THREADS_PER_RENDER <= 0:
+    cpu_count = max(os.cpu_count() or 1, 1)
+    FFMPEG_THREADS_PER_RENDER = max(1, cpu_count // max(JOB_QUEUE_WORKER_COUNT, 1))
 
 ALLOWED_UNITS_SPEED = {"kph", "mph", "mps", "knots"}
 ALLOWED_UNITS_ALTITUDE = {"metre", "meter", "feet", "foot"}
@@ -328,19 +348,76 @@ _BREVO_CLIENT_LOCK = threading.Lock()
 _BREVO_CLIENT: Any | None = None
 _QUEUE_WORKER_LOCK = threading.Lock()
 _QUEUE_WORKER_STARTED = False
+_RECOVERY_LOOP_STARTED = False
 JOB_QUEUE: queue.Queue[str] = queue.Queue()
 ENQUEUED_JOBS: set[str] = set()
+ACTIVE_JOBS: set[str] = set()
+_OPS_LOCK = threading.Lock()
+_OPS_METRICS: dict[str, Any] = {
+    "started_at": datetime.now(timezone.utc).isoformat(),
+    "queue_enqueued_total": 0,
+    "queue_dequeued_total": 0,
+    "queue_worker_crash_total": 0,
+    "reconcile_runs_total": 0,
+    "reconcile_errors_total": 0,
+    "reconcile_requeued_total": 0,
+    "reconcile_normalized_running_total": 0,
+    "reconcile_failed_missing_dir_total": 0,
+    "reconcile_failed_missing_inputs_total": 0,
+    "cleanup_runs_total": 0,
+    "cleanup_errors_total": 0,
+    "cleanup_deleted_job_dirs_total": 0,
+    "cleanup_deleted_firestore_jobs_total": 0,
+    "last_reconcile_started_at": None,
+    "last_reconcile_completed_at": None,
+    "last_cleanup_started_at": None,
+    "last_cleanup_completed_at": None,
+}
 _RENDER_ANALYTICS_LOCK = threading.Lock()
 _RENDER_ETA_CACHE_MTIME: float | None = None
 _RENDER_ETA_CACHE: dict[str, Any] | None = None
 LOGGER = logging.getLogger("poverlay.api")
 
 
+def _ops_increment(metric: str, delta: int = 1) -> None:
+    with _OPS_LOCK:
+        _OPS_METRICS[metric] = int(_OPS_METRICS.get(metric, 0)) + delta
+
+
+def _ops_set(metric: str, value: Any) -> None:
+    with _OPS_LOCK:
+        _OPS_METRICS[metric] = value
+
+
+def _ops_snapshot() -> dict[str, Any]:
+    with _OPS_LOCK:
+        return deepcopy(_OPS_METRICS)
+
+
+def _queue_snapshot() -> dict[str, Any]:
+    with _QUEUE_WORKER_LOCK:
+        active_jobs = sorted(ACTIVE_JOBS)
+        enqueued_jobs = sorted(ENQUEUED_JOBS)
+    return {
+        "configured_workers": JOB_QUEUE_WORKER_COUNT,
+        "active_jobs_count": len(active_jobs),
+        "active_jobs": active_jobs,
+        "enqueued_jobs_count": len(enqueued_jobs),
+        "enqueued_jobs": enqueued_jobs,
+        "queue_depth": JOB_QUEUE.qsize(),
+    }
+
+
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     _ensure_dirs()
-    _start_queue_worker()
-    _recover_pending_jobs()
+    _start_queue_workers()
+    try:
+        _recover_pending_jobs()
+    except Exception:  # noqa: BLE001
+        _ops_increment("reconcile_errors_total")
+        LOGGER.exception("Initial pending-job recovery failed")
+    _start_recovery_loop()
     if JOB_CLEANUP_ENABLED:
         threading.Thread(target=_cleanup_loop, name="job-cleanup", daemon=True).start()
     yield
@@ -363,6 +440,19 @@ class UserSettingsUpdate(BaseModel):
     notifications_enabled: bool
 
 
+class AdminCleanupRequest(BaseModel):
+    include_database: bool = True
+    force_database: bool = False
+
+
+class AdminRequeueRequest(BaseModel):
+    reset_failed_videos: bool = True
+
+
+class AdminCancelRequest(BaseModel):
+    reason: str | None = None
+
+
 def _safe_filename(name: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", name.strip())
     return safe or "file"
@@ -383,9 +473,12 @@ def _ensure_dirs() -> None:
 def _ffmpeg_profile_presets() -> dict[str, dict[str, Any]]:
     presets: dict[str, dict[str, Any]] = {}
     for profile_id, entry in RENDER_PROFILE_CATALOG.items():
+        output_args = list(entry["ffmpeg"].get("output", []))
+        if FFMPEG_THREADS_PER_RENDER > 0 and "-threads" not in output_args:
+            output_args.extend(["-threads", str(FFMPEG_THREADS_PER_RENDER)])
         ffmpeg_profile = {
             "input": list(entry["ffmpeg"].get("input", [])),
-            "output": list(entry["ffmpeg"].get("output", [])),
+            "output": output_args,
         }
         if "filter" in entry["ffmpeg"]:
             ffmpeg_profile["filter"] = entry["ffmpeg"]["filter"]
@@ -749,6 +842,21 @@ def _persist_job_state(job: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def _delete_job_state(job_id: str) -> None:
+    def _delete() -> None:
+        _firestore_jobs_collection().document(job_id).delete()
+
+    _retry_operation(
+        f"Deleting job {job_id} state",
+        _delete,
+        attempts=STATE_RETRY_ATTEMPTS,
+        delay_seconds=STATE_RETRY_DELAY_SECONDS,
+    )
+    _forget_job(job_id)
+    with _QUEUE_WORKER_LOCK:
+        ENQUEUED_JOBS.discard(job_id)
+
+
 def _load_job_state(job_id: str, *, prefer_cache: bool) -> dict[str, Any] | None:
     if prefer_cache:
         with JOBS_LOCK:
@@ -818,6 +926,27 @@ def _list_jobs_for_uid(uid: str) -> list[dict[str, Any]]:
         payload.setdefault("id", snapshot.id)
         if str(payload.get("uid") or "") == uid:
             jobs.append(payload)
+    return jobs
+
+
+def _list_all_jobs() -> list[dict[str, Any]]:
+    if not FIRESTORE_ENABLED:
+        return []
+
+    def _stream() -> list[Any]:
+        return list(_firestore_jobs_collection().stream())
+
+    snapshots = _retry_operation(
+        "Listing all jobs",
+        _stream,
+        attempts=STATE_RETRY_ATTEMPTS,
+        delay_seconds=STATE_RETRY_DELAY_SECONDS,
+    )
+    jobs: list[dict[str, Any]] = []
+    for snapshot in snapshots:
+        payload = snapshot.to_dict() or {}
+        payload.setdefault("id", snapshot.id)
+        jobs.append(payload)
     return jobs
 
 
@@ -1028,20 +1157,42 @@ def _signed_r2_download_url(object_key: str, filename: str) -> str:
     )
 
 
-def _enqueue_job(job_id: str) -> None:
+def _enqueue_job(job_id: str) -> bool:
+    added = False
     with _QUEUE_WORKER_LOCK:
-        if job_id in ENQUEUED_JOBS:
-            return
+        if job_id in ENQUEUED_JOBS or job_id in ACTIVE_JOBS:
+            return False
         ENQUEUED_JOBS.add(job_id)
+        added = True
     JOB_QUEUE.put(job_id)
+    if added:
+        _ops_increment("queue_enqueued_total")
+    return added
+
+
+def _is_job_active_locally(job_id: str) -> bool:
+    with _QUEUE_WORKER_LOCK:
+        return job_id in ACTIVE_JOBS
 
 
 def _queue_worker_loop() -> None:
     while True:
         job_id = JOB_QUEUE.get()
+        claimed = False
+        with _QUEUE_WORKER_LOCK:
+            if job_id not in ACTIVE_JOBS:
+                ACTIVE_JOBS.add(job_id)
+                ENQUEUED_JOBS.add(job_id)
+                claimed = True
+        if not claimed:
+            JOB_QUEUE.task_done()
+            continue
+
         try:
+            _ops_increment("queue_dequeued_total")
             _process_job(job_id)
         except Exception as exc:  # noqa: BLE001
+            _ops_increment("queue_worker_crash_total")
             try:
                 _set_job(
                     job_id,
@@ -1054,44 +1205,172 @@ def _queue_worker_loop() -> None:
                 pass
         finally:
             with _QUEUE_WORKER_LOCK:
+                ACTIVE_JOBS.discard(job_id)
                 ENQUEUED_JOBS.discard(job_id)
             JOB_QUEUE.task_done()
 
 
-def _start_queue_worker() -> None:
+def _start_queue_workers() -> None:
     global _QUEUE_WORKER_STARTED
     with _QUEUE_WORKER_LOCK:
         if _QUEUE_WORKER_STARTED:
             return
-        threading.Thread(target=_queue_worker_loop, name="render-job-worker", daemon=True).start()
+        for index in range(JOB_QUEUE_WORKER_COUNT):
+            threading.Thread(
+                target=_queue_worker_loop,
+                name=f"render-job-worker-{index + 1}",
+                daemon=True,
+            ).start()
         _QUEUE_WORKER_STARTED = True
 
 
-def _recover_pending_jobs() -> None:
+def _mark_job_artifacts_missing_failed(job: dict[str, Any], *, reason: str, metric_key: str) -> None:
+    job["status"] = "failed"
+    job["finished_at"] = _utc_now()
+    job["progress"] = 100
+    job["message"] = reason
+    _persist_job_state(job)
+    _ops_increment(metric_key)
+
+
+def _normalize_job_for_recovery(job: dict[str, Any], *, message: str) -> dict[str, Any]:
+    if str(job.get("status") or "") == "running":
+        job["status"] = "queued"
+        job["message"] = message
+        for video in job.get("videos", []):
+            status = str(video.get("status") or "")
+            if status == "completed":
+                continue
+            if status in {"running", "queued", "failed"}:
+                video["status"] = "queued"
+                video["progress"] = 0
+                video["detail"] = "Queued for recovery"
+                video["error"] = None
+        _persist_job_state(job)
+        _ops_increment("reconcile_normalized_running_total")
+    return job
+
+
+def _job_has_recoverable_inputs(job: dict[str, Any]) -> bool:
+    job_dir = Path(str(job.get("job_dir") or ""))
+    inputs_dir = job_dir / "inputs"
+    outputs_dir = job_dir / "outputs"
+    work_dir = job_dir / "work"
+    gpx_name = str(job.get("gpx_name") or "")
+
+    if not gpx_name:
+        return False
+    if not (inputs_dir / gpx_name).exists() and not (work_dir / "track-shifted.gpx").exists():
+        return False
+
+    for video in job.get("videos", []):
+        if not isinstance(video, dict):
+            continue
+        status = str(video.get("status") or "")
+        output_name = str(video.get("output_name") or "")
+        has_output = bool(video.get("r2_object_key") or (output_name and (outputs_dir / output_name).exists()))
+        if status == "completed" and has_output:
+            continue
+
+        input_name = str(video.get("input_name") or "")
+        if not input_name or not (inputs_dir / input_name).exists():
+            return False
+
+    return True
+
+
+def _prune_enqueued_jobs() -> None:
+    with _QUEUE_WORKER_LOCK:
+        candidates = [job_id for job_id in ENQUEUED_JOBS if job_id not in ACTIVE_JOBS]
+
+    stale: list[str] = []
+    for job_id in candidates:
+        state = _load_job_state(job_id, prefer_cache=False)
+        if state is None or str(state.get("status") or "") in TERMINAL_JOB_STATUSES:
+            stale.append(job_id)
+
+    if not stale:
+        return
+
+    with _QUEUE_WORKER_LOCK:
+        for job_id in stale:
+            if job_id not in ACTIVE_JOBS:
+                ENQUEUED_JOBS.discard(job_id)
+
+
+def _reconcile_pending_jobs_once(*, startup: bool) -> dict[str, int]:
+    _ops_increment("reconcile_runs_total")
+    _ops_set("last_reconcile_started_at", _utc_now())
+    summary = {
+        "scanned": 0,
+        "requeued": 0,
+        "normalized_running": 0,
+        "failed_missing_dir": 0,
+        "failed_missing_inputs": 0,
+    }
+
     for job in _list_jobs_with_status({"queued", "running"}):
+        summary["scanned"] += 1
         job_id = str(job.get("id") or "")
         if not job_id:
             continue
 
         job_dir_raw = str(job.get("job_dir") or "")
         if not job_dir_raw or not Path(job_dir_raw).exists():
-            job["status"] = "failed"
-            job["finished_at"] = _utc_now()
-            job["progress"] = 100
-            job["message"] = "Job artifacts are missing on disk after restart"
-            _persist_job_state(job)
+            _mark_job_artifacts_missing_failed(
+                job,
+                reason="Job artifacts are missing on disk and were removed from the queue",
+                metric_key="reconcile_failed_missing_dir_total",
+            )
+            summary["failed_missing_dir"] += 1
+            continue
+        if not _job_has_recoverable_inputs(job):
+            _mark_job_artifacts_missing_failed(
+                job,
+                reason="Job inputs are incomplete on disk and could not be recovered",
+                metric_key="reconcile_failed_missing_inputs_total",
+            )
+            summary["failed_missing_inputs"] += 1
             continue
 
-        if job.get("status") == "running":
-            job["status"] = "queued"
-            job["message"] = "Resuming after API restart"
-            for video in job.get("videos", []):
-                if video.get("status") == "running":
-                    video["status"] = "queued"
-                    video["detail"] = "Queued after API restart"
-            _persist_job_state(job)
+        if str(job.get("status") or "") == "running" and not _is_job_active_locally(job_id):
+            job = _normalize_job_for_recovery(
+                job,
+                message="Resuming after API restart" if startup else "Recovered from stale running state",
+            )
+            summary["normalized_running"] += 1
 
-        _enqueue_job(job_id)
+        if not _is_job_active_locally(job_id):
+            if _enqueue_job(job_id):
+                summary["requeued"] += 1
+
+    _prune_enqueued_jobs()
+    _ops_increment("reconcile_requeued_total", summary["requeued"])
+    _ops_set("last_reconcile_completed_at", _utc_now())
+    return summary
+
+
+def _recovery_loop() -> None:
+    while True:
+        try:
+            _reconcile_pending_jobs_once(startup=False)
+        except Exception:  # noqa: BLE001
+            _ops_increment("reconcile_errors_total")
+            LOGGER.exception("Pending job reconciliation failed")
+        time.sleep(JOB_RECOVERY_INTERVAL_SECONDS)
+
+
+def _start_recovery_loop() -> None:
+    global _RECOVERY_LOOP_STARTED
+    with _QUEUE_WORKER_LOCK:
+        if _RECOVERY_LOOP_STARTED:
+            return
+        threading.Thread(target=_recovery_loop, name="job-recovery", daemon=True).start()
+        _RECOVERY_LOOP_STARTED = True
+
+
+def _recover_pending_jobs() -> None:
+    _reconcile_pending_jobs_once(startup=True)
 
 
 def _require_durable_pipeline_enabled() -> None:
@@ -1136,17 +1415,25 @@ def _cleanup_completed_job_live_files(job_dir: Path) -> None:
     _safe_unlink(job_dir / "outputs.zip")
 
 
-def _cleanup_expired_jobs_once() -> None:
+def _cleanup_expired_jobs_once() -> dict[str, int]:
+    summary = {
+        "scanned_dirs": 0,
+        "deleted_dirs": 0,
+        "skipped_active": 0,
+        "skipped_not_expired": 0,
+    }
     if not JOBS_DIR.exists():
-        return
+        return summary
 
     now = datetime.now(timezone.utc)
     for job_dir in JOBS_DIR.iterdir():
         if not job_dir.is_dir():
             continue
+        summary["scanned_dirs"] += 1
 
         job_id = job_dir.name
         if _is_active_job(job_id):
+            summary["skipped_active"] += 1
             continue
 
         expires_at = _read_expiry_marker(job_dir)
@@ -1156,18 +1443,99 @@ def _cleanup_expired_jobs_once() -> None:
             expires_at = mtime + timedelta(hours=JOB_OUTPUT_RETENTION_HOURS)
 
         if expires_at > now:
+            summary["skipped_not_expired"] += 1
             continue
 
         _safe_rmtree(job_dir)
         _forget_job(job_id)
+        summary["deleted_dirs"] += 1
+
+    if summary["deleted_dirs"] > 0:
+        _ops_increment("cleanup_deleted_job_dirs_total", summary["deleted_dirs"])
+    return summary
+
+
+def _cleanup_expired_firestore_jobs_once(*, force: bool = False) -> dict[str, int]:
+    summary = {
+        "scanned_docs": 0,
+        "deleted_docs": 0,
+        "skipped_not_terminal": 0,
+        "skipped_recent": 0,
+        "skipped_active": 0,
+    }
+    if not FIRESTORE_ENABLED or (not JOB_DATABASE_CLEANUP_ENABLED and not force):
+        return summary
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=JOB_DATABASE_RETENTION_DAYS)
+    try:
+        snapshots = _retry_operation(
+            "Listing jobs for database cleanup",
+            lambda: list(_firestore_jobs_collection().stream()),
+            attempts=STATE_RETRY_ATTEMPTS,
+            delay_seconds=STATE_RETRY_DELAY_SECONDS,
+        )
+    except Exception:
+        return summary
+
+    for snapshot in snapshots:
+        payload = snapshot.to_dict() or {}
+        job_id = str(payload.get("id") or snapshot.id)
+        summary["scanned_docs"] += 1
+
+        status = str(payload.get("status") or "")
+        if status not in TERMINAL_JOB_STATUSES:
+            summary["skipped_not_terminal"] += 1
+            continue
+
+        if _is_job_active_locally(job_id):
+            summary["skipped_active"] += 1
+            continue
+
+        terminal_at = _parse_iso(str(payload.get("expires_at") or "")) or _parse_iso(str(payload.get("finished_at") or "")) or _parse_iso(
+            str(payload.get("updated_at") or "")
+        )
+        if terminal_at is None or terminal_at > cutoff:
+            summary["skipped_recent"] += 1
+            continue
+
+        try:
+            _delete_job_state(job_id)
+            summary["deleted_docs"] += 1
+        except Exception:
+            LOGGER.exception("Failed deleting expired job document: %s", job_id)
+
+    if summary["deleted_docs"] > 0:
+        _ops_increment("cleanup_deleted_firestore_jobs_total", summary["deleted_docs"])
+    return summary
+
+
+def _run_cleanup_cycle(*, include_database: bool, force_database: bool = False) -> dict[str, Any]:
+    _ops_increment("cleanup_runs_total")
+    _ops_set("last_cleanup_started_at", _utc_now())
+    payload: dict[str, Any] = {"disk": _cleanup_expired_jobs_once(), "database": None}
+
+    if include_database and (force_database or JOB_DATABASE_CLEANUP_ENABLED):
+        payload["database"] = _cleanup_expired_firestore_jobs_once(force=force_database)
+
+    _ops_set("last_cleanup_completed_at", _utc_now())
+    return payload
 
 
 def _cleanup_loop() -> None:
+    last_database_cleanup_at = 0.0
     while True:
         try:
-            _cleanup_expired_jobs_once()
+            now_monotonic = time.monotonic()
+            should_cleanup_database = (
+                JOB_DATABASE_CLEANUP_ENABLED
+                and (now_monotonic - last_database_cleanup_at) >= float(JOB_DATABASE_CLEANUP_INTERVAL_SECONDS)
+            )
+            result = _run_cleanup_cycle(include_database=should_cleanup_database)
+            if should_cleanup_database and result.get("database") is not None:
+                last_database_cleanup_at = now_monotonic
         except Exception:  # noqa: BLE001
-            pass
+            _ops_increment("cleanup_errors_total")
+            LOGGER.exception("Cleanup loop iteration failed")
         time.sleep(JOB_CLEANUP_INTERVAL_SECONDS)
 
 
@@ -1259,6 +1627,22 @@ def _require_user_uid(token: str = Depends(_bearer_token_from_header)) -> str:
     return _verify_firebase_token(token)
 
 
+def _is_uid_admin(uid: str) -> bool:
+    if not ADMIN_UIDS:
+        return False
+    if "*" in ADMIN_UIDS:
+        return True
+    return uid in ADMIN_UIDS
+
+
+def _require_admin_uid(uid: str = Depends(_require_user_uid)) -> str:
+    if not ADMIN_UIDS:
+        raise HTTPException(status_code=503, detail="Admin operations are not configured")
+    if not _is_uid_admin(uid):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return uid
+
+
 def _get_job(job_id: str, requester_uid: str | None = None) -> dict[str, Any]:
     job = _load_job_state(job_id, prefer_cache=False)
     if job is None:
@@ -1296,6 +1680,247 @@ def _cleanup_local_artifacts_if_uploaded(job_id: str) -> None:
         _safe_rmtree(job_dir)
 
     _set_job(job_id, local_artifacts_deleted_at=_utc_now())
+
+
+def _jobs_disk_usage_snapshot() -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "jobs_dir": str(JOBS_DIR),
+        "job_dirs": 0,
+        "files": 0,
+        "bytes": 0,
+        "bytes_human": "0 B",
+    }
+    if not JOBS_DIR.exists():
+        return summary
+
+    total_bytes = 0
+    total_files = 0
+    total_dirs = 0
+    for job_dir in JOBS_DIR.iterdir():
+        if not job_dir.is_dir():
+            continue
+        total_dirs += 1
+        for path in job_dir.rglob("*"):
+            if not path.is_file():
+                continue
+            total_files += 1
+            try:
+                total_bytes += path.stat().st_size
+            except OSError:
+                continue
+
+    summary["job_dirs"] = total_dirs
+    summary["files"] = total_files
+    summary["bytes"] = total_bytes
+
+    value = float(total_bytes)
+    units = ("B", "KB", "MB", "GB", "TB")
+    unit = units[0]
+    for candidate in units:
+        unit = candidate
+        if value < 1024 or candidate == units[-1]:
+            break
+        value /= 1024.0
+    summary["bytes_human"] = f"{value:.2f} {unit}"
+    return summary
+
+
+def _job_status_summary(jobs: list[dict[str, Any]]) -> dict[str, Any]:
+    counts: dict[str, int] = defaultdict(int)
+    by_uid: dict[str, int] = defaultdict(int)
+    oldest_terminal: datetime | None = None
+    newest_terminal: datetime | None = None
+    terminal_count = 0
+
+    for job in jobs:
+        status = str(job.get("status") or "unknown")
+        counts[status] += 1
+        uid = str(job.get("uid") or "")
+        if uid:
+            by_uid[uid] += 1
+        if status in TERMINAL_JOB_STATUSES:
+            terminal_count += 1
+            terminal_at = _parse_iso(str(job.get("finished_at") or "")) or _parse_iso(str(job.get("updated_at") or ""))
+            if terminal_at is not None:
+                if oldest_terminal is None or terminal_at < oldest_terminal:
+                    oldest_terminal = terminal_at
+                if newest_terminal is None or terminal_at > newest_terminal:
+                    newest_terminal = terminal_at
+
+    return {
+        "total_jobs": len(jobs),
+        "status_counts": dict(sorted(counts.items())),
+        "terminal_jobs": terminal_count,
+        "users_with_jobs": len(by_uid),
+        "oldest_terminal_at": oldest_terminal.isoformat() if oldest_terminal else None,
+        "newest_terminal_at": newest_terminal.isoformat() if newest_terminal else None,
+    }
+
+
+def _video_has_completed_output(video: dict[str, Any], outputs_dir: Path) -> bool:
+    status = str(video.get("status") or "")
+    if status != "completed":
+        return False
+    output_name = str(video.get("output_name") or "")
+    if video.get("r2_object_key"):
+        return True
+    return bool(output_name and (outputs_dir / output_name).exists())
+
+
+def _prepare_job_for_admin_requeue(job: dict[str, Any], *, reset_failed_videos: bool) -> dict[str, Any]:
+    job_id = str(job.get("id") or "")
+    if not job_id:
+        raise HTTPException(status_code=400, detail="Invalid job payload")
+    if _is_job_active_locally(job_id):
+        raise HTTPException(status_code=409, detail="Job is currently active on this API instance")
+    if not _job_has_recoverable_inputs(job):
+        raise HTTPException(status_code=409, detail="Job inputs are incomplete and cannot be re-queued")
+
+    outputs_dir = Path(str(job.get("job_dir") or "")) / "outputs"
+    any_pending = False
+    for video in job.get("videos", []):
+        if not isinstance(video, dict):
+            continue
+        if _video_has_completed_output(video, outputs_dir):
+            continue
+        any_pending = True
+        status = str(video.get("status") or "")
+        if status == "failed" and not reset_failed_videos:
+            continue
+        video["status"] = "queued"
+        video["progress"] = 0
+        video["detail"] = "Queued by admin"
+        video["error"] = None
+        video["output_name"] = None
+        video["r2_object_key"] = None
+        video["r2_bucket"] = None
+        video["r2_etag"] = None
+        video["r2_uploaded_at"] = None
+        video["output_size_bytes"] = None
+
+    if not any_pending:
+        raise HTTPException(status_code=409, detail="Job has no pending work to re-queue")
+
+    job["status"] = "queued"
+    job["started_at"] = None
+    job["finished_at"] = None
+    job["progress"] = 0
+    job["message"] = "Queued by admin"
+    job["expires_at"] = None
+    return _persist_job_state(job)
+
+
+def _cancel_job_for_admin(job: dict[str, Any], *, reason: str | None) -> dict[str, Any]:
+    job_id = str(job.get("id") or "")
+    if not job_id:
+        raise HTTPException(status_code=400, detail="Invalid job payload")
+    if _is_job_active_locally(job_id):
+        raise HTTPException(status_code=409, detail="Job is currently active on this API instance and cannot be cancelled safely")
+
+    status = str(job.get("status") or "")
+    if status in TERMINAL_JOB_STATUSES:
+        return job
+
+    cancel_reason = (reason or "").strip()[:160]
+    detail = "Cancelled by admin"
+    if cancel_reason:
+        detail = f"{detail}: {cancel_reason}"
+
+    for video in job.get("videos", []):
+        if not isinstance(video, dict):
+            continue
+        video_status = str(video.get("status") or "")
+        if video_status in {"queued", "running"}:
+            video["status"] = "failed"
+            video["progress"] = 0
+            video["detail"] = detail
+            video["error"] = detail
+
+    job["status"] = "failed"
+    job["finished_at"] = _utc_now()
+    job["progress"] = 100
+    job["message"] = detail
+    updated = _persist_job_state(job)
+    with _QUEUE_WORKER_LOCK:
+        ENQUEUED_JOBS.discard(job_id)
+    return updated
+
+
+def _pending_jobs_summary(jobs: list[dict[str, Any]], *, limit: int = 50) -> list[dict[str, Any]]:
+    pending: list[dict[str, Any]] = []
+    ordered = sorted(
+        jobs,
+        key=lambda job: str(job.get("updated_at") or ""),
+        reverse=True,
+    )
+    for job in ordered:
+        status = str(job.get("status") or "")
+        if status not in {"queued", "running"}:
+            continue
+        videos = job.get("videos", [])
+        queued_count = 0
+        running_count = 0
+        completed_count = 0
+        failed_count = 0
+        for video in videos if isinstance(videos, list) else []:
+            if not isinstance(video, dict):
+                continue
+            video_status = str(video.get("status") or "")
+            if video_status == "queued":
+                queued_count += 1
+            elif video_status == "running":
+                running_count += 1
+            elif video_status == "completed":
+                completed_count += 1
+            elif video_status == "failed":
+                failed_count += 1
+
+        pending.append(
+            {
+                "id": str(job.get("id") or ""),
+                "uid": str(job.get("uid") or ""),
+                "status": status,
+                "progress": int(job.get("progress") or 0),
+                "message": str(job.get("message") or ""),
+                "updated_at": job.get("updated_at"),
+                "videos": {
+                    "total": len(videos) if isinstance(videos, list) else 0,
+                    "queued": queued_count,
+                    "running": running_count,
+                    "completed": completed_count,
+                    "failed": failed_count,
+                },
+            }
+        )
+        if len(pending) >= limit:
+            break
+    return pending
+
+
+def _admin_overview_payload() -> dict[str, Any]:
+    jobs = _list_all_jobs() if FIRESTORE_ENABLED else []
+    return {
+        "now": _utc_now(),
+        "queue": _queue_snapshot(),
+        "ops": _ops_snapshot(),
+        "disk": _jobs_disk_usage_snapshot(),
+        "firestore": {
+            "enabled": FIRESTORE_ENABLED,
+            "summary": _job_status_summary(jobs) if FIRESTORE_ENABLED else None,
+        },
+        "runtime": {
+            "job_cleanup_enabled": JOB_CLEANUP_ENABLED,
+            "job_cleanup_interval_seconds": JOB_CLEANUP_INTERVAL_SECONDS,
+            "job_recovery_interval_seconds": JOB_RECOVERY_INTERVAL_SECONDS,
+            "job_queue_worker_count": JOB_QUEUE_WORKER_COUNT,
+            "job_output_retention_hours": JOB_OUTPUT_RETENTION_HOURS,
+            "job_database_cleanup_enabled": JOB_DATABASE_CLEANUP_ENABLED,
+            "job_database_cleanup_interval_seconds": JOB_DATABASE_CLEANUP_INTERVAL_SECONDS,
+            "job_database_retention_days": JOB_DATABASE_RETENTION_DAYS,
+            "ffmpeg_threads_per_render": FFMPEG_THREADS_PER_RENDER,
+        },
+        "pending_jobs": _pending_jobs_summary(jobs, limit=80) if FIRESTORE_ENABLED else [],
+    }
 
 
 def _build_zip_from_r2(outputs: list[tuple[str, str]], zip_path: Path) -> None:
@@ -1883,6 +2508,7 @@ def _run_renderer(
     log_path: Path,
     job_id: str,
     video_index: int,
+    completed_before: int,
     total_videos: int,
 ) -> tuple[int, str, float]:
     progress_re = re.compile(r"\[(\s*\d+)%\]")
@@ -1910,8 +2536,8 @@ def _run_renderer(
             if match:
                 video_progress = int(match.group(1).strip())
                 _set_video(job_id, video_index, progress=video_progress)
-                overall = int(((video_index + (video_progress / 100.0)) / total_videos) * 100)
-                _set_job(job_id, progress=overall, message=f"Rendering {video_index + 1}/{total_videos}")
+                overall = int(((completed_before + (video_progress / 100.0)) / total_videos) * 100)
+                _set_job(job_id, progress=overall, message=f"Rendering {completed_before + 1}/{total_videos}")
 
         return_code = process.wait()
 
@@ -1944,32 +2570,55 @@ def _process_job(job_id: str) -> None:
 
     source_gpx = inputs_dir / job["gpx_name"]
     shifted_gpx = work_dir / "track-shifted.gpx"
-    try:
-        shift_gpx_timestamps(
-            source_gpx,
-            shifted_gpx,
-            float(job["settings"]["gpx_offset_seconds"]),
-            speed_unit=str(job["settings"].get("gpx_speed_unit", "auto")),
-        )
-    except Exception as exc:  # noqa: BLE001
+    if source_gpx.exists():
+        try:
+            shift_gpx_timestamps(
+                source_gpx,
+                shifted_gpx,
+                float(job["settings"]["gpx_offset_seconds"]),
+                speed_unit=str(job["settings"].get("gpx_speed_unit", "auto")),
+            )
+        except Exception as exc:  # noqa: BLE001
+            _set_job(
+                job_id,
+                status="failed",
+                progress=100,
+                finished_at=_utc_now(),
+                message=f"GPX preparation failed: {exc}",
+            )
+            return
+    elif not shifted_gpx.exists():
         _set_job(
             job_id,
             status="failed",
             progress=100,
             finished_at=_utc_now(),
-            message=f"GPX preparation failed: {exc}",
+            message="GPX preparation failed: source GPX is missing",
         )
         return
 
-    if DELETE_INPUTS_ON_COMPLETE:
-        _safe_unlink(source_gpx)
-
     total_videos = len(job["videos"])
+    resumable_completed = 0
+    pending_video_indexes: list[int] = []
+    for index, video in enumerate(job["videos"]):
+        status = str(video.get("status") or "")
+        output_name = str(video.get("output_name") or "")
+        has_output = bool(video.get("r2_object_key") or (output_name and (outputs_dir / output_name).exists()))
+        if status == "completed" and has_output:
+            resumable_completed += 1
+            continue
+        pending_video_indexes.append(index)
+
     failed_count = 0
     owner_uid = str(job.get("uid") or "")
     first_failure_reason: str | None = None
 
-    for index, video_state in enumerate(job["videos"]):
+    if total_videos > 0 and resumable_completed > 0:
+        baseline = int((resumable_completed / total_videos) * 100)
+        _set_job(job_id, progress=max(1, baseline), message=f"Resuming ({resumable_completed}/{total_videos} completed)")
+
+    for pending_position, index in enumerate(pending_video_indexes):
+        video_state = job["videos"][index]
         input_name = video_state["input_name"]
         input_path = inputs_dir / input_name
 
@@ -2029,7 +2678,14 @@ def _process_job(job_id: str) -> None:
                     render_profile=profile_id,
                     overlay_size=overlay_size,
                 )
-                return_code, last_line, elapsed_seconds = _run_renderer(command, log_path, job_id, index, total_videos)
+                return_code, last_line, elapsed_seconds = _run_renderer(
+                    command,
+                    log_path,
+                    job_id,
+                    index,
+                    resumable_completed + pending_position,
+                    total_videos,
+                )
                 render_elapsed_seconds += elapsed_seconds
                 normalized_last_line = _normalize_console_line(last_line).lower()
                 if (
@@ -2051,7 +2707,14 @@ def _process_job(job_id: str) -> None:
                         speed_units=str(job["settings"].get("speed_units", "kph")),
                     )
                     layout_path.write_text(fallback_layout, encoding="utf-8")
-                    return_code, last_line, elapsed_seconds = _run_renderer(command, log_path, job_id, index, total_videos)
+                    return_code, last_line, elapsed_seconds = _run_renderer(
+                        command,
+                        log_path,
+                        job_id,
+                        index,
+                        resumable_completed + pending_position,
+                        total_videos,
+                    )
                     render_elapsed_seconds += elapsed_seconds
                     normalized_last_line = _normalize_console_line(last_line).lower()
 
@@ -2209,9 +2872,6 @@ def _process_job(job_id: str) -> None:
                 error=str(exc),
                 detail="Render/upload failed",
             )
-        finally:
-            if DELETE_INPUTS_ON_COMPLETE:
-                _safe_unlink(input_path)
 
     if failed_count == 0:
         _set_job(job_id, status="completed", progress=100, finished_at=_utc_now(), message="All videos rendered")
@@ -2277,12 +2937,87 @@ def get_user_settings(uid: str = Depends(_require_user_uid)) -> dict[str, Any]:
     }
 
 
+@app.get("/api/user/access")
+def get_user_access(uid: str = Depends(_require_user_uid)) -> dict[str, Any]:
+    return {
+        "uid": uid,
+        "admin_configured": bool(ADMIN_UIDS),
+        "is_admin": _is_uid_admin(uid),
+    }
+
+
 @app.put("/api/user/settings")
 def update_user_settings(payload: UserSettingsUpdate, uid: str = Depends(_require_user_uid)) -> dict[str, Any]:
     profile = _update_user_notification_preference(uid, notifications_enabled=payload.notifications_enabled)
     return {
         "uid": uid,
         "notifications_enabled": bool(profile.get("notifications_enabled", True)),
+    }
+
+
+@app.get("/api/admin/ops/overview")
+def admin_ops_overview(_uid: str = Depends(_require_admin_uid)) -> dict[str, Any]:
+    _require_durable_pipeline_enabled()
+    return _admin_overview_payload()
+
+
+@app.post("/api/admin/ops/reconcile")
+def admin_ops_reconcile(_uid: str = Depends(_require_admin_uid)) -> dict[str, Any]:
+    _require_durable_pipeline_enabled()
+    try:
+        summary = _reconcile_pending_jobs_once(startup=False)
+        return {"ok": True, "summary": summary, "queue": _queue_snapshot()}
+    except Exception as exc:  # noqa: BLE001
+        _ops_increment("reconcile_errors_total")
+        raise HTTPException(status_code=500, detail=f"Reconcile failed: {exc}") from exc
+
+
+@app.post("/api/admin/ops/cleanup")
+def admin_ops_cleanup(payload: AdminCleanupRequest, _uid: str = Depends(_require_admin_uid)) -> dict[str, Any]:
+    _require_durable_pipeline_enabled()
+    try:
+        summary = _run_cleanup_cycle(
+            include_database=payload.include_database,
+            force_database=payload.force_database,
+        )
+        return {"ok": True, "summary": summary}
+    except Exception as exc:  # noqa: BLE001
+        _ops_increment("cleanup_errors_total")
+        raise HTTPException(status_code=500, detail=f"Cleanup failed: {exc}") from exc
+
+
+@app.post("/api/admin/jobs/{job_id}/requeue")
+def admin_requeue_job(
+    job_id: str,
+    payload: AdminRequeueRequest,
+    _uid: str = Depends(_require_admin_uid),
+) -> dict[str, Any]:
+    _require_durable_pipeline_enabled()
+    job = _get_job(job_id)
+    updated = _prepare_job_for_admin_requeue(job, reset_failed_videos=payload.reset_failed_videos)
+    _enqueue_job(job_id)
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "status": str(updated.get("status") or "queued"),
+        "message": str(updated.get("message") or ""),
+    }
+
+
+@app.post("/api/admin/jobs/{job_id}/cancel")
+def admin_cancel_job(
+    job_id: str,
+    payload: AdminCancelRequest,
+    _uid: str = Depends(_require_admin_uid),
+) -> dict[str, Any]:
+    _require_durable_pipeline_enabled()
+    job = _get_job(job_id)
+    updated = _cancel_job_for_admin(job, reason=payload.reason)
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "status": str(updated.get("status") or ""),
+        "message": str(updated.get("message") or ""),
     }
 
 

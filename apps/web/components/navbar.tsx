@@ -7,7 +7,7 @@ import { ThemeToggle } from "./theme-toggle";
 import { useAuth } from "@/components/auth-provider";
 
 export function Navbar() {
-  const { account, signOut } = useAuth();
+  const { account, isAdmin, signOut } = useAuth();
   const pathname = usePathname();
   const initials = (account?.displayName ?? account?.email ?? "P").trim().charAt(0).toUpperCase();
 
@@ -42,6 +42,11 @@ export function Navbar() {
               <Link href="/settings" className={navLinkClass("/settings")}>
                 Settings
               </Link>
+              {isAdmin && (
+                <Link href="/admin" className={navLinkClass("/admin")}>
+                  Admin
+                </Link>
+              )}
             </>
           )}
           {account && (

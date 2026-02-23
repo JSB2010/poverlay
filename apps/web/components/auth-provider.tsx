@@ -23,6 +23,8 @@ import {
   getFirebaseAuth,
   isFirebaseAuthEnabled,
 } from "@/lib/auth/firebase-client";
+import { apiUrl } from "@/lib/api-base";
+import { PUBLIC_WEB_CONFIG } from "@/lib/public-config";
 
 type AuthAccount = {
   uid: string;
@@ -34,8 +36,12 @@ type AuthAccount = {
 type AuthContextValue = {
   isEnabled: boolean;
   isLoading: boolean;
+  isAccessLoading: boolean;
   account: AuthAccount | null;
+  isAdmin: boolean;
+  adminConfigured: boolean;
   getIdToken: (forceRefresh?: boolean) => Promise<string | null>;
+  refreshAccess: () => Promise<void>;
   signInWithPassword: (email: string, password: string) => Promise<void>;
   signUpWithPassword: (email: string, password: string) => Promise<void>;
   signOut: () => Promise<void>;
@@ -44,6 +50,28 @@ type AuthContextValue = {
 };
 
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
+const CONFIGURED_API_BASE = PUBLIC_WEB_CONFIG.apiBase;
+
+type UserAccessResponse = {
+  is_admin?: boolean;
+  admin_configured?: boolean;
+};
+
+function buildApiUrl(path: string): string {
+  return apiUrl(path, CONFIGURED_API_BASE);
+}
+
+async function readApiPayload(response: Response): Promise<unknown> {
+  const contentType = response.headers.get("content-type") ?? "";
+  if (contentType.includes("application/json")) {
+    try {
+      return await response.json();
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
 
 function mapUser(user: User): AuthAccount {
   return {
@@ -57,12 +85,18 @@ function mapUser(user: User): AuthAccount {
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [account, setAccount] = useState<AuthAccount | null>(null);
   const [isLoading, setIsLoading] = useState(true);
+  const [isAccessLoading, setIsAccessLoading] = useState(false);
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [adminConfigured, setAdminConfigured] = useState(false);
   const isEnabled = isFirebaseAuthEnabled();
 
   useEffect(() => {
     if (!isEnabled) {
       setAccount(null);
       setIsLoading(false);
+      setIsAccessLoading(false);
+      setIsAdmin(false);
+      setAdminConfigured(false);
       return;
     }
 
@@ -74,6 +108,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const unsubscribe = onAuthStateChanged(auth, (user) => {
       setAccount(user ? mapUser(user) : null);
       setIsLoading(false);
+      if (!user) {
+        setIsAccessLoading(false);
+        setIsAdmin(false);
+        setAdminConfigured(false);
+      }
     });
 
     return unsubscribe;
@@ -89,6 +128,57 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
     return auth.currentUser.getIdToken(forceRefresh);
   }, [isEnabled]);
+
+  const refreshAccess = useCallback(async (): Promise<void> => {
+    if (!isEnabled) {
+      setIsAccessLoading(false);
+      setIsAdmin(false);
+      setAdminConfigured(false);
+      return;
+    }
+
+    const auth = getFirebaseAuth();
+    const user = auth.currentUser;
+    if (!user) {
+      setIsAccessLoading(false);
+      setIsAdmin(false);
+      setAdminConfigured(false);
+      return;
+    }
+
+    setIsAccessLoading(true);
+    try {
+      const token = await user.getIdToken();
+      const response = await fetch(buildApiUrl("/api/user/access"), {
+        headers: { Authorization: `Bearer ${token}` },
+        cache: "no-store",
+      });
+      const payload = (await readApiPayload(response)) as UserAccessResponse | null;
+      if (!response.ok) {
+        setIsAdmin(false);
+        setAdminConfigured(false);
+        return;
+      }
+
+      setIsAdmin(Boolean(payload?.is_admin));
+      setAdminConfigured(Boolean(payload?.admin_configured));
+    } catch {
+      setIsAdmin(false);
+      setAdminConfigured(false);
+    } finally {
+      setIsAccessLoading(false);
+    }
+  }, [isEnabled]);
+
+  useEffect(() => {
+    if (!account?.uid || !isEnabled) {
+      setIsAccessLoading(false);
+      setIsAdmin(false);
+      setAdminConfigured(false);
+      return;
+    }
+    void refreshAccess();
+  }, [account?.uid, isEnabled, refreshAccess]);
 
   const signInWithPassword = useCallback(async (email: string, password: string): Promise<void> => {
     if (!isEnabled) {
@@ -153,8 +243,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     () => ({
       isEnabled,
       isLoading,
+      isAccessLoading,
       account,
+      isAdmin,
+      adminConfigured,
       getIdToken,
+      refreshAccess,
       signInWithPassword,
       signUpWithPassword,
       signOut,
@@ -163,9 +257,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }),
     [
       account,
+      adminConfigured,
       getIdToken,
       isEnabled,
+      isAccessLoading,
+      isAdmin,
       isLoading,
+      refreshAccess,
       sendPasswordReset,
       signInWithPassword,
       signOut,

@@ -69,6 +69,12 @@ def _read_cors_origins() -> tuple[str, ...]:
     return origins
 
 
+def _read_csv(name: str) -> tuple[str, ...]:
+    raw = os.environ.get(name, "")
+    values = tuple(part.strip() for part in raw.split(",") if part.strip())
+    return values
+
+
 @dataclass(frozen=True)
 class FirebaseConfig:
     auth_enabled: bool
@@ -125,9 +131,16 @@ class ApiRuntimeConfig:
     ffprobe_bin: str
     overlay_font_path: str
     cors_origins: tuple[str, ...]
+    admin_uids: tuple[str, ...]
     job_cleanup_enabled: bool
     job_cleanup_interval_seconds: int
+    job_recovery_interval_seconds: int
+    job_queue_worker_count: int
     job_output_retention_hours: float
+    job_database_cleanup_enabled: bool
+    job_database_cleanup_interval_seconds: int
+    job_database_retention_days: float
+    ffmpeg_threads_per_render: int
     delete_inputs_on_complete: bool
     delete_work_on_complete: bool
     api_base_url: str
@@ -204,15 +217,30 @@ def load_runtime_config(*, repo_root: Path, service_root: Path) -> ApiRuntimeCon
         template_render_complete_id=_read_optional("BREVO_TEMPLATE_RENDER_COMPLETE_ID"),
     )
 
+    cpu_count = max(os.cpu_count() or 1, 1)
+    if cpu_count >= 24:
+        default_worker_count = 3
+    elif cpu_count >= 12:
+        default_worker_count = 2
+    else:
+        default_worker_count = 1
+
     config = ApiRuntimeConfig(
         data_dir=data_dir,
         gopro_dashboard_bin=_read_optional("GOPRO_DASHBOARD_BIN") or str(dashboard_default),
         ffprobe_bin=_read_optional("FFPROBE_BIN") or "ffprobe",
         overlay_font_path=_read_optional("OVERLAY_FONT_PATH") or str(service_root / "app" / "static" / "fonts" / "Orbitron-Bold.ttf"),
         cors_origins=_read_cors_origins(),
+        admin_uids=_read_csv("ADMIN_UIDS"),
         job_cleanup_enabled=_read_bool("JOB_CLEANUP_ENABLED", True),
         job_cleanup_interval_seconds=_read_int("JOB_CLEANUP_INTERVAL_SECONDS", 900, 60),
+        job_recovery_interval_seconds=_read_int("JOB_RECOVERY_INTERVAL_SECONDS", 45, 15),
+        job_queue_worker_count=_read_int("JOB_QUEUE_WORKER_COUNT", default_worker_count, 0),
         job_output_retention_hours=_read_float("JOB_OUTPUT_RETENTION_HOURS", 24.0, 1.0),
+        job_database_cleanup_enabled=_read_bool("JOB_DATABASE_CLEANUP_ENABLED", True),
+        job_database_cleanup_interval_seconds=_read_int("JOB_DATABASE_CLEANUP_INTERVAL_SECONDS", 3600, 300),
+        job_database_retention_days=_read_float("JOB_DATABASE_RETENTION_DAYS", 30.0, 1.0),
+        ffmpeg_threads_per_render=_read_int("FFMPEG_THREADS_PER_RENDER", 0, 0),
         delete_inputs_on_complete=_read_bool("DELETE_INPUTS_ON_COMPLETE", True),
         delete_work_on_complete=_read_bool("DELETE_WORK_ON_COMPLETE", True),
         api_base_url=_read_optional("API_BASE_URL") or "http://127.0.0.1:8787",

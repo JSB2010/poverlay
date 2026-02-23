@@ -87,7 +87,7 @@ cp .env.example .env
 
 The root template includes:
 
-- App URLs/runtime: `WEB_BASE_URL`, `API_BASE_URL`, `NEXT_PUBLIC_SITE_URL`, CORS + job cleanup settings
+- App URLs/runtime: `WEB_BASE_URL`, `API_BASE_URL`, `NEXT_PUBLIC_SITE_URL`, CORS + admin/queue/cleanup controls (`ADMIN_UIDS`, `JOB_QUEUE_WORKER_COUNT`, `JOB_RECOVERY_INTERVAL_SECONDS`, `FFMPEG_THREADS_PER_RENDER`, `JOB_DATABASE_*`)
 - Firebase: client SDK keys + admin credentials (`FIREBASE_*`, `NEXT_PUBLIC_FIREBASE_*`)
 - Firestore: project/database/collection names (`FIRESTORE_*`)
 - Cloudflare R2: account/bucket/credentials (`R2_*`)
@@ -114,9 +114,14 @@ Use `./scripts/run.sh`, `./scripts/run-web.sh`, or `./scripts/run-api.sh` so roo
 
 - Web auth persistence uses Firebase `browserLocalPersistence`, so sessions survive page reloads and browser restarts until explicit sign-out.
 - API auth expects `Authorization: Bearer <Firebase ID token>` and verifies tokens with revocation checks.
-- Job state is persisted in Firestore and the API recovers `queued`/`running` jobs at startup.
+- Job state is persisted in Firestore and the API recovers `queued`/`running` jobs at startup and on a periodic reconciliation loop.
+- Queue workers are configurable via `JOB_QUEUE_WORKER_COUNT` (`0` = auto-size by CPU); ffmpeg thread budget per render is controlled with `FFMPEG_THREADS_PER_RENDER`.
 - Completed outputs are uploaded to R2 before local artifacts are deleted; job metadata records `local_artifacts_deleted_at` after cleanup.
 - Background cleanup removes expired job directories using `JOB_OUTPUT_RETENTION_HOURS` and `JOB_CLEANUP_INTERVAL_SECONDS`.
+- Optional Firestore retention cleanup removes old terminal job metadata using `JOB_DATABASE_CLEANUP_ENABLED`, `JOB_DATABASE_CLEANUP_INTERVAL_SECONDS`, and `JOB_DATABASE_RETENTION_DAYS`.
+- Admin operations endpoints (`/api/admin/*`) require Firebase auth plus `ADMIN_UIDS` allow-list membership.
+- The web admin operations dashboard is available at `/admin` for authenticated allow-listed admins.
+- Admin queue controls now include manual reconcile/cleanup, job requeue, and queued-job cancellation.
 
 ## Operator smoke checks
 
