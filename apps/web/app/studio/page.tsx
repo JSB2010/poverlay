@@ -84,6 +84,26 @@ type UploadProgressState = {
   etaSeconds: number | null;
 };
 
+type LocalVideoProbe = {
+  key: string;
+  name: string;
+  size: number;
+  lastModified: number;
+  width: number | null;
+  height: number | null;
+  durationSeconds: number | null;
+  fps: number | null;
+};
+
+type RenderEtaEstimate = {
+  totalSeconds: number;
+  remainingSeconds: number;
+  totalDurationSeconds: number;
+  clipCount: number;
+  profileUsage: Record<string, number>;
+  fallbackAssumptions: string[];
+};
+
 type SubmissionStage = "idle" | "uploading" | "queued" | "rendering" | "completed" | "failed";
 
 type PipelineStepState = "pending" | "active" | "done" | "error";
@@ -285,6 +305,52 @@ const DEFAULT_FORM_STATE: FormState = {
   fixed_fps: "30",
 };
 
+const ETA_REFERENCE_FPS = 30;
+const ETA_DEFAULT_WIDTH = 1920;
+const ETA_DEFAULT_HEIGHT = 1080;
+const ETA_DEFAULT_DURATION_SECONDS = 30;
+const ETA_JOB_OVERHEAD_SECONDS = 14;
+const ETA_CLIP_OVERHEAD_SECONDS = 4;
+const ETA_MAPS_ENABLED_MULTIPLIER = 1.05;
+
+const ETA_PROFILE_REALTIME_POINTS: Record<string, Array<{ megaPixels: number; xRealtime: number }>> = {
+  "h264-fast": [
+    { megaPixels: 0.92, xRealtime: 0.839 },
+    { megaPixels: 2.07, xRealtime: 1.182 },
+    { megaPixels: 4.11, xRealtime: 2.14 },
+    { megaPixels: 8.29, xRealtime: 3.518 },
+    { megaPixels: 15.87, xRealtime: 10.776 },
+  ],
+  "h264-source": [
+    { megaPixels: 0.92, xRealtime: 0.933 },
+    { megaPixels: 2.07, xRealtime: 1.231 },
+    { megaPixels: 4.11, xRealtime: 2.241 },
+    { megaPixels: 8.29, xRealtime: 3.79 },
+    { megaPixels: 15.87, xRealtime: 11.402 },
+  ],
+  "h264-4k-compat": [
+    { megaPixels: 0.92, xRealtime: 0.867 },
+    { megaPixels: 2.07, xRealtime: 1.272 },
+    { megaPixels: 4.11, xRealtime: 2.516 },
+    { megaPixels: 8.29, xRealtime: 3.698 },
+    { megaPixels: 15.87, xRealtime: 11.209 },
+  ],
+  "qt-hevc-balanced": [
+    { megaPixels: 0.9, xRealtime: 0.75 },
+    { megaPixels: 2.1, xRealtime: 1.25 },
+    { megaPixels: 4.1, xRealtime: 2.3 },
+    { megaPixels: 8.3, xRealtime: 4.4 },
+    { megaPixels: 15.9, xRealtime: 8.1 },
+  ],
+  "qt-hevc-high": [
+    { megaPixels: 0.9, xRealtime: 0.95 },
+    { megaPixels: 2.1, xRealtime: 1.6 },
+    { megaPixels: 4.1, xRealtime: 3.0 },
+    { megaPixels: 8.3, xRealtime: 5.8 },
+    { megaPixels: 15.9, xRealtime: 10.6 },
+  ],
+};
+
 function buildApiUrl(path: string): string {
   return apiUrl(path, CONFIGURED_API_BASE);
 }
@@ -427,6 +493,192 @@ function formatRate(bytesPerSecond: number): string {
   return `${formatBytes(bytesPerSecond)}/s`;
 }
 
+function localVideoProbeKey(file: File): string {
+  return `${file.name}:${file.size}:${file.lastModified}`;
+}
+
+function parseFpsValue(value: string | number | null | undefined): number | null {
+  if (typeof value === "number") {
+    return Number.isFinite(value) && value > 0 ? value : null;
+  }
+
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  if (trimmed.includes("/")) {
+    const [left, right] = trimmed.split("/", 2);
+    const numerator = Number(left);
+    const denominator = Number(right);
+    if (!Number.isFinite(numerator) || !Number.isFinite(denominator) || denominator === 0) {
+      return null;
+    }
+    const fps = numerator / denominator;
+    return Number.isFinite(fps) && fps > 0 ? fps : null;
+  }
+
+  const fps = Number(trimmed);
+  return Number.isFinite(fps) && fps > 0 ? fps : null;
+}
+
+function parseResolutionValue(value: string | null | undefined): { width: number; height: number } | null {
+  if (!value) {
+    return null;
+  }
+
+  const match = value.match(/(\d+)\s*x\s*(\d+)/i);
+  if (!match) {
+    return null;
+  }
+
+  const width = Number(match[1]);
+  const height = Number(match[2]);
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    return null;
+  }
+
+  return { width, height };
+}
+
+function estimateAutoProfileForClip(
+  width: number,
+  height: number,
+  availableProfiles: Set<string>,
+): string {
+  const highResolution = width > 3840 || height > 2160;
+  const highResolutionOrder = ["qt-hevc-balanced", "h264-4k-compat", "h264-source", "h264-fast"];
+  const standardOrder = ["h264-source", "qt-hevc-balanced", "h264-fast"];
+  const candidates = highResolution ? highResolutionOrder : standardOrder;
+
+  for (const profileId of candidates) {
+    if (availableProfiles.has(profileId)) {
+      return profileId;
+    }
+  }
+
+  return "h264-source";
+}
+
+function interpolateRealtimeFactor(points: Array<{ megaPixels: number; xRealtime: number }>, megaPixels: number): number {
+  if (points.length === 0) {
+    return 1;
+  }
+  if (megaPixels <= points[0].megaPixels) {
+    return points[0].xRealtime;
+  }
+
+  for (let index = 1; index < points.length; index += 1) {
+    const previous = points[index - 1];
+    const current = points[index];
+    if (megaPixels <= current.megaPixels) {
+      const span = current.megaPixels - previous.megaPixels;
+      if (span <= 0) {
+        return current.xRealtime;
+      }
+      const ratio = (megaPixels - previous.megaPixels) / span;
+      return previous.xRealtime + ratio * (current.xRealtime - previous.xRealtime);
+    }
+  }
+
+  const tail = points[points.length - 1];
+  const beforeTail = points[points.length - 2] ?? tail;
+  const span = Math.max(tail.megaPixels - beforeTail.megaPixels, 0.0001);
+  const slope = (tail.xRealtime - beforeTail.xRealtime) / span;
+  return Math.max(0.25, tail.xRealtime + (megaPixels - tail.megaPixels) * slope);
+}
+
+type ClipEstimateInput = {
+  width: number;
+  height: number;
+  durationSeconds: number;
+  sourceFps: number | null;
+  profileId: string;
+  fixedFps: number | null;
+  fpsMode: FormState["fps_mode"];
+  mapsEnabled: boolean;
+};
+
+function estimateClipRenderSeconds(input: ClipEstimateInput): number {
+  const sourceMegaPixels = Math.max((input.width * input.height) / 1_000_000, 0.25);
+  const points =
+    ETA_PROFILE_REALTIME_POINTS[input.profileId] ??
+    ETA_PROFILE_REALTIME_POINTS["h264-source"] ??
+    [{ megaPixels: 2.1, xRealtime: 1.3 }];
+  const baseXRealtime = interpolateRealtimeFactor(points, sourceMegaPixels);
+
+  const sourceFps = input.sourceFps && input.sourceFps > 0 ? input.sourceFps : ETA_REFERENCE_FPS;
+  const targetFps =
+    input.fpsMode === "fixed"
+      ? Math.max(input.fixedFps && Number.isFinite(input.fixedFps) ? input.fixedFps : ETA_REFERENCE_FPS, 1)
+      : input.fpsMode === "source_rounded"
+        ? Math.max(Math.round(sourceFps), 1)
+        : sourceFps;
+  let fpsMultiplier = 1;
+  if (input.fpsMode === "source_rounded") {
+    fpsMultiplier = 0.91;
+  } else if (input.fpsMode === "fixed") {
+    if (targetFps <= 30) {
+      fpsMultiplier = Math.max(0.45, 0.32 + 0.02 * targetFps);
+    } else {
+      fpsMultiplier = 0.92 + (targetFps - 30) * 0.028;
+    }
+  }
+  const mapsMultiplier = input.mapsEnabled ? ETA_MAPS_ENABLED_MULTIPLIER : 1;
+
+  return input.durationSeconds * baseXRealtime * fpsMultiplier * mapsMultiplier + ETA_CLIP_OVERHEAD_SECONDS;
+}
+
+async function probeLocalVideo(file: File): Promise<LocalVideoProbe> {
+  const fallback: LocalVideoProbe = {
+    key: localVideoProbeKey(file),
+    name: file.name,
+    size: file.size,
+    lastModified: file.lastModified,
+    width: null,
+    height: null,
+    durationSeconds: null,
+    fps: null,
+  };
+
+  const objectUrl = URL.createObjectURL(file);
+  const element = document.createElement("video");
+  element.preload = "metadata";
+  element.muted = true;
+  element.playsInline = true;
+  element.src = objectUrl;
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const onLoaded = () => resolve();
+      const onError = () => reject(new Error("Failed to load local video metadata"));
+      element.addEventListener("loadedmetadata", onLoaded, { once: true });
+      element.addEventListener("error", onError, { once: true });
+    });
+
+    const width = element.videoWidth > 0 ? element.videoWidth : null;
+    const height = element.videoHeight > 0 ? element.videoHeight : null;
+    const durationSeconds = Number.isFinite(element.duration) && element.duration > 0 ? element.duration : null;
+
+    return {
+      ...fallback,
+      width,
+      height,
+      durationSeconds,
+      fps: null,
+    };
+  } catch {
+    return fallback;
+  } finally {
+    element.src = "";
+    URL.revokeObjectURL(objectUrl);
+  }
+}
+
 function pipelineStepTone(state: PipelineStepState): string {
   if (state === "done") {
     return "border-emerald-400/60 bg-emerald-500/10 text-emerald-700";
@@ -544,6 +796,7 @@ export default function HomePage() {
 
   const [gpxFile, setGpxFile] = useState<File | null>(null);
   const [videoFiles, setVideoFiles] = useState<File[]>([]);
+  const [localVideoProbesByKey, setLocalVideoProbesByKey] = useState<Record<string, LocalVideoProbe>>({});
   const [job, setJob] = useState<JobStatus | null>(null);
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -652,6 +905,35 @@ export default function HomePage() {
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
+
+    if (videoFiles.length === 0) {
+      setLocalVideoProbesByKey({});
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    async function loadLocalVideoProbes() {
+      const probes = await Promise.all(videoFiles.map((file) => probeLocalVideo(file)));
+      if (cancelled) {
+        return;
+      }
+      const byKey: Record<string, LocalVideoProbe> = {};
+      for (const probe of probes) {
+        byKey[probe.key] = probe;
+      }
+      setLocalVideoProbesByKey(byKey);
+    }
+
+    void loadLocalVideoProbes();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [videoFiles]);
+
+  useEffect(() => {
     let ignore = false;
 
     async function loadLayoutPreviewManifest() {
@@ -724,6 +1006,90 @@ export default function HomePage() {
     () => (gpxFile?.size ?? 0) + videoFiles.reduce((sum, video) => sum + video.size, 0),
     [gpxFile, videoFiles],
   );
+  const renderEtaEstimate = useMemo((): RenderEtaEstimate | null => {
+    if (videoFiles.length === 0) {
+      return null;
+    }
+
+    const availableProfiles = new Set(renderProfiles.map((profile) => profile.id));
+    const fixedFpsValue = parseFpsValue(formState.fixed_fps);
+    const localProbeByName = new Map<string, LocalVideoProbe>();
+    for (const file of videoFiles) {
+      const probe = localVideoProbesByKey[localVideoProbeKey(file)];
+      if (probe) {
+        localProbeByName.set(file.name, probe);
+      }
+    }
+
+    const clipNames = (job?.videos ?? []).length > 0 ? (job?.videos ?? []).map((video) => video.input_name) : videoFiles.map((file) => file.name);
+    const fallbackAssumptions: string[] = [];
+    let totalDurationSeconds = 0;
+    let totalRenderSeconds = ETA_JOB_OVERHEAD_SECONDS;
+    const profileUsage: Record<string, number> = {};
+
+    for (const clipName of clipNames) {
+      const jobVideo = (job?.videos ?? []).find((video) => video.input_name === clipName);
+      const probe = localProbeByName.get(clipName);
+
+      const parsedResolution = parseResolutionValue(jobVideo?.source_resolution ?? null);
+      const width = parsedResolution?.width ?? probe?.width ?? ETA_DEFAULT_WIDTH;
+      const height = parsedResolution?.height ?? probe?.height ?? ETA_DEFAULT_HEIGHT;
+      if (!parsedResolution && !probe?.width) {
+        fallbackAssumptions.push("resolution");
+      }
+
+      const durationSeconds = Math.max(probe?.durationSeconds ?? ETA_DEFAULT_DURATION_SECONDS, 1);
+      if (!probe?.durationSeconds) {
+        fallbackAssumptions.push("duration");
+      }
+
+      const sourceFps = parseFpsValue(jobVideo?.source_fps ?? null) ?? probe?.fps ?? null;
+      if (sourceFps === null && formState.fps_mode !== "fixed") {
+        fallbackAssumptions.push("fps");
+      }
+
+      const selectedProfileId =
+        formState.render_profile === "auto"
+          ? estimateAutoProfileForClip(width, height, availableProfiles)
+          : formState.render_profile;
+      profileUsage[selectedProfileId] = (profileUsage[selectedProfileId] ?? 0) + 1;
+
+      totalDurationSeconds += durationSeconds;
+      totalRenderSeconds += estimateClipRenderSeconds({
+        width,
+        height,
+        durationSeconds,
+        sourceFps,
+        profileId: selectedProfileId,
+        fixedFps: fixedFpsValue,
+        fpsMode: formState.fps_mode,
+        mapsEnabled,
+      });
+    }
+
+    const currentProgress = submissionStage === "rendering" ? clampPercent(job?.progress ?? 0) / 100 : submissionStage === "completed" ? 1 : 0;
+    const remainingSeconds = Math.max(totalRenderSeconds * (1 - currentProgress), 0);
+
+    return {
+      totalSeconds: totalRenderSeconds,
+      remainingSeconds,
+      totalDurationSeconds,
+      clipCount: clipNames.length,
+      profileUsage,
+      fallbackAssumptions: Array.from(new Set(fallbackAssumptions)),
+    };
+  }, [
+    formState.fixed_fps,
+    formState.fps_mode,
+    formState.render_profile,
+    job?.progress,
+    job?.videos,
+    localVideoProbesByKey,
+    mapsEnabled,
+    renderProfiles,
+    submissionStage,
+    videoFiles,
+  ]);
   const videoStatusSummary = useMemo(() => {
     const summary = {
       total: job?.videos.length ?? 0,
@@ -844,6 +1210,16 @@ export default function HomePage() {
           { label: "Running", value: `${videoStatusSummary.running}` },
           { label: "Completed", value: `${videoStatusSummary.completed}` },
           { label: "Failed", value: `${videoStatusSummary.failed}` },
+          { label: "Est. total", value: renderEtaEstimate ? `~${formatEta(renderEtaEstimate.totalSeconds)}` : "--" },
+          {
+            label: "Est. remaining",
+            value:
+              submissionStage === "rendering" && renderEtaEstimate
+                ? `~${formatEta(renderEtaEstimate.remainingSeconds)}`
+                : renderEtaEstimate
+                  ? `~${formatEta(renderEtaEstimate.totalSeconds)}`
+                  : "--",
+          },
           { label: "Active clip", value: runningClipNames[0] ?? "--" },
         ] satisfies PipelineStepMetric[],
       },
@@ -878,6 +1254,7 @@ export default function HomePage() {
     job?.status,
     job?.videos,
     lastStatusUpdateAt,
+    renderEtaEstimate,
     runningClipNames,
     selectedUploadBytes,
     submissionStage,
@@ -1272,6 +1649,17 @@ export default function HomePage() {
                     {selectedUploadBytes > 0 ? formatBytes(selectedUploadBytes) : "No files selected"}
                   </span>
                 </p>
+                <p className="mt-1 text-sm font-medium">
+                  Render ETA:{" "}
+                  <span className="text-[var(--color-primary)]">
+                    {renderEtaEstimate ? `~${formatEta(renderEtaEstimate.totalSeconds)}` : "Select clips to estimate"}
+                  </span>
+                </p>
+                {renderEtaEstimate && renderEtaEstimate.fallbackAssumptions.length > 0 && (
+                  <p className="mt-1 text-xs text-[var(--color-muted-foreground)]">
+                    Using fallback assumptions for {renderEtaEstimate.fallbackAssumptions.join(", ")}.
+                  </p>
+                )}
                 <p className="mt-1 text-xs text-[var(--color-muted-foreground)]">
                   Keep this tab open through upload completion. Rendering continues server-side after upload.
                 </p>
@@ -1764,6 +2152,16 @@ export default function HomePage() {
                   <p className="text-[var(--color-muted-foreground)]">Clips</p>
                   <p className="text-sm font-semibold">
                     {videoStatusSummary.completed}/{videoStatusSummary.total} complete
+                  </p>
+                </div>
+                <div className="rounded-lg border border-[var(--color-border)] bg-[var(--color-background)]/70 px-3 py-2">
+                  <p className="text-[var(--color-muted-foreground)]">Est. render time</p>
+                  <p className="text-sm font-semibold">
+                    {renderEtaEstimate
+                      ? submissionStage === "rendering"
+                        ? `~${formatEta(renderEtaEstimate.remainingSeconds)} left`
+                        : `~${formatEta(renderEtaEstimate.totalSeconds)}`
+                      : "--"}
                   </p>
                 </div>
               </div>
