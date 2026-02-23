@@ -109,6 +109,40 @@ def test_invalid_token_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     assert response.status_code == 401
 
 
+def test_overlay_dimensions_for_4k_compat_downscale_high_res() -> None:
+    assert api_main._overlay_dimensions_for_profile({"width": 5312, "height": 2988}, "h264-4k-compat") == (3840, 2160)
+
+
+def test_overlay_dimensions_for_non_compat_profile_keep_source() -> None:
+    assert api_main._overlay_dimensions_for_profile({"width": 5312, "height": 2988}, "h264-source") == (5312, 2988)
+
+
+def test_build_renderer_command_sets_cache_dir_and_overlay_size() -> None:
+    settings = {
+        "font_path": "/tmp/font.ttf",
+        "map_style": "osm",
+        "speed_units": "mph",
+        "altitude_units": "feet",
+        "distance_units": "mile",
+        "temperature_units": "degF",
+        "fps_mode": "source_exact",
+        "fixed_fps": 30.0,
+    }
+    command = api_main._build_renderer_command(
+        gpx_path=Path("/tmp/track.gpx"),
+        video_path=Path("/tmp/input.mp4"),
+        output_path=Path("/tmp/output.mp4"),
+        layout_path=Path("/tmp/layout.xml"),
+        settings=settings,
+        render_profile="h264-4k-compat",
+        overlay_size=(3840, 2160),
+    )
+    assert "--cache-dir" in command
+    assert str(api_main.CONFIG_DIR) in command
+    assert "--overlay-size" in command
+    assert "3840x2160" in command
+
+
 def test_cross_user_job_access_returns_not_found(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

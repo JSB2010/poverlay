@@ -81,6 +81,7 @@ ALLOWED_MAP_STYLES = {
 }
 ALLOWED_FPS_MODES = {"source_exact", "source_rounded", "fixed"}
 AUTO_RENDER_PROFILE = "auto"
+PROFILE_4K_COMPAT_MAX_WIDTH = 3840
 
 RENDER_PROFILE_CATALOG: dict[str, dict[str, Any]] = {
     "qt-hevc-balanced": {
@@ -171,7 +172,7 @@ RENDER_PROFILE_CATALOG: dict[str, dict[str, Any]] = {
         "platforms": {"darwin", "linux", "win32"},
         "ffmpeg": {
             "input": [],
-            "filter": "[0:v][1:v]overlay,scale=min(3840\\,iw):-2:flags=lanczos",
+            "filter": "[0:v]scale=min(3840\\,iw):-2:flags=lanczos[main];[main][1:v]overlay",
             "output": [
                 "-vcodec",
                 "libx264",
@@ -1348,6 +1349,7 @@ def _build_renderer_command(
     layout_path: Path,
     settings: dict[str, Any],
     render_profile: str,
+    overlay_size: tuple[int, int] | None = None,
 ) -> list[str]:
     cmd = [
         GOPRO_DASHBOARD_BIN,
@@ -1374,9 +1376,14 @@ def _build_renderer_command(
         settings["temperature_units"],
         "--config-dir",
         str(CONFIG_DIR),
+        "--cache-dir",
+        str(CONFIG_DIR),
         "--profile",
         render_profile,
     ]
+
+    if overlay_size is not None:
+        cmd.extend(["--overlay-size", f"{overlay_size[0]}x{overlay_size[1]}"])
 
     fps_mode = settings.get("fps_mode", "source_exact")
     if fps_mode == "source_rounded":
@@ -1520,6 +1527,26 @@ def _render_profile_label(profile_id: str) -> str:
     return RENDER_PROFILE_CATALOG.get(profile_id, {}).get("label", profile_id)
 
 
+def _to_even(value: int) -> int:
+    # Keep dimensions encoder-safe (many codecs expect even dimensions).
+    if value < 2:
+        return 2
+    return value if value % 2 == 0 else value - 1
+
+
+def _overlay_dimensions_for_profile(metadata: dict[str, Any], profile_id: str) -> tuple[int, int]:
+    width = int(metadata.get("width") or 0)
+    height = int(metadata.get("height") or 0)
+    if width < 2 or height < 2:
+        return 1920, 1080
+
+    if profile_id != "h264-4k-compat" or width <= PROFILE_4K_COMPAT_MAX_WIDTH:
+        return width, height
+
+    scaled_height = int(round(height * (PROFILE_4K_COMPAT_MAX_WIDTH / float(width))))
+    return _to_even(PROFILE_4K_COMPAT_MAX_WIDTH), _to_even(scaled_height)
+
+
 def _run_renderer(
     cmd: list[str],
     log_path: Path,
@@ -1619,18 +1646,7 @@ def _process_job(job_id: str) -> None:
             metadata = _probe_video(input_path)
             _set_file_mtime_from_creation(input_path, metadata.get("creation_time"))
             selected_profile, profile_candidates = _select_render_profile(metadata, job["settings"]["render_profile"])
-
-            layout_xml = render_layout_xml(
-                metadata["width"],
-                metadata["height"],
-                job["settings"]["overlay_theme"],
-                include_maps=bool(job["settings"]["include_maps"]),
-                layout_style=str(job["settings"].get("layout_style", DEFAULT_LAYOUT_STYLE)),
-                component_visibility=job["settings"].get("component_visibility"),
-                speed_units=str(job["settings"].get("speed_units", "kph")),
-            )
             layout_path = work_dir / f"layout-{index + 1}.xml"
-            layout_path.write_text(layout_xml, encoding="utf-8")
             maps_enabled_for_attempt = bool(job["settings"]["include_maps"])
             map_fallback_used = False
 
@@ -1644,10 +1660,29 @@ def _process_job(job_id: str) -> None:
 
             for profile_idx, profile_id in enumerate(profile_candidates):
                 attempted_profile = profile_id
+                overlay_width, overlay_height = _overlay_dimensions_for_profile(metadata, profile_id)
+                overlay_size: tuple[int, int] | None = None
+                if overlay_width != int(metadata["width"]) or overlay_height != int(metadata["height"]):
+                    overlay_size = (overlay_width, overlay_height)
+
+                layout_xml = render_layout_xml(
+                    overlay_width,
+                    overlay_height,
+                    job["settings"]["overlay_theme"],
+                    include_maps=maps_enabled_for_attempt,
+                    layout_style=str(job["settings"].get("layout_style", DEFAULT_LAYOUT_STYLE)),
+                    component_visibility=job["settings"].get("component_visibility"),
+                    speed_units=str(job["settings"].get("speed_units", "kph")),
+                )
+                layout_path.write_text(layout_xml, encoding="utf-8")
+
                 _set_video(
                     job_id,
                     index,
-                    detail=f"Rendering with {profile_id} ({profile_idx + 1}/{len(profile_candidates)})",
+                    detail=(
+                        f"Rendering with {profile_id} ({profile_idx + 1}/{len(profile_candidates)}) "
+                        f"at {overlay_width}x{overlay_height}"
+                    ),
                     render_profile=profile_id,
                     render_profile_label=_render_profile_label(profile_id),
                 )
@@ -1658,6 +1693,7 @@ def _process_job(job_id: str) -> None:
                     layout_path=layout_path,
                     settings=job["settings"],
                     render_profile=profile_id,
+                    overlay_size=overlay_size,
                 )
                 return_code, last_line = _run_renderer(command, log_path, job_id, index, total_videos)
                 normalized_last_line = _normalize_console_line(last_line).lower()
@@ -1671,8 +1707,8 @@ def _process_job(job_id: str) -> None:
                     maps_enabled_for_attempt = False
                     _set_video(job_id, index, detail="Map rendering failed; retrying without route maps.")
                     fallback_layout = render_layout_xml(
-                        metadata["width"],
-                        metadata["height"],
+                        overlay_width,
+                        overlay_height,
                         job["settings"]["overlay_theme"],
                         include_maps=False,
                         layout_style=str(job["settings"].get("layout_style", DEFAULT_LAYOUT_STYLE)),
