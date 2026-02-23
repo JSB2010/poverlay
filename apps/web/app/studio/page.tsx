@@ -37,6 +37,24 @@ type RenderProfile = {
   is_default?: boolean;
 };
 
+type EtaProfilePoint = {
+  mega_pixels: number;
+  x_realtime: number;
+  sample_count?: number;
+};
+
+type RenderEtaCalibration = {
+  version?: number;
+  generated_at?: string;
+  sample_count?: number;
+  profile_points?: Record<string, EtaProfilePoint[]>;
+  maps_multiplier?: number;
+  source_rounded_multiplier?: number;
+  fixed_multiplier_intercept?: number;
+  fixed_multiplier_slope?: number;
+  fixed_multiplier_min?: number;
+};
+
 type MetaResponse = {
   theme_options?: ThemeOption[];
   layout_styles?: LayoutStyle[];
@@ -46,6 +64,7 @@ type MetaResponse = {
   map_styles?: string[];
   render_profiles?: RenderProfile[];
   default_render_profile?: string;
+  render_eta_calibration?: RenderEtaCalibration;
 };
 
 type LayoutPreviewManifest = {
@@ -64,6 +83,12 @@ type VideoState = {
   source_resolution?: string | null;
   source_fps?: string | null;
   source_duration_seconds?: number | null;
+  output_resolution?: string | null;
+  output_fps?: string | null;
+  output_duration_seconds?: number | null;
+  output_codec?: string | null;
+  render_elapsed_seconds?: number | null;
+  wall_x_realtime?: number | null;
   download_url?: string | null;
   log_name?: string | null;
 };
@@ -505,6 +530,29 @@ function parseIsoTimestamp(value: string | null | undefined): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function clampToRange(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) {
+    return min;
+  }
+  return Math.max(min, Math.min(max, value));
+}
+
+function sanitizedEtaProfilePoints(points: EtaProfilePoint[] | undefined): Array<{ megaPixels: number; xRealtime: number }> | null {
+  if (!points || points.length < 2) {
+    return null;
+  }
+
+  const normalized = points
+    .map((point) => ({
+      megaPixels: Number(point.mega_pixels),
+      xRealtime: Number(point.x_realtime),
+    }))
+    .filter((point) => Number.isFinite(point.megaPixels) && point.megaPixels > 0 && Number.isFinite(point.xRealtime) && point.xRealtime > 0)
+    .sort((left, right) => left.megaPixels - right.megaPixels);
+
+  return normalized.length >= 2 ? normalized : null;
+}
+
 function localVideoProbeKey(file: File): string {
   return `${file.name}:${file.size}:${file.lastModified}`;
 }
@@ -613,11 +661,14 @@ type ClipEstimateInput = {
   fixedFps: number | null;
   fpsMode: FormState["fps_mode"];
   mapsEnabled: boolean;
+  calibration: RenderEtaCalibration | null;
 };
 
 function estimateClipRenderSeconds(input: ClipEstimateInput): number {
   const sourceMegaPixels = Math.max((input.width * input.height) / 1_000_000, 0.25);
+  const calibratedPoints = sanitizedEtaProfilePoints(input.calibration?.profile_points?.[input.profileId]);
   const points =
+    calibratedPoints ??
     ETA_PROFILE_REALTIME_POINTS[input.profileId] ??
     ETA_PROFILE_REALTIME_POINTS["h264-source"] ??
     [{ megaPixels: 2.1, xRealtime: 1.3 }];
@@ -632,15 +683,18 @@ function estimateClipRenderSeconds(input: ClipEstimateInput): number {
         : sourceFps;
   let fpsMultiplier = 1;
   if (input.fpsMode === "source_rounded") {
-    fpsMultiplier = 0.91;
+    fpsMultiplier = clampToRange(input.calibration?.source_rounded_multiplier ?? 0.91, 0.4, 1.4);
   } else if (input.fpsMode === "fixed") {
+    const fixedSlope = clampToRange(input.calibration?.fixed_multiplier_slope ?? 0.02, 0, 0.05);
+    const fixedIntercept = clampToRange(input.calibration?.fixed_multiplier_intercept ?? 0.32, 0.1, 1.4);
+    const fixedMin = clampToRange(input.calibration?.fixed_multiplier_min ?? 0.45, 0.2, 1.0);
     if (targetFps <= 30) {
-      fpsMultiplier = Math.max(0.45, 0.32 + 0.02 * targetFps);
+      fpsMultiplier = Math.max(fixedMin, fixedIntercept + fixedSlope * targetFps);
     } else {
-      fpsMultiplier = 0.92 + (targetFps - 30) * 0.028;
+      fpsMultiplier = (fixedIntercept + fixedSlope * 30) + (targetFps - 30) * 0.028;
     }
   }
-  const mapsMultiplier = input.mapsEnabled ? ETA_MAPS_ENABLED_MULTIPLIER : 1;
+  const mapsMultiplier = input.mapsEnabled ? clampToRange(input.calibration?.maps_multiplier ?? ETA_MAPS_ENABLED_MULTIPLIER, 0.7, 1.5) : 1;
 
   return input.durationSeconds * baseXRealtime * fpsMultiplier * mapsMultiplier + ETA_CLIP_OVERHEAD_SECONDS;
 }
@@ -805,6 +859,7 @@ export default function HomePage() {
   const [componentVisibility, setComponentVisibility] = useState<Record<string, boolean>>(FALLBACK_COMPONENT_VISIBILITY);
   const [mapStyles, setMapStyles] = useState<string[]>(FALLBACK_MAP_STYLES);
   const [renderProfiles, setRenderProfiles] = useState<RenderProfile[]>(FALLBACK_RENDER_PROFILES);
+  const [etaCalibration, setEtaCalibration] = useState<RenderEtaCalibration | null>(null);
 
   const [gpxFile, setGpxFile] = useState<File | null>(null);
   const [videoFiles, setVideoFiles] = useState<File[]>([]);
@@ -868,6 +923,7 @@ export default function HomePage() {
         setComponentOptions(nextComponents);
         setMapStyles(nextMapStyles);
         setRenderProfiles(nextProfiles);
+        setEtaCalibration(meta.render_eta_calibration ?? null);
 
         const defaults = makeDefaultVisibility(nextComponents, meta.default_component_visibility);
         setComponentVisibility(defaults);
@@ -899,6 +955,7 @@ export default function HomePage() {
         setComponentVisibility(FALLBACK_COMPONENT_VISIBILITY);
         setMapStyles(FALLBACK_MAP_STYLES);
         setRenderProfiles(FALLBACK_RENDER_PROFILES);
+        setEtaCalibration(null);
       }
     }
 
@@ -1081,6 +1138,7 @@ export default function HomePage() {
         fixedFps: fixedFpsValue,
         fpsMode: formState.fps_mode,
         mapsEnabled,
+        calibration: etaCalibration,
       });
     }
 
@@ -1104,6 +1162,7 @@ export default function HomePage() {
     job?.videos,
     localVideoProbesByKey,
     mapsEnabled,
+    etaCalibration,
     renderProfiles,
     submissionStage,
     videoFiles,
@@ -1761,6 +1820,12 @@ export default function HomePage() {
                       <li key={tip}>{tip}</li>
                     ))}
                   </ul>
+                )}
+                {etaCalibration?.sample_count && etaCalibration.sample_count > 0 && (
+                  <p className="mt-1 text-[11px] text-[var(--color-muted-foreground)]">
+                    ETA model calibrated from {etaCalibration.sample_count} successful render
+                    {etaCalibration.sample_count === 1 ? "" : "s"}.
+                  </p>
                 )}
                 <p className="mt-1 text-xs text-[var(--color-muted-foreground)]">
                   Keep this tab open through upload completion. Rendering continues server-side after upload.

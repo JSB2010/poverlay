@@ -143,6 +143,48 @@ def test_build_renderer_command_sets_cache_dir_and_overlay_size() -> None:
     assert "3840x2160" in command
 
 
+def test_render_eta_calibration_from_samples() -> None:
+    samples = [
+        {
+            "success": True,
+            "render_profile": "h264-source",
+            "fps_mode": "source_exact",
+            "maps_enabled": False,
+            "source_width": 1920,
+            "source_height": 1080,
+            "source_duration_seconds": 10.0,
+            "render_elapsed_seconds": 12.0,
+        },
+        {
+            "success": True,
+            "render_profile": "h264-source",
+            "fps_mode": "source_exact",
+            "maps_enabled": False,
+            "source_width": 3840,
+            "source_height": 2160,
+            "source_duration_seconds": 10.0,
+            "render_elapsed_seconds": 36.0,
+        },
+        {
+            "success": True,
+            "render_profile": "h264-source",
+            "fps_mode": "source_rounded",
+            "maps_enabled": False,
+            "source_width": 1920,
+            "source_height": 1080,
+            "source_duration_seconds": 10.0,
+            "render_elapsed_seconds": 10.5,
+        },
+    ]
+
+    calibration = api_main._build_render_eta_calibration(samples)
+    assert calibration["sample_count"] == 3
+    assert calibration["version"] == 1
+    assert "h264-source" in calibration["profile_points"]
+    assert len(calibration["profile_points"]["h264-source"]) >= 3
+    assert calibration["source_rounded_multiplier"] < 1.0
+
+
 def test_cross_user_job_access_returns_not_found(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -186,6 +228,18 @@ def test_create_job_persists_authenticated_uid(
         await upload.close()
 
     monkeypatch.setattr(api_main, "_save_upload", _noop_save_upload)
+    async def _mock_probe_video_safe(_path: Path) -> dict[str, object]:
+        return {
+            "width": 5312,
+            "height": 2988,
+            "duration": 42.5,
+            "creation_time": "2026-02-07T22:28:39Z",
+            "codec": "h264",
+            "fps": 29.97,
+            "fps_raw": "30000/1001",
+        }
+
+    monkeypatch.setattr(api_main, "_probe_video_safe", _mock_probe_video_safe)
 
     files = [
         ("gpx", ("track.gpx", b"<gpx></gpx>", "application/gpx+xml")),
@@ -196,6 +250,10 @@ def test_create_job_persists_authenticated_uid(
 
     job_id = response.json()["job_id"]
     assert fake_job_store[job_id]["uid"] == "user-a"
+    first_video = fake_job_store[job_id]["videos"][0]
+    assert first_video["source_resolution"] == "5312x2988"
+    assert first_video["source_fps"] == "30000/1001"
+    assert first_video["source_duration_seconds"] == 42.5
 
 
 def test_set_job_terminal_transition_triggers_single_notification(

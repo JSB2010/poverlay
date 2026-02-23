@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
@@ -55,6 +56,8 @@ DATA_DIR = RUNTIME_CONFIG.data_dir
 JOBS_DIR = DATA_DIR / "jobs"
 CONFIG_DIR = DATA_DIR / "gopro-config"
 TEMP_DIR = DATA_DIR / "tmp"
+ANALYTICS_DIR = DATA_DIR / "analytics"
+RENDER_SAMPLES_FILE = ANALYTICS_DIR / "render-samples.jsonl"
 FFMPEG_PROFILES_FILE = CONFIG_DIR / "ffmpeg-profiles.json"
 
 GOPRO_DASHBOARD_BIN = RUNTIME_CONFIG.gopro_dashboard_bin
@@ -112,6 +115,20 @@ H264_4K_COMPAT_PRESET = _resolve_x264_preset(
     "faster" if sys.platform != "darwin" else "medium",
 )
 H264_FAST_PRESET = _resolve_x264_preset("POVERLAY_H264_FAST_PRESET", "veryfast")
+
+ETA_DEFAULT_MAPS_MULTIPLIER = 1.05
+ETA_DEFAULT_SOURCE_ROUNDED_MULTIPLIER = 0.91
+ETA_DEFAULT_FIXED_MULTIPLIER_INTERCEPT = 0.32
+ETA_DEFAULT_FIXED_MULTIPLIER_SLOPE = 0.02
+ETA_DEFAULT_FIXED_MULTIPLIER_MIN = 0.45
+ETA_ANCHOR_MEGA_PIXELS = [0.92, 2.07, 4.11, 8.29, 15.87]
+ETA_BASE_PROFILE_POINTS: dict[str, list[tuple[float, float]]] = {
+    "h264-fast": [(0.92, 0.839), (2.07, 1.182), (4.11, 2.14), (8.29, 3.518), (15.87, 10.776)],
+    "h264-source": [(0.92, 0.933), (2.07, 1.231), (4.11, 2.241), (8.29, 3.79), (15.87, 11.402)],
+    "h264-4k-compat": [(0.92, 0.867), (2.07, 1.272), (4.11, 2.516), (8.29, 3.698), (15.87, 11.209)],
+    "qt-hevc-balanced": [(0.9, 0.75), (2.1, 1.25), (4.1, 2.3), (8.3, 4.4), (15.9, 8.1)],
+    "qt-hevc-high": [(0.9, 0.95), (2.1, 1.6), (4.1, 3.0), (8.3, 5.8), (15.9, 10.6)],
+}
 
 RENDER_PROFILE_CATALOG: dict[str, dict[str, Any]] = {
     "qt-hevc-balanced": {
@@ -313,6 +330,9 @@ _QUEUE_WORKER_LOCK = threading.Lock()
 _QUEUE_WORKER_STARTED = False
 JOB_QUEUE: queue.Queue[str] = queue.Queue()
 ENQUEUED_JOBS: set[str] = set()
+_RENDER_ANALYTICS_LOCK = threading.Lock()
+_RENDER_ETA_CACHE_MTIME: float | None = None
+_RENDER_ETA_CACHE: dict[str, Any] | None = None
 LOGGER = logging.getLogger("poverlay.api")
 
 
@@ -890,6 +910,12 @@ def _build_media_item(job: dict[str, Any], video: dict[str, Any]) -> dict[str, A
         "source_resolution": video.get("source_resolution"),
         "source_fps": video.get("source_fps"),
         "source_duration_seconds": video.get("source_duration_seconds"),
+        "output_resolution": video.get("output_resolution"),
+        "output_fps": video.get("output_fps"),
+        "output_duration_seconds": video.get("output_duration_seconds"),
+        "output_codec": video.get("output_codec"),
+        "render_elapsed_seconds": video.get("render_elapsed_seconds"),
+        "wall_x_realtime": video.get("wall_x_realtime"),
         "progress": int(video.get("progress") or 0),
         "detail": video.get("detail"),
         "error": video.get("error"),
@@ -1372,6 +1398,273 @@ def _probe_video(path: Path) -> dict[str, Any]:
     }
 
 
+def _safe_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not (parsed > 0):
+        return None
+    return parsed
+
+
+def _median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2 == 1:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+def _nearest_eta_anchor(mega_pixels: float) -> float:
+    if mega_pixels <= 0:
+        return ETA_ANCHOR_MEGA_PIXELS[0]
+    return min(ETA_ANCHOR_MEGA_PIXELS, key=lambda anchor: abs(anchor - mega_pixels))
+
+
+def _interpolate_eta_points(points: list[tuple[float, float]], mega_pixels: float) -> float:
+    if not points:
+        return 1.0
+    if mega_pixels <= points[0][0]:
+        return points[0][1]
+    for index in range(1, len(points)):
+        previous = points[index - 1]
+        current = points[index]
+        if mega_pixels <= current[0]:
+            span = current[0] - previous[0]
+            if span <= 0:
+                return current[1]
+            ratio = (mega_pixels - previous[0]) / span
+            return previous[1] + ratio * (current[1] - previous[1])
+    tail = points[-1]
+    before_tail = points[-2] if len(points) > 1 else tail
+    span = max(tail[0] - before_tail[0], 0.0001)
+    slope = (tail[1] - before_tail[1]) / span
+    return max(0.2, tail[1] + (mega_pixels - tail[0]) * slope)
+
+
+def _default_eta_point_for_profile(profile_id: str, mega_pixels: float) -> float:
+    points = ETA_BASE_PROFILE_POINTS.get(profile_id) or ETA_BASE_PROFILE_POINTS["h264-source"]
+    return _interpolate_eta_points(points, mega_pixels)
+
+
+def _load_recent_render_samples(limit: int = 3000) -> list[dict[str, Any]]:
+    if not RENDER_SAMPLES_FILE.exists():
+        return []
+
+    window: deque[dict[str, Any]] = deque(maxlen=limit)
+    with RENDER_SAMPLES_FILE.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                window.append(payload)
+
+    return list(window)
+
+
+def _build_render_eta_calibration(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    successful: list[dict[str, Any]] = []
+    for sample in samples:
+        if not bool(sample.get("success", False)):
+            continue
+        duration_seconds = _safe_float(sample.get("source_duration_seconds"))
+        elapsed_seconds = _safe_float(sample.get("render_elapsed_seconds"))
+        if duration_seconds is None or elapsed_seconds is None:
+            continue
+        if elapsed_seconds > duration_seconds * 240:
+            continue
+
+        width = int(sample.get("source_width") or 0)
+        height = int(sample.get("source_height") or 0)
+        if width < 2 or height < 2:
+            continue
+
+        mega_pixels = (width * height) / 1_000_000.0
+        if mega_pixels <= 0:
+            continue
+
+        wall_x = elapsed_seconds / duration_seconds
+        if wall_x <= 0:
+            continue
+
+        payload = dict(sample)
+        payload["mega_pixels"] = mega_pixels
+        payload["wall_x_realtime"] = wall_x
+        successful.append(payload)
+
+    profile_points: dict[str, list[dict[str, Any]]] = {}
+    profile_ids = sorted({*ETA_BASE_PROFILE_POINTS.keys(), *(str(s.get("render_profile") or "") for s in successful)})
+    for profile_id in profile_ids:
+        if not profile_id:
+            continue
+
+        baseline = ETA_BASE_PROFILE_POINTS.get(profile_id) or ETA_BASE_PROFILE_POINTS["h264-source"]
+        anchor_values: dict[float, list[float]] = defaultdict(list)
+        profile_samples = [s for s in successful if str(s.get("render_profile") or "") == profile_id]
+        preferred = [
+            s
+            for s in profile_samples
+            if str(s.get("fps_mode") or "source_exact") == "source_exact" and not bool(s.get("maps_enabled", False))
+        ]
+        selected = preferred if len(preferred) >= 2 else profile_samples
+        for sample in selected:
+            anchor = _nearest_eta_anchor(float(sample["mega_pixels"]))
+            anchor_values[anchor].append(float(sample["wall_x_realtime"]))
+
+        points: list[dict[str, Any]] = []
+        for anchor, base_x in baseline:
+            observations = anchor_values.get(anchor, [])
+            measured = _median(observations)
+            count = len(observations)
+            if measured is None:
+                blended = base_x
+            else:
+                confidence = min(count, 16) / 16.0
+                blended = (base_x * (1.0 - confidence)) + (measured * confidence)
+            points.append(
+                {
+                    "mega_pixels": round(anchor, 3),
+                    "x_realtime": round(max(blended, 0.2), 4),
+                    "sample_count": count,
+                }
+            )
+
+        profile_points[profile_id] = points
+
+    normalized_by_mode: dict[str, list[float]] = defaultdict(list)
+    fixed_points: dict[int, list[float]] = defaultdict(list)
+    maps_on: list[float] = []
+    maps_off: list[float] = []
+
+    for sample in successful:
+        profile_id = str(sample.get("render_profile") or "h264-source")
+        mega_pixels = float(sample["mega_pixels"])
+        baseline_x = _default_eta_point_for_profile(profile_id, mega_pixels)
+        if baseline_x <= 0:
+            continue
+        normalized = float(sample["wall_x_realtime"]) / baseline_x
+        if normalized <= 0:
+            continue
+
+        fps_mode = str(sample.get("fps_mode") or "source_exact")
+        normalized_by_mode[fps_mode].append(normalized)
+        if bool(sample.get("maps_enabled", False)):
+            maps_on.append(normalized)
+        else:
+            maps_off.append(normalized)
+
+        if fps_mode == "fixed":
+            fixed_fps_value = _safe_float(sample.get("fixed_fps"))
+            if fixed_fps_value is not None:
+                fixed_points[int(round(fixed_fps_value))].append(normalized)
+
+    exact_median = _median(normalized_by_mode.get("source_exact", [])) or 1.0
+    rounded_median = _median(normalized_by_mode.get("source_rounded", []))
+    source_rounded_multiplier = (
+        rounded_median / exact_median
+        if rounded_median is not None and exact_median > 0
+        else ETA_DEFAULT_SOURCE_ROUNDED_MULTIPLIER
+    )
+    source_rounded_multiplier = max(0.45, min(1.4, source_rounded_multiplier))
+
+    maps_on_median = _median(maps_on)
+    maps_off_median = _median(maps_off)
+    maps_multiplier = (
+        maps_on_median / maps_off_median
+        if maps_on_median is not None and maps_off_median is not None and maps_off_median > 0
+        else ETA_DEFAULT_MAPS_MULTIPLIER
+    )
+    maps_multiplier = max(0.7, min(1.5, maps_multiplier))
+
+    fixed_measurements: list[tuple[float, float]] = []
+    fixed_series: list[dict[str, Any]] = []
+    for fps in sorted(fixed_points):
+        median_value = _median(fixed_points[fps])
+        if median_value is None or exact_median <= 0:
+            continue
+        multiplier = median_value / exact_median
+        multiplier = max(0.2, min(2.0, multiplier))
+        fixed_measurements.append((float(fps), multiplier))
+        fixed_series.append({"fps": fps, "multiplier": round(multiplier, 4), "sample_count": len(fixed_points[fps])})
+
+    intercept = ETA_DEFAULT_FIXED_MULTIPLIER_INTERCEPT
+    slope = ETA_DEFAULT_FIXED_MULTIPLIER_SLOPE
+    if len(fixed_measurements) >= 2:
+        x_values = [point[0] for point in fixed_measurements]
+        y_values = [point[1] for point in fixed_measurements]
+        x_mean = sum(x_values) / len(x_values)
+        y_mean = sum(y_values) / len(y_values)
+        variance = sum((x - x_mean) ** 2 for x in x_values)
+        if variance > 0:
+            slope = sum((x - x_mean) * (y - y_mean) for x, y in fixed_measurements) / variance
+            intercept = y_mean - slope * x_mean
+    elif len(fixed_measurements) == 1:
+        fps, multiplier = fixed_measurements[0]
+        slope = ETA_DEFAULT_FIXED_MULTIPLIER_SLOPE
+        intercept = multiplier - (slope * fps)
+
+    slope = max(0.0, min(0.05, slope))
+    intercept = max(0.1, min(1.4, intercept))
+
+    return {
+        "version": 1,
+        "generated_at": _utc_now(),
+        "sample_count": len(successful),
+        "profile_points": profile_points,
+        "maps_multiplier": round(maps_multiplier, 4),
+        "source_rounded_multiplier": round(source_rounded_multiplier, 4),
+        "fixed_multiplier_intercept": round(intercept, 4),
+        "fixed_multiplier_slope": round(slope, 4),
+        "fixed_multiplier_min": ETA_DEFAULT_FIXED_MULTIPLIER_MIN,
+        "fixed_samples": fixed_series,
+        "defaults": {
+            "maps_multiplier": ETA_DEFAULT_MAPS_MULTIPLIER,
+            "source_rounded_multiplier": ETA_DEFAULT_SOURCE_ROUNDED_MULTIPLIER,
+            "fixed_multiplier_intercept": ETA_DEFAULT_FIXED_MULTIPLIER_INTERCEPT,
+            "fixed_multiplier_slope": ETA_DEFAULT_FIXED_MULTIPLIER_SLOPE,
+            "fixed_multiplier_min": ETA_DEFAULT_FIXED_MULTIPLIER_MIN,
+        },
+    }
+
+
+def _get_render_eta_calibration() -> dict[str, Any]:
+    global _RENDER_ETA_CACHE, _RENDER_ETA_CACHE_MTIME
+
+    mtime = RENDER_SAMPLES_FILE.stat().st_mtime if RENDER_SAMPLES_FILE.exists() else -1.0
+    with _RENDER_ANALYTICS_LOCK:
+        if _RENDER_ETA_CACHE is not None and _RENDER_ETA_CACHE_MTIME == mtime:
+            return deepcopy(_RENDER_ETA_CACHE)
+
+        samples = _load_recent_render_samples(limit=3000)
+        calibration = _build_render_eta_calibration(samples)
+        _RENDER_ETA_CACHE = calibration
+        _RENDER_ETA_CACHE_MTIME = mtime
+        return deepcopy(calibration)
+
+
+def _record_render_sample(sample: dict[str, Any]) -> None:
+    global _RENDER_ETA_CACHE, _RENDER_ETA_CACHE_MTIME
+
+    ANALYTICS_DIR.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(sample, separators=(",", ":"), ensure_ascii=True)
+    with _RENDER_ANALYTICS_LOCK:
+        with RENDER_SAMPLES_FILE.open("a", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.write("\n")
+        _RENDER_ETA_CACHE = None
+        _RENDER_ETA_CACHE_MTIME = None
+
+
 def _set_file_mtime_from_creation(path: Path, creation_time: str | None) -> None:
     dt = _parse_iso(creation_time)
     if dt is None:
@@ -1591,9 +1884,10 @@ def _run_renderer(
     job_id: str,
     video_index: int,
     total_videos: int,
-) -> tuple[int, str]:
+) -> tuple[int, str, float]:
     progress_re = re.compile(r"\[(\s*\d+)%\]")
     last_line = ""
+    started = time.perf_counter()
 
     with log_path.open("a", encoding="utf-8") as log_file:
         log_file.write(f"\n=== Renderer attempt at {_utc_now()} ===\n")
@@ -1623,7 +1917,8 @@ def _run_renderer(
 
     if last_line:
         _set_video(job_id, video_index, detail=last_line)
-    return return_code, last_line
+    elapsed_seconds = max(time.perf_counter() - started, 0.0)
+    return return_code, last_line, elapsed_seconds
 
 
 def _normalize_console_line(value: str) -> str:
@@ -1695,6 +1990,7 @@ def _process_job(job_id: str) -> None:
             return_code = 1
             attempted_profile = selected_profile
             last_error: str | None = None
+            render_elapsed_seconds = 0.0
 
             for profile_idx, profile_id in enumerate(profile_candidates):
                 attempted_profile = profile_id
@@ -1733,7 +2029,8 @@ def _process_job(job_id: str) -> None:
                     render_profile=profile_id,
                     overlay_size=overlay_size,
                 )
-                return_code, last_line = _run_renderer(command, log_path, job_id, index, total_videos)
+                return_code, last_line, elapsed_seconds = _run_renderer(command, log_path, job_id, index, total_videos)
+                render_elapsed_seconds += elapsed_seconds
                 normalized_last_line = _normalize_console_line(last_line).lower()
                 if (
                     return_code != 0
@@ -1754,7 +2051,8 @@ def _process_job(job_id: str) -> None:
                         speed_units=str(job["settings"].get("speed_units", "kph")),
                     )
                     layout_path.write_text(fallback_layout, encoding="utf-8")
-                    return_code, last_line = _run_renderer(command, log_path, job_id, index, total_videos)
+                    return_code, last_line, elapsed_seconds = _run_renderer(command, log_path, job_id, index, total_videos)
+                    render_elapsed_seconds += elapsed_seconds
                     normalized_last_line = _normalize_console_line(last_line).lower()
 
                 if return_code == 0:
@@ -1782,8 +2080,45 @@ def _process_job(job_id: str) -> None:
                     source_resolution=f"{metadata['width']}x{metadata['height']}",
                     source_fps=metadata.get("fps_raw"),
                     source_duration_seconds=metadata.get("duration"),
+                    render_elapsed_seconds=round(render_elapsed_seconds, 3),
+                    wall_x_realtime=(
+                        round(render_elapsed_seconds / float(metadata["duration"]), 5)
+                        if metadata.get("duration") and float(metadata["duration"]) > 0
+                        else None
+                    ),
                     render_profile_label=_render_profile_label(attempted_profile),
                 )
+                try:
+                    _record_render_sample(
+                        {
+                            "recorded_at": _utc_now(),
+                            "job_id": job_id,
+                            "video_id": video_state.get("id"),
+                            "input_name": input_name,
+                            "platform": sys.platform,
+                            "success": False,
+                            "error": last_error or f"Renderer exited with code {return_code}",
+                            "render_profile": attempted_profile,
+                            "requested_render_profile": str(job["settings"].get("render_profile", AUTO_RENDER_PROFILE)),
+                            "maps_enabled": maps_enabled_for_attempt,
+                            "fps_mode": str(job["settings"].get("fps_mode", "source_exact")),
+                            "fixed_fps": float(job["settings"].get("fixed_fps", 30.0)),
+                            "source_width": metadata.get("width"),
+                            "source_height": metadata.get("height"),
+                            "source_duration_seconds": metadata.get("duration"),
+                            "source_codec": metadata.get("codec"),
+                            "source_fps": metadata.get("fps"),
+                            "source_fps_raw": metadata.get("fps_raw"),
+                            "render_elapsed_seconds": round(render_elapsed_seconds, 3),
+                            "wall_x_realtime": (
+                                round(render_elapsed_seconds / float(metadata["duration"]), 5)
+                                if metadata.get("duration") and float(metadata["duration"]) > 0
+                                else None
+                            ),
+                        }
+                    )
+                except Exception:  # noqa: BLE001
+                    LOGGER.exception("Failed to persist failed render sample for job=%s video=%s", job_id, input_name)
                 continue
 
             upload_metadata = _upload_output_to_r2(
@@ -1792,6 +2127,12 @@ def _process_job(job_id: str) -> None:
                 output_name=output_name,
                 output_path=output_path,
             )
+
+            output_metadata: dict[str, Any] | None = None
+            try:
+                output_metadata = _probe_video(output_path)
+            except Exception:  # noqa: BLE001
+                output_metadata = None
 
             _set_video(
                 job_id,
@@ -1805,9 +2146,57 @@ def _process_job(job_id: str) -> None:
                 source_resolution=f"{metadata['width']}x{metadata['height']}",
                 source_fps=metadata.get("fps_raw"),
                 source_duration_seconds=metadata.get("duration"),
+                output_resolution=(
+                    f"{output_metadata['width']}x{output_metadata['height']}" if output_metadata else None
+                ),
+                output_fps=output_metadata.get("fps_raw") if output_metadata else None,
+                output_duration_seconds=output_metadata.get("duration") if output_metadata else None,
+                output_codec=output_metadata.get("codec") if output_metadata else None,
+                render_elapsed_seconds=round(render_elapsed_seconds, 3),
+                wall_x_realtime=(
+                    round(render_elapsed_seconds / float(metadata["duration"]), 5)
+                    if metadata.get("duration") and float(metadata["duration"]) > 0
+                    else None
+                ),
                 error=None,
                 **upload_metadata,
             )
+            try:
+                _record_render_sample(
+                    {
+                        "recorded_at": _utc_now(),
+                        "job_id": job_id,
+                        "video_id": video_state.get("id"),
+                        "input_name": input_name,
+                        "platform": sys.platform,
+                        "success": True,
+                        "render_profile": selected_profile,
+                        "requested_render_profile": str(job["settings"].get("render_profile", AUTO_RENDER_PROFILE)),
+                        "maps_enabled": maps_enabled_for_attempt,
+                        "fps_mode": str(job["settings"].get("fps_mode", "source_exact")),
+                        "fixed_fps": float(job["settings"].get("fixed_fps", 30.0)),
+                        "source_width": metadata.get("width"),
+                        "source_height": metadata.get("height"),
+                        "source_duration_seconds": metadata.get("duration"),
+                        "source_codec": metadata.get("codec"),
+                        "source_fps": metadata.get("fps"),
+                        "source_fps_raw": metadata.get("fps_raw"),
+                        "output_width": output_metadata.get("width") if output_metadata else None,
+                        "output_height": output_metadata.get("height") if output_metadata else None,
+                        "output_duration_seconds": output_metadata.get("duration") if output_metadata else None,
+                        "output_codec": output_metadata.get("codec") if output_metadata else None,
+                        "output_fps": output_metadata.get("fps") if output_metadata else None,
+                        "output_fps_raw": output_metadata.get("fps_raw") if output_metadata else None,
+                        "render_elapsed_seconds": round(render_elapsed_seconds, 3),
+                        "wall_x_realtime": (
+                            round(render_elapsed_seconds / float(metadata["duration"]), 5)
+                            if metadata.get("duration") and float(metadata["duration"]) > 0
+                            else None
+                        ),
+                    }
+                )
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("Failed to persist completed render sample for job=%s video=%s", job_id, input_name)
         except Exception as exc:  # noqa: BLE001
             failed_count += 1
             if first_failure_reason is None:
@@ -1875,6 +2264,7 @@ def meta() -> dict[str, Any]:
         "render_profiles": _render_profile_meta(),
         "render_profile_ids": AVAILABLE_RENDER_PROFILE_IDS,
         "default_render_profile": AUTO_RENDER_PROFILE,
+        "render_eta_calibration": _get_render_eta_calibration(),
     }
 
 
@@ -2005,6 +2395,12 @@ async def create_job(
                 "source_resolution": f"{metadata['width']}x{metadata['height']}" if metadata else None,
                 "source_fps": metadata.get("fps_raw") if metadata else None,
                 "source_duration_seconds": metadata.get("duration") if metadata else None,
+                "output_resolution": None,
+                "output_fps": None,
+                "output_duration_seconds": None,
+                "output_codec": None,
+                "render_elapsed_seconds": None,
+                "wall_x_realtime": None,
                 "r2_object_key": None,
                 "r2_bucket": None,
                 "r2_etag": None,
