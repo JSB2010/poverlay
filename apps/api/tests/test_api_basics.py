@@ -109,6 +109,25 @@ def test_media_routes_require_auth() -> None:
     assert client.get("/api/user/access").status_code == 401
 
 
+def test_resolve_executable_path_uses_path_for_command_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(api_main.shutil, "which", lambda value: "/opt/venv/bin/gopro-dashboard.py" if value == "gopro-dashboard.py" else None)
+
+    resolved = api_main._resolve_executable_path("gopro-dashboard.py", fallback_name="gopro-dashboard.py")
+
+    assert resolved == "/opt/venv/bin/gopro-dashboard.py"
+
+
+def test_resolve_executable_path_recovers_old_container_venv_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(api_main.shutil, "which", lambda value: "/opt/venv/bin/gopro-dashboard.py" if value == "gopro-dashboard.py" else None)
+
+    resolved = api_main._resolve_executable_path(
+        "/app/.venv/bin/gopro-dashboard.py",
+        fallback_name="gopro-dashboard.py",
+    )
+
+    assert resolved == "/opt/venv/bin/gopro-dashboard.py"
+
+
 def test_firebase_service_account_payload_accepts_json(monkeypatch: pytest.MonkeyPatch) -> None:
     payload = {
         "type": "service_account",

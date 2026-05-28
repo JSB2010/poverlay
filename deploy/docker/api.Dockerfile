@@ -18,6 +18,7 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 COPY apps/api/requirements.txt ./apps/api/requirements.txt
 RUN pip install --upgrade pip && pip install -r apps/api/requirements.txt
+RUN test -x /opt/venv/bin/gopro-dashboard.py
 
 COPY apps/api ./apps/api
 

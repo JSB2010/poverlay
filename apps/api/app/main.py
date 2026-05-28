@@ -61,7 +61,32 @@ ANALYTICS_DIR = DATA_DIR / "analytics"
 RENDER_SAMPLES_FILE = ANALYTICS_DIR / "render-samples.jsonl"
 FFMPEG_PROFILES_FILE = CONFIG_DIR / "ffmpeg-profiles.json"
 
-GOPRO_DASHBOARD_BIN = RUNTIME_CONFIG.gopro_dashboard_bin
+def _resolve_executable_path(value: str, *, fallback_name: str | None = None) -> str:
+    raw = value.strip()
+    if not raw:
+        return raw
+
+    candidate = Path(raw)
+    if candidate.is_file():
+        return str(candidate)
+
+    if candidate.name == raw:
+        resolved = shutil.which(raw)
+        if resolved:
+            return resolved
+
+    if fallback_name and candidate.name == fallback_name:
+        resolved = shutil.which(fallback_name)
+        if resolved:
+            return resolved
+
+    return raw
+
+
+GOPRO_DASHBOARD_BIN = _resolve_executable_path(
+    RUNTIME_CONFIG.gopro_dashboard_bin,
+    fallback_name="gopro-dashboard.py",
+)
 FFPROBE_BIN = RUNTIME_CONFIG.ffprobe_bin
 DEFAULT_FONT_PATH = RUNTIME_CONFIG.overlay_font_path
 

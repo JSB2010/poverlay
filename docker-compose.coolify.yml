@@ -7,7 +7,7 @@ services:
     environment:
       PYTHONUNBUFFERED: "1"
       POVERLAY_DATA_DIR: /data
-      GOPRO_DASHBOARD_BIN: ${GOPRO_DASHBOARD_BIN:-gopro-dashboard.py}
+      GOPRO_DASHBOARD_BIN: ${GOPRO_DASHBOARD_BIN:-/opt/venv/bin/gopro-dashboard.py}
       FFPROBE_BIN: ${FFPROBE_BIN:-ffprobe}
       OVERLAY_FONT_PATH: ${OVERLAY_FONT_PATH:-/app/apps/api/app/static/fonts/Orbitron-Bold.ttf}
       WEB_BASE_URL: ${WEB_BASE_URL:?}
