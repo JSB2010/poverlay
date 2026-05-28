@@ -39,7 +39,7 @@ ENV NEXT_PUBLIC_SITE_URL="${NEXT_PUBLIC_SITE_URL}" \
     API_PROXY_TARGET="${API_PROXY_TARGET}" \
     NEXT_PROXY_CLIENT_MAX_BODY_SIZE="${NEXT_PROXY_CLIENT_MAX_BODY_SIZE}"
 
-RUN set -euo pipefail; \
+RUN set -eu; \
     flag="$(printf '%s' "${NEXT_PUBLIC_FIREBASE_AUTH_ENABLED:-false}" | tr '[:upper:]' '[:lower:]')"; \
     case "${flag}" in \
       1|true|yes|on) \
