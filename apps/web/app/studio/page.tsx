@@ -2040,7 +2040,8 @@ export default function HomePage() {
         }
 
         if (xhr.status < 200 || xhr.status >= 300) {
-          reject(new Error(extractErrorMessage(payloadFromServer, "Failed to create render job")));
+          const statusLabel = xhr.statusText ? `${xhr.status} ${xhr.statusText}` : `${xhr.status}`;
+          reject(new Error(extractErrorMessage(payloadFromServer, `Failed to create render job (${statusLabel})`)));
           return;
         }
 

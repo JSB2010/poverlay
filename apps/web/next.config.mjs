@@ -1,6 +1,14 @@
 /** @type {import('next').NextConfig} */
 // Applies only when Next.js itself proxies /api requests.
 const proxyClientMaxBodySize = process.env.NEXT_PROXY_CLIENT_MAX_BODY_SIZE || "64gb";
+const proxyTimeout = (() => {
+  const raw = (process.env.NEXT_PROXY_TIMEOUT_MS || "1800000").trim();
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw new Error(`Invalid NEXT_PROXY_TIMEOUT_MS: ${JSON.stringify(raw)}`);
+  }
+  return parsed;
+})();
 
 const nextConfig = {
   output: "standalone",
@@ -11,6 +19,7 @@ const nextConfig = {
 
   experimental: {
     proxyClientMaxBodySize,
+    proxyTimeout,
   },
 
   // Image optimization

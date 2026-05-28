@@ -36,13 +36,21 @@ This repository now deploys through Coolify using Docker Compose. The Compose fi
    - Recommended values:
      - `API_PROXY_TARGET=http://api:8787`
      - `NEXT_PROXY_CLIENT_MAX_BODY_SIZE=64gb`
-   - Set **Build + Runtime** for `NEXT_PUBLIC_*`, `API_PROXY_TARGET`, and `NEXT_PROXY_CLIENT_MAX_BODY_SIZE`.
+     - `NEXT_PROXY_TIMEOUT_MS=1800000` for 30-minute proxied upload requests
+   - Set **Build + Runtime** for `NEXT_PUBLIC_*`, `API_PROXY_TARGET`, `NEXT_PROXY_CLIENT_MAX_BODY_SIZE`, and `NEXT_PROXY_TIMEOUT_MS`.
    - Set **Runtime only** for secrets (Firebase admin keys, R2 keys, Brevo, etc).
    - If `FIRESTORE_ENABLED=true`, provide one Firebase service-account source to the API container: `FIREBASE_CREDENTIALS_JSON`, `FIREBASE_CREDENTIALS_PATH`, `GOOGLE_APPLICATION_CREDENTIALS`, or `FIREBASE_ADMIN_CLIENT_EMAIL` plus one `FIREBASE_ADMIN_PRIVATE_KEY*` value.
 
 5. **Domains**
    - Assign your public domain to the **web** service and set the port to **3000**.
    - Keep the **api** service private (no domain).
+   - For uploads larger than your public proxy can accept, assign a separate hostname to the **api** service on port **8787** and set `NEXT_PUBLIC_API_BASE` to that origin. If the hostname is behind Cloudflare and video uploads exceed Cloudflare's proxied upload cap, set that DNS record to **DNS-only**.
+
+## Large upload failures
+
+If `POST /api/jobs` fails after roughly 30 seconds with a browser `502` and no API-container log entry, the request is likely timing out in the Next.js rewrite proxy before FastAPI receives the full multipart body. Confirm by checking the **web** service logs for `Failed to proxy ... /api/jobs`.
+
+Set `NEXT_PROXY_TIMEOUT_MS` to a value longer than the expected upload duration and redeploy the web image. The default in this repo is `1800000` ms (30 minutes). For very large files, prefer a direct API/upload hostname so the browser posts straight to FastAPI instead of tunneling through the web service.
 
 6. **Deploy**
    - Save and deploy the resource. Coolify will build both images and start the stack.
