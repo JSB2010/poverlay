@@ -11,7 +11,7 @@ The app is now split into a modern monorepo architecture:
 ## Why this architecture
 
 - Ready for future auth and richer routed UI (Next.js)
-- Clear API/frontend separation for VPS deployment
+- Clear API/frontend separation for containerized deployments
 - Easy horizontal scaling path (web + API can be split later)
 - Uses `pnpm` workspace for fast, deterministic JS dependency management
 
@@ -20,7 +20,7 @@ The app is now split into a modern monorepo architecture:
 - Frontend: Next.js 16 + React 19 + TypeScript
 - Backend: FastAPI
 - Renderer: `gopro-dashboard-overlay` + ffmpeg/ffprobe
-- Process/deploy: systemd + Nginx (templates included)
+- Process/deploy: Docker Compose on Coolify (Dockerfiles in `deploy/docker`)
 
 ## Local development
 
@@ -93,7 +93,7 @@ The root template includes:
 - Cloudflare R2: account/bucket/credentials (`R2_*`)
 - Brevo: notifications + sender/template settings (`BREVO_*`)
 
-Production integration checklist (set in `/etc/poverlay/poverlay.env` on VPS):
+Production integration checklist (set as Coolify environment variables):
 
 - Keep auth toggles aligned: `FIREBASE_AUTH_ENABLED=true` and `NEXT_PUBLIC_FIREBASE_AUTH_ENABLED=true`.
 - Durable pipeline toggles: `FIRESTORE_ENABLED=true` and `R2_UPLOAD_ENABLED=true`.
@@ -139,17 +139,14 @@ Expected:
 - Health endpoints return `200`.
 - Unauthenticated `/api/media` and `/api/user/settings` return `401`.
 
-## VPS deployment
+## Coolify deployment
 
-Deployment artifacts are included:
+Deployment now targets Coolify using Docker Compose:
 
-- systemd units: `deploy/systemd/poverlay-api.service`, `deploy/systemd/poverlay-web.service`
-- Nginx site: `deploy/nginx/poverlay.conf`
-- step-by-step guide: `deploy/VPS.md`
-- deployment command: `./scripts/deploy-vps.sh --branch main --public-url https://poverlay.com`
-- staging bootstrap command: `./scripts/bootstrap-staging-vps.sh`
-- staging deploy workflow: `.github/workflows/deploy-staging.yml`
-- production deploy workflow: `.github/workflows/deploy.yml`
+- compose file: `docker-compose.coolify.yml`
+- Dockerfiles: `deploy/docker/api.Dockerfile`, `deploy/docker/web.Dockerfile`
+- environment template: `.env.example`
+- step-by-step guide: `deploy/COOLIFY.md`
 
 ## Repository layout
 
@@ -164,5 +161,5 @@ Deployment artifacts are included:
 ## Notes
 
 - Job artifacts are written to `data/jobs/<job-id>/`.
-- Cleanup defaults are enabled for VPS-friendly disk usage.
+- Cleanup defaults are enabled for production-friendly disk usage.
 - Vendored renderer source is tracked under `vendor/gopro-dashboard-overlay`.
