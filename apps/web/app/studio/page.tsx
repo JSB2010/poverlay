@@ -121,6 +121,8 @@ type LocalVideoProbe = {
   height: number | null;
   durationSeconds: number | null;
   fps: number | null;
+  creationTimeMs: number | null;
+  timelineSource: "embedded" | "file_modified" | null;
 };
 
 type RenderEtaEstimate = {
@@ -131,6 +133,20 @@ type RenderEtaEstimate = {
   highResClipCount: number;
   profileUsage: Record<string, number>;
   fallbackAssumptions: string[];
+};
+
+type GpxTimeRange = {
+  startMs: number;
+  endMs: number;
+};
+
+type TimelinePreflightStatus = "idle" | "checking" | "ok" | "warning" | "blocked";
+
+type TimelinePreflight = {
+  status: TimelinePreflightStatus;
+  summary: string;
+  detail?: string;
+  recommendedOffsetSeconds?: number;
 };
 
 type SubmissionStage = "idle" | "uploading" | "queued" | "rendering" | "completed" | "failed";
@@ -530,6 +546,17 @@ function parseIsoTimestamp(value: string | null | undefined): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function formatDateTime(valueMs: number): string {
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+    timeZoneName: "short",
+  }).format(new Date(valueMs));
+}
+
 function clampToRange(value: number, min: number, max: number): number {
   if (!Number.isFinite(value)) {
     return min;
@@ -603,6 +630,123 @@ function parseResolutionValue(value: string | null | undefined): { width: number
   }
 
   return { width, height };
+}
+
+function parseGpxTimeRangeFromText(text: string): GpxTimeRange | null {
+  const parser = new DOMParser();
+  const document = parser.parseFromString(text, "application/xml");
+  if (document.querySelector("parsererror")) {
+    return null;
+  }
+
+  let startMs = Number.POSITIVE_INFINITY;
+  let endMs = Number.NEGATIVE_INFINITY;
+  const nodes = Array.from(document.getElementsByTagName("time"));
+  for (const node of nodes) {
+    const parsed = Date.parse(node.textContent?.trim() ?? "");
+    if (!Number.isFinite(parsed)) {
+      continue;
+    }
+    startMs = Math.min(startMs, parsed);
+    endMs = Math.max(endMs, parsed);
+  }
+
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) {
+    return null;
+  }
+  return { startMs, endMs };
+}
+
+async function parseGpxTimeRange(file: File): Promise<GpxTimeRange | null> {
+  try {
+    return parseGpxTimeRangeFromText(await file.text());
+  } catch {
+    return null;
+  }
+}
+
+function readAscii(bytes: Uint8Array, offset: number, length: number): string {
+  let value = "";
+  for (let index = 0; index < length; index += 1) {
+    value += String.fromCharCode(bytes[offset + index] ?? 0);
+  }
+  return value;
+}
+
+function mp4TimestampToUnixMs(secondsSince1904: number): number | null {
+  const unixSeconds = secondsSince1904 - 2_082_844_800;
+  const timestampMs = unixSeconds * 1000;
+  const minMs = Date.UTC(1990, 0, 1);
+  const maxMs = Date.UTC(2100, 0, 1);
+  if (!Number.isFinite(timestampMs) || timestampMs < minMs || timestampMs > maxMs) {
+    return null;
+  }
+  return timestampMs;
+}
+
+function parseMp4CreationTimeFromBuffer(buffer: ArrayBuffer): number | null {
+  const bytes = new Uint8Array(buffer);
+  const view = new DataView(buffer);
+  const candidates: number[] = [];
+
+  for (let offset = 4; offset < bytes.length - 20; offset += 1) {
+    const boxType = readAscii(bytes, offset, 4);
+    if (boxType !== "mvhd" && boxType !== "tkhd") {
+      continue;
+    }
+
+    const boxStart = offset - 4;
+    const boxSize = view.getUint32(boxStart);
+    if (boxSize < 20 || boxStart + boxSize > bytes.length + 16) {
+      continue;
+    }
+
+    const version = bytes[boxStart + 8];
+    let secondsSince1904: number | null = null;
+    if (version === 0 && boxStart + 16 <= bytes.length) {
+      secondsSince1904 = view.getUint32(boxStart + 12);
+    } else if (version === 1 && boxStart + 20 <= bytes.length) {
+      const high = view.getUint32(boxStart + 12);
+      const low = view.getUint32(boxStart + 16);
+      secondsSince1904 = high * 4_294_967_296 + low;
+    }
+
+    if (secondsSince1904 === null || secondsSince1904 <= 0) {
+      continue;
+    }
+
+    const timestampMs = mp4TimestampToUnixMs(secondsSince1904);
+    if (timestampMs !== null) {
+      candidates.push(timestampMs);
+    }
+  }
+
+  return candidates.length > 0 ? Math.min(...candidates) : null;
+}
+
+async function readMp4CreationTimeMs(file: File): Promise<number | null> {
+  const lowerName = file.name.toLowerCase();
+  if (!lowerName.endsWith(".mp4") && !lowerName.endsWith(".mov")) {
+    return null;
+  }
+
+  const chunkSize = Math.min(file.size, 16 * 1024 * 1024);
+  const buffers: ArrayBuffer[] = [];
+  if (chunkSize > 0) {
+    buffers.push(await file.slice(0, chunkSize).arrayBuffer());
+  }
+  if (file.size > chunkSize) {
+    buffers.push(await file.slice(Math.max(file.size - chunkSize, 0), file.size).arrayBuffer());
+  }
+
+  for (const buffer of buffers) {
+    const timestampMs = parseMp4CreationTimeFromBuffer(buffer);
+    if (timestampMs !== null) {
+      return timestampMs;
+    }
+  }
+
+  return null;
 }
 
 function estimateAutoProfileForClip(
@@ -829,6 +973,7 @@ function estimateClipRenderSeconds(input: ClipEstimateInput): number {
 }
 
 async function probeLocalVideo(file: File): Promise<LocalVideoProbe> {
+  const creationTimeMs = await readMp4CreationTimeMs(file);
   const fallback: LocalVideoProbe = {
     key: localVideoProbeKey(file),
     name: file.name,
@@ -838,6 +983,8 @@ async function probeLocalVideo(file: File): Promise<LocalVideoProbe> {
     height: null,
     durationSeconds: null,
     fps: null,
+    creationTimeMs: creationTimeMs ?? (file.lastModified > 0 ? file.lastModified : null),
+    timelineSource: creationTimeMs !== null ? "embedded" : file.lastModified > 0 ? "file_modified" : null,
   };
 
   const objectUrl = URL.createObjectURL(file);
@@ -992,6 +1139,7 @@ export default function HomePage() {
   const [tuningSliderValue, setTuningSliderValue] = useState(72);
 
   const [gpxFile, setGpxFile] = useState<File | null>(null);
+  const [gpxTimeRange, setGpxTimeRange] = useState<GpxTimeRange | null>(null);
   const [videoFiles, setVideoFiles] = useState<File[]>([]);
   const [localVideoProbesByKey, setLocalVideoProbesByKey] = useState<Record<string, LocalVideoProbe>>({});
   const [job, setJob] = useState<JobStatus | null>(null);
@@ -1103,6 +1251,30 @@ export default function HomePage() {
       }
     };
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    setGpxTimeRange(null);
+    if (!gpxFile) {
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    async function loadGpxTimeRange() {
+      const range = gpxFile ? await parseGpxTimeRange(gpxFile) : null;
+      if (!cancelled) {
+        setGpxTimeRange(range);
+      }
+    }
+
+    void loadGpxTimeRange();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [gpxFile]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1237,6 +1409,78 @@ export default function HomePage() {
     () => (gpxFile?.size ?? 0) + videoFiles.reduce((sum, video) => sum + video.size, 0),
     [gpxFile, videoFiles],
   );
+  const timelinePreflight = useMemo((): TimelinePreflight => {
+    if (!gpxFile && videoFiles.length === 0) {
+      return { status: "idle", summary: "Select files to check timing." };
+    }
+    if (!gpxFile || videoFiles.length === 0) {
+      return { status: "idle", summary: "Select one GPX file and at least one clip." };
+    }
+    if (!gpxTimeRange) {
+      return {
+        status: "warning",
+        summary: "GPX timing could not be read.",
+        detail: "Upload can continue, but timing overlap cannot be checked before upload.",
+      };
+    }
+
+    const probes = videoFiles.map((file) => localVideoProbesByKey[localVideoProbeKey(file)]).filter(Boolean);
+    if (probes.length < videoFiles.length) {
+      return { status: "checking", summary: "Checking GPX and clip timing..." };
+    }
+
+    const offsetSeconds = Number(formState.gpx_offset_seconds);
+    const safeOffsetSeconds = Number.isFinite(offsetSeconds) ? offsetSeconds : 0;
+    const shiftedGpxStartMs = gpxTimeRange.startMs + safeOffsetSeconds * 1000;
+    const shiftedGpxEndMs = gpxTimeRange.endMs + safeOffsetSeconds * 1000;
+    const unknown = probes.filter((probe) => probe.creationTimeMs === null || probe.durationSeconds === null);
+    if (unknown.length > 0) {
+      return {
+        status: "warning",
+        summary: "Some clip timing could not be read.",
+        detail: `${unknown.length} clip${unknown.length === 1 ? "" : "s"} will be checked after upload.`,
+      };
+    }
+
+    const mismatches = probes
+      .map((probe) => {
+        const videoStartMs = probe.creationTimeMs ?? 0;
+        const videoEndMs = videoStartMs + (probe.durationSeconds ?? 0) * 1000;
+        const overlaps = videoEndMs >= shiftedGpxStartMs && videoStartMs <= shiftedGpxEndMs;
+        return { probe, videoStartMs, videoEndMs, overlaps };
+      })
+      .filter((entry) => !entry.overlaps);
+
+    if (mismatches.length === 0) {
+      const fallbackCount = probes.filter((probe) => probe.timelineSource !== "embedded").length;
+      return {
+        status: fallbackCount > 0 ? "warning" : "ok",
+        summary: fallbackCount > 0 ? "Timeline appears to overlap." : "Timeline check passed.",
+        detail:
+          fallbackCount > 0
+            ? `${fallbackCount} clip${fallbackCount === 1 ? "" : "s"} used file modified time because embedded creation time was unavailable.`
+            : `GPX ${formatDateTime(shiftedGpxStartMs)} - ${formatDateTime(shiftedGpxEndMs)} overlaps selected clips.`,
+      };
+    }
+
+    const embeddedMismatchCount = mismatches.filter((entry) => entry.probe.timelineSource === "embedded").length;
+    const first = mismatches[0];
+    let recommendedOffsetSeconds: number | undefined;
+    if (first.videoStartMs > shiftedGpxEndMs) {
+      recommendedOffsetSeconds = Math.round(safeOffsetSeconds + (first.videoStartMs - shiftedGpxEndMs) / 1000);
+    } else if (first.videoEndMs < shiftedGpxStartMs) {
+      recommendedOffsetSeconds = Math.round(safeOffsetSeconds - (shiftedGpxStartMs - first.videoEndMs) / 1000);
+    }
+
+    return {
+      status: embeddedMismatchCount > 0 ? "blocked" : "warning",
+      summary: `${mismatches.length} clip${mismatches.length === 1 ? "" : "s"} do not overlap the GPX range.`,
+      detail:
+        `${first.probe.name}: video ${formatDateTime(first.videoStartMs)} - ${formatDateTime(first.videoEndMs)}; ` +
+        `GPX ${formatDateTime(shiftedGpxStartMs)} - ${formatDateTime(shiftedGpxEndMs)}.`,
+      recommendedOffsetSeconds,
+    };
+  }, [formState.gpx_offset_seconds, gpxFile, gpxTimeRange, localVideoProbesByKey, videoFiles]);
   const renderEtaEstimate = useMemo((): RenderEtaEstimate | null => {
     if (videoFiles.length === 0) {
       return null;
@@ -1903,6 +2147,15 @@ export default function HomePage() {
       return;
     }
 
+    if (timelinePreflight.status === "blocked") {
+      const offsetHint =
+        typeof timelinePreflight.recommendedOffsetSeconds === "number"
+          ? ` Try GPX offset ${timelinePreflight.recommendedOffsetSeconds} seconds.`
+          : "";
+      setFormError(`${timelinePreflight.summary}${offsetHint}`);
+      return;
+    }
+
     if (pollRef.current) {
       clearInterval(pollRef.current);
       pollRef.current = null;
@@ -2041,6 +2294,39 @@ export default function HomePage() {
                       : "Select clips to estimate"}
                   </span>
                 </p>
+                {timelinePreflight.status !== "idle" && (
+                  <div
+                    className={
+                      "mt-3 rounded-lg border px-3 py-2 text-sm " +
+                      (timelinePreflight.status === "blocked"
+                        ? "border-red-500/50 bg-red-500/10 text-red-700 dark:text-red-300"
+                        : timelinePreflight.status === "ok"
+                          ? "border-emerald-500/50 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
+                          : "border-amber-500/50 bg-amber-500/10 text-amber-700 dark:text-amber-300")
+                    }
+                  >
+                    <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                      <div>
+                        <p className="font-medium">{timelinePreflight.summary}</p>
+                        {timelinePreflight.detail && <p className="mt-1 text-xs opacity-90">{timelinePreflight.detail}</p>}
+                      </div>
+                      {typeof timelinePreflight.recommendedOffsetSeconds === "number" && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setFormState((prev) => ({
+                              ...prev,
+                              gpx_offset_seconds: String(timelinePreflight.recommendedOffsetSeconds),
+                            }))
+                          }
+                          className="shrink-0 rounded-md border border-current px-2.5 py-1 text-xs font-semibold"
+                        >
+                          Use {timelinePreflight.recommendedOffsetSeconds}s
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
                 {downscaleTo4kLikely && (
                   <p className="mt-1 text-xs text-[var(--color-muted-foreground)]">
                     One or more clips exceed 4K and are currently set to render at 4K output for compatibility.
