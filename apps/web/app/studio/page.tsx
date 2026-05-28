@@ -1989,6 +1989,12 @@ export default function HomePage() {
       let latestLoadedBytes = 0;
       let latestTotalBytes = 0;
       let latestRateBytesPerSecond = 0;
+      const uploadFailureContext = (): string => {
+        const elapsedSeconds = Math.max((performance.now() - startedAt) / 1000, 0);
+        const totalBytes = Math.max(latestTotalBytes, latestLoadedBytes);
+        const uploaded = totalBytes > 0 ? `${formatBytes(latestLoadedBytes)} of ${formatBytes(totalBytes)}` : formatBytes(latestLoadedBytes);
+        return `after ${formatEta(elapsedSeconds)} with ${uploaded} sent`;
+      };
 
       xhr.open("POST", buildApiUrl("/api/jobs"));
       headers.forEach((value, key) => {
@@ -2019,7 +2025,7 @@ export default function HomePage() {
 
       xhr.onerror = () => {
         uploadRequestRef.current = null;
-        reject(new Error("Upload failed due to a network error."));
+        reject(new Error(`Upload failed due to a network error ${uploadFailureContext()}.`));
       };
 
       xhr.onabort = () => {
@@ -2041,7 +2047,7 @@ export default function HomePage() {
 
         if (xhr.status < 200 || xhr.status >= 300) {
           const statusLabel = xhr.statusText ? `${xhr.status} ${xhr.statusText}` : `${xhr.status}`;
-          reject(new Error(extractErrorMessage(payloadFromServer, `Failed to create render job (${statusLabel})`)));
+          reject(new Error(extractErrorMessage(payloadFromServer, `Failed to create render job (${statusLabel}) ${uploadFailureContext()}`)));
           return;
         }
 

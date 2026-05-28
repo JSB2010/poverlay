@@ -23,6 +23,7 @@ from uuid import uuid4
 import zipfile
 
 from fastapi import Body, Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
+from fastapi import Request
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -464,6 +465,40 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _log_upload_request_boundary(request: Request, call_next):  # type: ignore[no-untyped-def]
+    if request.url.path != "/api/jobs":
+        return await call_next(request)
+
+    started_at = time.monotonic()
+    content_length = request.headers.get("content-length", "unknown")
+    forwarded_for = request.headers.get("x-forwarded-for", "")
+    LOGGER.info(
+        "upload_request_start method=%s path=%s content_length=%s forwarded_for=%s",
+        request.method,
+        request.url.path,
+        content_length,
+        forwarded_for,
+    )
+    try:
+        response = await call_next(request)
+    except Exception:
+        LOGGER.exception(
+            "upload_request_exception elapsed_seconds=%.3f content_length=%s",
+            time.monotonic() - started_at,
+            content_length,
+        )
+        raise
+
+    LOGGER.info(
+        "upload_request_end status=%s elapsed_seconds=%.3f content_length=%s",
+        response.status_code,
+        time.monotonic() - started_at,
+        content_length,
+    )
+    return response
 
 
 class UserSettingsUpdate(BaseModel):

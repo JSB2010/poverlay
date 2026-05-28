@@ -52,6 +52,19 @@ If `POST /api/jobs` fails after roughly 30 seconds with a browser `502` and no A
 
 Set `NEXT_PROXY_TIMEOUT_MS` to a value longer than the expected upload duration and redeploy the web image. The default in this repo is `1800000` ms (30 minutes). For very large files, prefer a direct API/upload hostname so the browser posts straight to FastAPI instead of tunneling through the web service.
 
+If it fails after roughly 60 seconds and neither the web nor API service receives a useful app-level error, increase the Coolify proxy timeout. For the default Traefik proxy, add longer responding timeouts under **Servers > your server > Proxy > Configuration > Command**:
+
+```yaml
+--entrypoints.http.transport.respondingTimeouts.readTimeout=30m
+--entrypoints.http.transport.respondingTimeouts.writeTimeout=30m
+--entrypoints.http.transport.respondingTimeouts.idleTimeout=30m
+--entrypoints.https.transport.respondingTimeouts.readTimeout=30m
+--entrypoints.https.transport.respondingTimeouts.writeTimeout=30m
+--entrypoints.https.transport.respondingTimeouts.idleTimeout=30m
+```
+
+Restart the Coolify proxy after changing these settings. If Cloudflare is proxying the hostname, large single-request uploads are still limited by the Cloudflare plan's maximum upload size; use a DNS-only upload/API hostname or chunked uploads for files above that limit.
+
 6. **Deploy**
    - Save and deploy the resource. Coolify will build both images and start the stack.
 
