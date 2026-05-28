@@ -5,6 +5,7 @@ import json
 import os
 import sys
 from pathlib import Path
+import types
 
 import pytest
 from fastapi import HTTPException
@@ -48,10 +49,14 @@ def fake_job_store(monkeypatch: pytest.MonkeyPatch) -> dict[str, dict[str, objec
     def _list_jobs_for_uid(uid: str) -> list[dict[str, object]]:
         return [deepcopy(job) for job in store.values() if str(job.get("uid")) == uid]
 
+    def _list_all_jobs() -> list[dict[str, object]]:
+        return [deepcopy(job) for job in store.values()]
+
     monkeypatch.setattr(api_main, "_persist_job_state", _persist_job_state)
     monkeypatch.setattr(api_main, "_load_job_state", _load_job_state)
     monkeypatch.setattr(api_main, "_list_jobs_with_status", _list_jobs_with_status)
     monkeypatch.setattr(api_main, "_list_jobs_for_uid", _list_jobs_for_uid)
+    monkeypatch.setattr(api_main, "_list_all_jobs", _list_all_jobs)
     monkeypatch.setattr(api_main, "_enqueue_job", lambda job_id: None)
     monkeypatch.setattr(api_main, "FIRESTORE_ENABLED", True)
     monkeypatch.setattr(api_main, "R2_UPLOAD_ENABLED", True)
@@ -102,6 +107,74 @@ def test_media_routes_require_auth() -> None:
     assert client.delete("/api/media/job-1/video-1").status_code == 401
     assert client.post("/api/media/job-1/video-1/download-link").status_code == 401
     assert client.get("/api/user/access").status_code == 401
+
+
+def test_firebase_service_account_payload_accepts_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = {
+        "type": "service_account",
+        "project_id": "project-a",
+        "client_email": "firebase-admin@example.test",
+        "private_key": "private-key",
+    }
+
+    monkeypatch.setattr(api_main, "FIREBASE_CREDENTIALS_JSON", json.dumps(payload))
+    monkeypatch.setattr(api_main, "FIREBASE_ADMIN_CLIENT_EMAIL", "")
+    monkeypatch.setattr(api_main, "FIREBASE_ADMIN_PRIVATE_KEY", "")
+    monkeypatch.setattr(api_main, "FIREBASE_ADMIN_PRIVATE_KEY_BASE64", "")
+    monkeypatch.setattr(api_main, "FIREBASE_ADMIN_PRIVATE_KEY_PATH", None)
+
+    assert api_main._firebase_service_account_payload() == payload
+
+
+def test_firebase_service_account_payload_accepts_admin_key_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(api_main, "FIREBASE_CREDENTIALS_JSON", "")
+    monkeypatch.setattr(api_main, "FIREBASE_PROJECT_ID", "project-a")
+    monkeypatch.setattr(api_main, "FIRESTORE_PROJECT_ID", "")
+    monkeypatch.setattr(api_main, "FIREBASE_ADMIN_CLIENT_EMAIL", "firebase-admin@example.test")
+    monkeypatch.setattr(api_main, "FIREBASE_ADMIN_PRIVATE_KEY", "private-key")
+    monkeypatch.setattr(api_main, "FIREBASE_ADMIN_PRIVATE_KEY_BASE64", "")
+    monkeypatch.setattr(api_main, "FIREBASE_ADMIN_PRIVATE_KEY_PATH", None)
+
+    payload = api_main._firebase_service_account_payload()
+
+    assert payload == {
+        "type": "service_account",
+        "project_id": "project-a",
+        "client_email": "firebase-admin@example.test",
+        "private_key": "private-key",
+        "token_uri": "https://oauth2.googleapis.com/token",
+    }
+
+
+def test_firestore_client_uses_configured_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    sentinel_credentials = object()
+    created_clients: list[dict[str, object]] = []
+
+    class FakeFirestoreClient:
+        def __init__(self, **kwargs: object) -> None:
+            created_clients.append(kwargs)
+
+        def collection(self, name: str) -> tuple[str, str]:
+            return ("collection", name)
+
+    fake_firestore_module = types.ModuleType("google.cloud.firestore")
+    fake_firestore_module.Client = FakeFirestoreClient
+    fake_cloud_module = types.ModuleType("google.cloud")
+    fake_cloud_module.firestore = fake_firestore_module
+
+    monkeypatch.setitem(sys.modules, "google.cloud", fake_cloud_module)
+    monkeypatch.setitem(sys.modules, "google.cloud.firestore", fake_firestore_module)
+    monkeypatch.setattr(api_main, "_FIRESTORE_CLIENT", None)
+    monkeypatch.setattr(api_main, "FIRESTORE_ENABLED", True)
+    monkeypatch.setattr(api_main, "FIRESTORE_PROJECT_ID", "project-a")
+    monkeypatch.setattr(api_main, "FIRESTORE_DATABASE_ID", "db-a")
+    monkeypatch.setattr(api_main, "FIRESTORE_JOBS_COLLECTION", "jobs-a")
+    monkeypatch.setattr(api_main, "_google_service_account_credentials", lambda: sentinel_credentials)
+
+    collection = api_main._firestore_jobs_collection()
+
+    assert collection == ("collection", "jobs-a")
+    assert created_clients == [{"project": "project-a", "credentials": sentinel_credentials, "database": "db-a"}]
 
 
 def test_invalid_token_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:

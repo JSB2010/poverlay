@@ -31,13 +31,14 @@ This repository now deploys through Coolify using Docker Compose. The Compose fi
      - `WEB_BASE_URL` (e.g., `https://poverlay.com`)
      - `API_BASE_URL` (e.g., `https://poverlay.com/api`)
      - `NEXT_PUBLIC_SITE_URL` (e.g., `https://poverlay.com`)
-     - `NEXT_PUBLIC_API_BASE` (e.g., `https://poverlay.com/api`)
+     - `NEXT_PUBLIC_API_BASE` (leave empty for the same-domain Next.js `/api` proxy, or use the site origin such as `https://poverlay.com`; do not append `/api`)
      - `CORS_ORIGINS` (include your public domain)
    - Recommended values:
      - `API_PROXY_TARGET=http://api:8787`
      - `NEXT_PROXY_CLIENT_MAX_BODY_SIZE=64gb`
    - Set **Build + Runtime** for `NEXT_PUBLIC_*`, `API_PROXY_TARGET`, and `NEXT_PROXY_CLIENT_MAX_BODY_SIZE`.
    - Set **Runtime only** for secrets (Firebase admin keys, R2 keys, Brevo, etc).
+   - If `FIRESTORE_ENABLED=true`, provide one Firebase service-account source to the API container: `FIREBASE_CREDENTIALS_JSON`, `FIREBASE_CREDENTIALS_PATH`, `GOOGLE_APPLICATION_CREDENTIALS`, or `FIREBASE_ADMIN_CLIENT_EMAIL` plus one `FIREBASE_ADMIN_PRIVATE_KEY*` value.
 
 5. **Domains**
    - Assign your public domain to the **web** service and set the port to **3000**.

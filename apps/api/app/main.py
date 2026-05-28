@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from copy import deepcopy
@@ -313,6 +314,10 @@ FIREBASE_AUTH_ENABLED = RUNTIME_CONFIG.firebase.auth_enabled
 FIREBASE_PROJECT_ID = (RUNTIME_CONFIG.firebase.project_id or "").strip()
 FIREBASE_CREDENTIALS_JSON = (RUNTIME_CONFIG.firebase.credentials_json or "").strip()
 FIREBASE_CREDENTIALS_PATH = (RUNTIME_CONFIG.firebase.credentials_path or "").strip()
+FIREBASE_ADMIN_CLIENT_EMAIL = (RUNTIME_CONFIG.firebase.admin_client_email or "").strip()
+FIREBASE_ADMIN_PRIVATE_KEY = (RUNTIME_CONFIG.firebase.admin_private_key or "").strip()
+FIREBASE_ADMIN_PRIVATE_KEY_BASE64 = (RUNTIME_CONFIG.firebase.admin_private_key_base64 or "").strip()
+FIREBASE_ADMIN_PRIVATE_KEY_PATH = RUNTIME_CONFIG.firebase.admin_private_key_path
 FIRESTORE_ENABLED = RUNTIME_CONFIG.firestore.enabled
 FIRESTORE_PROJECT_ID = (RUNTIME_CONFIG.firestore.project_id or "").strip()
 FIRESTORE_DATABASE_ID = RUNTIME_CONFIG.firestore.database_id
@@ -539,6 +544,55 @@ def _cache_job_state(job: dict[str, Any]) -> None:
         JOBS[str(job["id"])] = deepcopy(job)
 
 
+def _firebase_admin_private_key() -> str:
+    if FIREBASE_ADMIN_PRIVATE_KEY:
+        return FIREBASE_ADMIN_PRIVATE_KEY
+    if FIREBASE_ADMIN_PRIVATE_KEY_BASE64:
+        return base64.b64decode(FIREBASE_ADMIN_PRIVATE_KEY_BASE64).decode("utf-8")
+    if FIREBASE_ADMIN_PRIVATE_KEY_PATH:
+        return FIREBASE_ADMIN_PRIVATE_KEY_PATH.read_text()
+    return ""
+
+
+def _firebase_service_account_payload() -> dict[str, Any] | None:
+    if FIREBASE_CREDENTIALS_JSON:
+        try:
+            payload = json.loads(FIREBASE_CREDENTIALS_JSON)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Invalid FIREBASE_CREDENTIALS_JSON") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError("FIREBASE_CREDENTIALS_JSON must be a JSON object")
+        return payload
+
+    private_key = _firebase_admin_private_key()
+    if FIREBASE_ADMIN_CLIENT_EMAIL and private_key:
+        project_id = FIREBASE_PROJECT_ID or FIRESTORE_PROJECT_ID
+        return {
+            "type": "service_account",
+            "project_id": project_id,
+            "client_email": FIREBASE_ADMIN_CLIENT_EMAIL,
+            "private_key": private_key,
+            "token_uri": "https://oauth2.googleapis.com/token",
+        }
+
+    return None
+
+
+def _google_service_account_credentials() -> Any | None:
+    payload = _firebase_service_account_payload()
+    if payload is None and not FIREBASE_CREDENTIALS_PATH:
+        return None
+
+    try:
+        from google.oauth2 import service_account
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError("google-auth service account support is unavailable") from exc
+
+    if payload is not None:
+        return service_account.Credentials.from_service_account_info(payload)
+    return service_account.Credentials.from_service_account_file(FIREBASE_CREDENTIALS_PATH)
+
+
 def _firestore_jobs_collection() -> Any:
     if not FIRESTORE_ENABLED:
         raise RuntimeError("Firestore-backed job state is disabled")
@@ -557,6 +611,9 @@ def _firestore_jobs_collection() -> Any:
             client_kwargs: dict[str, Any] = {}
             if FIRESTORE_PROJECT_ID:
                 client_kwargs["project"] = FIRESTORE_PROJECT_ID
+            credentials = _google_service_account_credentials()
+            if credentials is not None:
+                client_kwargs["credentials"] = credentials
 
             try:
                 _FIRESTORE_CLIENT = firestore.Client(database=FIRESTORE_DATABASE_ID, **client_kwargs)
@@ -1594,11 +1651,11 @@ def _firebase_auth_module() -> Any:
 
         options = {"projectId": FIREBASE_PROJECT_ID} if FIREBASE_PROJECT_ID else None
         if not firebase_admin._apps:
-            if FIREBASE_CREDENTIALS_JSON:
-                try:
-                    credential_payload = json.loads(FIREBASE_CREDENTIALS_JSON)
-                except json.JSONDecodeError as exc:
-                    raise HTTPException(status_code=500, detail="Invalid FIREBASE_CREDENTIALS_JSON") from exc
+            try:
+                credential_payload = _firebase_service_account_payload()
+            except RuntimeError as exc:
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
+            if credential_payload is not None:
                 firebase_admin.initialize_app(credentials.Certificate(credential_payload), options=options)
             elif FIREBASE_CREDENTIALS_PATH:
                 firebase_admin.initialize_app(credentials.Certificate(FIREBASE_CREDENTIALS_PATH), options=options)

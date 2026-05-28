@@ -34,5 +34,8 @@ export function apiUrl(path: string, configuredApiBase: string): string {
 
   const base = resolveApiBase(configuredApiBase);
   const normalizedPath = path.startsWith("/") ? path : `/${path}`;
-  return base ? `${base}${normalizedPath}` : normalizedPath;
+  const pathForBase = base.endsWith("/api") && normalizedPath.startsWith("/api/")
+    ? normalizedPath.slice("/api".length)
+    : normalizedPath;
+  return base ? `${base}${pathForBase}` : normalizedPath;
 }
