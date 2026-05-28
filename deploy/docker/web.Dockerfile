@@ -39,7 +39,30 @@ ENV NEXT_PUBLIC_SITE_URL="${NEXT_PUBLIC_SITE_URL}" \
     API_PROXY_TARGET="${API_PROXY_TARGET}" \
     NEXT_PROXY_CLIENT_MAX_BODY_SIZE="${NEXT_PROXY_CLIENT_MAX_BODY_SIZE}"
 
-RUN pnpm --filter @poverlay/web build && ./scripts/sync-next-standalone.sh
+RUN set -euo pipefail; \
+    flag="$(printf '%s' "${NEXT_PUBLIC_FIREBASE_AUTH_ENABLED}" | tr '[:upper:]' '[:lower:]')"; \
+    case "${flag}" in \
+      1|true|yes|on) \
+        missing=""; \
+        for key in \
+          NEXT_PUBLIC_FIREBASE_API_KEY \
+          NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN \
+          NEXT_PUBLIC_FIREBASE_PROJECT_ID \
+          NEXT_PUBLIC_FIREBASE_APP_ID \
+          NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID \
+          NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET; do \
+          value="$(printenv "${key}" || true)"; \
+          if [ -z "${value}" ]; then \
+            missing="${missing} ${key}"; \
+          fi; \
+        done; \
+        if [ -n "${missing}" ]; then \
+          echo "Missing required Firebase public env at build:${missing}" >&2; \
+          exit 1; \
+        fi; \
+        ;; \
+    esac; \
+    pnpm --filter @poverlay/web build && ./scripts/sync-next-standalone.sh
 
 FROM node:20-bookworm-slim
 
