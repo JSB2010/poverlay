@@ -1,9 +1,9 @@
 use std::{
     path::PathBuf,
-    process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
 };
 use tauri::{Emitter, Manager};
+use tauri_plugin_shell::{process::CommandChild, ShellExt};
 
 #[tauri::command]
 fn worker_status() -> serde_json::Value {
@@ -32,26 +32,15 @@ fn desktop_paths() -> serde_json::Value {
     })
 }
 
-fn bundled_worker_path() -> Option<PathBuf> {
-    let executable = std::env::current_exe().ok()?;
-    let file_name = if cfg!(windows) {
-        "poverlay-worker.exe"
-    } else {
-        "poverlay-worker"
-    };
-    let sibling = executable.with_file_name(file_name);
-    sibling.is_file().then_some(sibling)
-}
-
-fn spawn_worker() -> Result<Child, String> {
-    let worker_path = bundled_worker_path().ok_or_else(|| "Bundled local worker sidecar was not found".to_string())?;
-    Command::new(worker_path)
+fn spawn_worker<R: tauri::Runtime>(app: &tauri::App<R>) -> Result<CommandChild, String> {
+    let (_events, child) = app
+        .shell()
+        .sidecar("poverlay-worker")
+        .map_err(|error| format!("Could not resolve local worker sidecar: {error}"))?
         .args(["serve", "--host", "127.0.0.1", "--port", "47981"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
         .spawn()
-        .map_err(|error| format!("Could not start local worker: {error}"))
+        .map_err(|error| format!("Could not start local worker: {error}"))?;
+    Ok(child)
 }
 
 pub fn run() {
@@ -60,8 +49,9 @@ pub fn run() {
     let close_worker_process = Arc::clone(&worker_process);
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_shell::init())
         .setup(move |app| {
-            match spawn_worker() {
+            match spawn_worker(app) {
                 Ok(child) => {
                     if let Ok(mut process) = setup_worker_process.lock() {
                         *process = Some(child);
@@ -74,7 +64,6 @@ pub fn run() {
             }
             Ok(())
         })
-        .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_focus();
@@ -88,7 +77,7 @@ pub fn run() {
         .on_window_event(move |_window, event| {
             if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
                 if let Ok(mut process) = close_worker_process.lock() {
-                    if let Some(mut child) = process.take() {
+                    if let Some(child) = process.take() {
                         let _ = child.kill();
                     }
                 }

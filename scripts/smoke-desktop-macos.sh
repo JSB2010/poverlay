@@ -20,6 +20,7 @@ executable="$(
 
 if [[ -z "$executable" ]]; then
   echo "No executable found in $app_path/Contents/MacOS" >&2
+  find "$app_path/Contents/MacOS" -maxdepth 1 -type f -print >&2 || true
   exit 1
 fi
 
@@ -42,6 +43,8 @@ for _ in $(seq 1 60); do
   if ! kill -0 "$app_pid" >/dev/null 2>&1; then
     echo "Desktop app exited before worker became healthy. Log follows:" >&2
     cat "$log_file" >&2
+    echo "Bundle executables:" >&2
+    find "$app_path/Contents/MacOS" -maxdepth 1 -type f -perm -111 -print >&2 || true
     exit 1
   fi
 
@@ -56,4 +59,6 @@ done
 
 echo "Timed out waiting for local worker health endpoint. App log follows:" >&2
 cat "$log_file" >&2
+echo "Bundle executables:" >&2
+find "$app_path/Contents/MacOS" -maxdepth 1 -type f -perm -111 -print >&2 || true
 exit 1
