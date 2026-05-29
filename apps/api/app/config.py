@@ -143,6 +143,9 @@ class ApiRuntimeConfig:
     ffmpeg_threads_per_render: int
     delete_inputs_on_complete: bool
     delete_work_on_complete: bool
+    local_render_enabled: bool
+    local_smoke_auth_uid: str | None
+    local_smoke_in_memory_jobs: bool
     api_base_url: str
     web_base_url: str
     firebase: FirebaseConfig
@@ -243,6 +246,9 @@ def load_runtime_config(*, repo_root: Path, service_root: Path) -> ApiRuntimeCon
         ffmpeg_threads_per_render=_read_int("FFMPEG_THREADS_PER_RENDER", 0, 0),
         delete_inputs_on_complete=_read_bool("DELETE_INPUTS_ON_COMPLETE", True),
         delete_work_on_complete=_read_bool("DELETE_WORK_ON_COMPLETE", True),
+        local_render_enabled=_read_bool("LOCAL_RENDER_ENABLED", False),
+        local_smoke_auth_uid=_read_optional("POVERLAY_LOCAL_SMOKE_AUTH_UID"),
+        local_smoke_in_memory_jobs=_read_bool("POVERLAY_LOCAL_SMOKE_IN_MEMORY_JOBS", False),
         api_base_url=_read_optional("API_BASE_URL") or "http://127.0.0.1:8787",
         web_base_url=_read_optional("WEB_BASE_URL") or "http://127.0.0.1:3000",
         firebase=firebase,

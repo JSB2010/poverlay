@@ -37,3 +37,6 @@ jobs:
 
       - name: Run monorepo checks
         run: pnpm check
+
+      - name: Smoke local render HTTP flow
+        run: pnpm smoke:local-render:http

@@ -1,6 +1,10 @@
 type PublicWebConfig = {
   siteUrl: string;
   apiBase: string;
+  desktopDownloads: {
+    macosUrl: string;
+    windowsUrl: string;
+  };
   firebaseAuthEnabled: boolean;
   firebase: {
     apiKey: string;
@@ -19,6 +23,9 @@ const BOOL_FALSE = new Set(["0", "false", "no", "off"]);
 const PUBLIC_ENV = {
   NEXT_PUBLIC_SITE_URL: process.env.NEXT_PUBLIC_SITE_URL,
   NEXT_PUBLIC_API_BASE: process.env.NEXT_PUBLIC_API_BASE,
+  NEXT_PUBLIC_DESKTOP_DOWNLOAD_BASE_URL: process.env.NEXT_PUBLIC_DESKTOP_DOWNLOAD_BASE_URL,
+  NEXT_PUBLIC_DESKTOP_MACOS_DOWNLOAD_URL: process.env.NEXT_PUBLIC_DESKTOP_MACOS_DOWNLOAD_URL,
+  NEXT_PUBLIC_DESKTOP_WINDOWS_DOWNLOAD_URL: process.env.NEXT_PUBLIC_DESKTOP_WINDOWS_DOWNLOAD_URL,
   NEXT_PUBLIC_FIREBASE_AUTH_ENABLED: process.env.NEXT_PUBLIC_FIREBASE_AUTH_ENABLED,
   NEXT_PUBLIC_FIREBASE_API_KEY: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
   NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN: process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN,
@@ -46,6 +53,10 @@ function trimmed(raw: string | undefined): string {
   return (raw ?? "").trim();
 }
 
+function joinDownloadBase(baseUrl: string, filename: string): string {
+  return baseUrl ? `${baseUrl.replace(/\/+$/, "")}/${filename}` : "";
+}
+
 function requiredWhenEnabled(name: string, value: string, errors: string[]): void {
   if (!value) {
     errors.push(`${name} is required when NEXT_PUBLIC_FIREBASE_AUTH_ENABLED=true.`);
@@ -60,6 +71,13 @@ function loadPublicWebConfig(): PublicWebConfig {
   );
   const siteUrl = trimmed(PUBLIC_ENV.NEXT_PUBLIC_SITE_URL) || "https://poverlay.com";
   const apiBase = trimmed(PUBLIC_ENV.NEXT_PUBLIC_API_BASE).replace(/\/+$/, "");
+  const desktopDownloadBaseUrl = trimmed(PUBLIC_ENV.NEXT_PUBLIC_DESKTOP_DOWNLOAD_BASE_URL);
+  const desktopMacosUrl =
+    trimmed(PUBLIC_ENV.NEXT_PUBLIC_DESKTOP_MACOS_DOWNLOAD_URL) ||
+    joinDownloadBase(desktopDownloadBaseUrl, "poverlay-desktop-macos.dmg");
+  const desktopWindowsUrl =
+    trimmed(PUBLIC_ENV.NEXT_PUBLIC_DESKTOP_WINDOWS_DOWNLOAD_URL) ||
+    joinDownloadBase(desktopDownloadBaseUrl, "poverlay-desktop-windows.exe");
 
   const firebaseApiKey = trimmed(PUBLIC_ENV.NEXT_PUBLIC_FIREBASE_API_KEY);
   const firebaseAuthDomain = trimmed(PUBLIC_ENV.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN);
@@ -88,6 +106,10 @@ function loadPublicWebConfig(): PublicWebConfig {
   return {
     siteUrl,
     apiBase,
+    desktopDownloads: {
+      macosUrl: desktopMacosUrl,
+      windowsUrl: desktopWindowsUrl,
+    },
     firebaseAuthEnabled,
     firebase: firebaseAuthEnabled
       ? {

@@ -65,6 +65,7 @@ type MetaResponse = {
   render_profiles?: RenderProfile[];
   default_render_profile?: string;
   render_eta_calibration?: RenderEtaCalibration;
+  local_render_enabled?: boolean;
 };
 
 type LayoutPreviewManifest = {
@@ -91,6 +92,7 @@ type VideoState = {
   wall_x_realtime?: number | null;
   download_url?: string | null;
   log_name?: string | null;
+  layout_xml?: string | null;
 };
 
 type JobStatus = {
@@ -102,6 +104,16 @@ type JobStatus = {
   updated_at?: string | null;
   videos: VideoState[];
   download_all_url?: string | null;
+};
+
+type LocalRenderPairing = {
+  pairing_code: string;
+  expires_at: string;
+  desktop_deep_link: string;
+};
+
+type LocalWorkerPairing = {
+  local_token: string;
 };
 
 type UploadProgressState = {
@@ -155,6 +167,8 @@ type PipelineStepState = "pending" | "active" | "done" | "error";
 type PipelineStepMetric = { label: string; value: string };
 
 type FormState = {
+  render_target: "server" | "local";
+  save_local_render_to_media_library: boolean;
   overlay_theme: string;
   layout_style: string;
   render_profile: string;
@@ -171,6 +185,8 @@ type FormState = {
 };
 
 const CONFIGURED_API_BASE = PUBLIC_WEB_CONFIG.apiBase;
+const DESKTOP_DOWNLOADS = PUBLIC_WEB_CONFIG.desktopDownloads;
+const LOCAL_WORKER_BASE = "http://127.0.0.1:47981";
 
 const TERMINAL_STATES = new Set(["completed", "completed_with_errors", "failed"]);
 
@@ -335,6 +351,8 @@ const FALLBACK_COMPONENT_VISIBILITY: Record<string, boolean> = {
 const FALLBACK_MAP_STYLES = ["osm", "geo-dark-matter", "geo-positron", "geo-positron-blue", "geo-toner"];
 
 const DEFAULT_FORM_STATE: FormState = {
+  render_target: "server",
+  save_local_render_to_media_library: false,
   overlay_theme: "powder-neon",
   layout_style: "summit-grid",
   render_profile: "auto",
@@ -1136,6 +1154,7 @@ export default function HomePage() {
   const [mapStyles, setMapStyles] = useState<string[]>(FALLBACK_MAP_STYLES);
   const [renderProfiles, setRenderProfiles] = useState<RenderProfile[]>(FALLBACK_RENDER_PROFILES);
   const [etaCalibration, setEtaCalibration] = useState<RenderEtaCalibration | null>(null);
+  const [localRenderEnabled, setLocalRenderEnabled] = useState(false);
   const [tuningSliderValue, setTuningSliderValue] = useState(72);
 
   const [gpxFile, setGpxFile] = useState<File | null>(null);
@@ -1148,6 +1167,9 @@ export default function HomePage() {
   const [submissionStage, setSubmissionStage] = useState<SubmissionStage>("idle");
   const [formError, setFormError] = useState<string | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
+  const [localRenderPairing, setLocalRenderPairing] = useState<LocalRenderPairing | null>(null);
+  const [localWorkerToken, setLocalWorkerToken] = useState<string | null>(null);
+  const [localWorkerStatus, setLocalWorkerStatus] = useState<"unknown" | "waiting" | "connected" | "missing">("unknown");
   const [uploadProgress, setUploadProgress] = useState<UploadProgressState>({
     loadedBytes: 0,
     totalBytes: 0,
@@ -1203,6 +1225,7 @@ export default function HomePage() {
         setMapStyles(nextMapStyles);
         setRenderProfiles(nextProfiles);
         setEtaCalibration(meta.render_eta_calibration ?? null);
+        setLocalRenderEnabled(Boolean(meta.local_render_enabled));
 
         const defaults = makeDefaultVisibility(nextComponents, meta.default_component_visibility);
         setComponentVisibility(defaults);
@@ -1235,6 +1258,7 @@ export default function HomePage() {
         setMapStyles(FALLBACK_MAP_STYLES);
         setRenderProfiles(FALLBACK_RENDER_PROFILES);
         setEtaCalibration(null);
+        setLocalRenderEnabled(false);
       }
     }
 
@@ -2071,6 +2095,148 @@ export default function HomePage() {
     });
   }
 
+  function renderSettingsPayload(): Record<string, unknown> {
+    return {
+      overlay_theme: formState.overlay_theme,
+      layout_style: formState.layout_style,
+      render_profile: formState.render_profile,
+      map_style: formState.map_style,
+      speed_units: formState.speed_units,
+      gpx_speed_unit: formState.gpx_speed_unit,
+      distance_units: formState.distance_units,
+      altitude_units: formState.altitude_units,
+      temperature_units: formState.temperature_units,
+      gpx_offset_seconds: Number(formState.gpx_offset_seconds),
+      fps_mode: formState.fps_mode,
+      fixed_fps: Number(formState.fixed_fps),
+      component_visibility: componentVisibility,
+      include_maps: mapsEnabled,
+    };
+  }
+
+  async function startLocalRenderPairing(): Promise<LocalRenderPairing> {
+    const response = await fetch(buildApiUrl("/api/local-render/pairing/start"), {
+      method: "POST",
+      headers: await authHeaders(),
+    });
+    const payload = await readApiPayload(response);
+    if (!response.ok) {
+      throw new Error(extractErrorMessage(payload, "Could not start local render pairing"));
+    }
+    if (
+      !isObjectRecord(payload) ||
+      typeof payload.pairing_code !== "string" ||
+      typeof payload.expires_at !== "string" ||
+      typeof payload.desktop_deep_link !== "string"
+    ) {
+      throw new Error("Invalid local render pairing response");
+    }
+    return payload as LocalRenderPairing;
+  }
+
+  function apiBaseForLocalWorker(): string {
+    return new URL(buildApiUrl("/api/meta"), window.location.href).origin;
+  }
+
+  async function waitForLocalWorker(timeoutMs = 15000): Promise<void> {
+    const startedAt = Date.now();
+    setLocalWorkerStatus("waiting");
+    while (Date.now() - startedAt < timeoutMs) {
+      try {
+        const response = await fetch(`${LOCAL_WORKER_BASE}/health`, { cache: "no-store" });
+        if (response.ok) {
+          setLocalWorkerStatus("connected");
+          return;
+        }
+      } catch {
+        // The desktop app may still be starting.
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    setLocalWorkerStatus("missing");
+    throw new Error("POVerlay Desktop did not respond on localhost. Start the desktop app and try again.");
+  }
+
+  async function completeLocalWorkerPairing(pairing: LocalRenderPairing): Promise<LocalWorkerPairing> {
+    const response = await fetch(`${LOCAL_WORKER_BASE}/pairing/complete`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        api_base_url: apiBaseForLocalWorker(),
+        pairing_code: pairing.pairing_code,
+      }),
+    });
+    const payload = await readApiPayload(response);
+    if (!response.ok) {
+      throw new Error(extractErrorMessage(payload, "Could not pair with POVerlay Desktop"));
+    }
+    if (!isObjectRecord(payload) || typeof payload.local_token !== "string") {
+      throw new Error("Invalid local worker pairing response");
+    }
+    return payload as LocalWorkerPairing;
+  }
+
+  async function createLocalRenderJob(): Promise<JobStatus> {
+    if (!gpxFile) {
+      throw new Error("Select a GPX file to continue.");
+    }
+    const headers = await authHeaders();
+    headers.set("Content-Type", "application/json");
+    const response = await fetch(buildApiUrl("/api/local-render/jobs"), {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        gpx_name: gpxFile.name,
+        videos: videoFiles.map((file) => {
+          const probe = localVideoProbesByKey[localVideoProbeKey(file)];
+          return {
+            input_name: file.name,
+            title: file.name.replace(/\.[^.]+$/, ""),
+            size_bytes: file.size,
+            source_resolution: probe?.width && probe.height ? `${probe.width}x${probe.height}` : null,
+            source_fps: probe?.fps ? String(probe.fps) : null,
+            source_duration_seconds: probe?.durationSeconds ?? null,
+          };
+        }),
+        settings: renderSettingsPayload(),
+        upload_intent: formState.save_local_render_to_media_library ? "media_library" : "local_only",
+      }),
+    });
+    const payload = await readApiPayload(response);
+    if (!response.ok) {
+      throw new Error(extractErrorMessage(payload, "Could not create local render job"));
+    }
+    if (!isObjectRecord(payload) || typeof payload.id !== "string") {
+      throw new Error("Invalid local render job response");
+    }
+    setJob(payload as JobStatus);
+    return payload as JobStatus;
+  }
+
+  async function submitLocalWorkerJob(localJob: JobStatus, localToken: string): Promise<void> {
+    if (!gpxFile) {
+      throw new Error("Select a GPX file to continue.");
+    }
+    const payload = new FormData();
+    payload.append("job_manifest", JSON.stringify(localJob));
+    payload.append("gpx", gpxFile);
+    for (const video of videoFiles) {
+      payload.append("videos", video);
+    }
+
+    const response = await fetch(`${LOCAL_WORKER_BASE}/jobs`, {
+      method: "POST",
+      headers: {
+        "X-POVerlay-Local-Token": localToken,
+      },
+      body: payload,
+    });
+    const responsePayload = await readApiPayload(response);
+    if (!response.ok) {
+      throw new Error(extractErrorMessage(responsePayload, "Could not start local render"));
+    }
+  }
+
   async function downloadAuthenticated(path: string, fallbackFilename: string): Promise<void> {
     try {
       setStatusError(null);
@@ -2154,6 +2320,26 @@ export default function HomePage() {
       return;
     }
 
+    if (formState.render_target === "local" && !localRenderEnabled) {
+      setFormError("Local rendering is not enabled for this environment yet.");
+      return;
+    }
+
+    if (formState.render_target === "local") {
+      const unreadableMetadata = videoFiles.filter((file) => {
+        const probe = localVideoProbesByKey[localVideoProbeKey(file)];
+        return !probe?.width || !probe.height;
+      });
+      if (unreadableMetadata.length > 0) {
+        setFormError(
+          `Local rendering needs readable clip dimensions. Use server render for ${unreadableMetadata
+            .map((file) => file.name)
+            .join(", ")} or choose browser-readable MP4 clips.`,
+        );
+        return;
+      }
+    }
+
     if (timelinePreflight.status === "blocked") {
       const offsetHint =
         typeof timelinePreflight.recommendedOffsetSeconds === "number"
@@ -2175,6 +2361,32 @@ export default function HomePage() {
     setJob(null);
     setActiveJobId(null);
     setLastStatusUpdateAt(null);
+
+    if (formState.render_target === "local") {
+      try {
+        setSubmissionStage("queued");
+        const pairing = await startLocalRenderPairing();
+        setLocalRenderPairing(pairing);
+        window.location.href = pairing.desktop_deep_link;
+        await waitForLocalWorker();
+        const workerPairing = await completeLocalWorkerPairing(pairing);
+        setLocalWorkerToken(workerPairing.local_token);
+        const localJob = await createLocalRenderJob();
+        setActiveJobId(localJob.id);
+        await submitLocalWorkerJob(localJob, workerPairing.local_token);
+        setSubmissionStage("rendering");
+
+        pollRef.current = setInterval(() => {
+          void pollJob(localJob.id);
+        }, 2000);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Failed to create local render job";
+        setFormError(message);
+        setSubmissionStage("failed");
+        setIsSubmitting(false);
+      }
+      return;
+    }
 
     const estimatedUploadBytes = (gpxFile?.size ?? 0) + videoFiles.reduce((sum, video) => sum + video.size, 0);
     setUploadProgress({
@@ -2256,8 +2468,91 @@ export default function HomePage() {
         <section className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-card)] p-5 shadow-sm sm:p-6">
           <form onSubmit={handleSubmit} className="space-y-6">
             <section className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-background)]/55 p-5">
+              <h2 className="text-lg font-semibold">Render target</h2>
+              <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                {[
+                  {
+                    id: "server",
+                    title: "Server render",
+                    detail: "Upload source files, wait in queue, and download from your media library.",
+                  },
+                  {
+                    id: "local",
+                    title: "This computer",
+                    detail: localRenderEnabled
+                      ? "Use the desktop app to render locally. Source videos stay on this machine."
+                      : "Local rendering is not enabled for this environment yet.",
+                  },
+                ].map((option) => (
+                  <button
+                    key={option.id}
+                    type="button"
+                    disabled={option.id === "local" && !localRenderEnabled}
+                    onClick={() => setFormState((prev) => ({ ...prev, render_target: option.id as FormState["render_target"] }))}
+                    className={`rounded-xl border p-4 text-left transition ${
+                      formState.render_target === option.id
+                        ? "border-[var(--color-primary)] bg-[var(--color-primary)]/10"
+                        : "border-[var(--color-border)] bg-[var(--color-card)]"
+                    } ${option.id === "local" && !localRenderEnabled ? "cursor-not-allowed opacity-60" : ""}`}
+                  >
+                    <span className="block text-sm font-semibold">{option.title}</span>
+                    <span className="mt-1 block text-xs text-[var(--color-muted-foreground)]">{option.detail}</span>
+                  </button>
+                ))}
+              </div>
+              {formState.render_target === "local" && (
+                <div className="mt-4 rounded-xl border border-[var(--color-border)] bg-[var(--color-card)] px-4 py-3 text-sm">
+                  <p className="font-medium">Desktop app required</p>
+                  <p className="mt-1 text-[var(--color-muted-foreground)]">
+                    Starting a local render creates a job manifest and opens POVerlay Desktop with a secure pairing link.
+                  </p>
+                  <p className="mt-2 text-xs text-[var(--color-muted-foreground)]">
+                    Status: {localWorkerStatus === "connected" ? "desktop app connected" : localWorkerStatus === "waiting" ? "waiting for desktop app" : localWorkerStatus === "missing" ? "desktop app not found" : "not checked"}
+                    {localWorkerToken ? " • paired" : ""}
+                  </p>
+                  <label className="mt-3 flex items-start gap-2 text-xs text-[var(--color-muted-foreground)]">
+                    <input
+                      type="checkbox"
+                      checked={formState.save_local_render_to_media_library}
+                      onChange={(event) =>
+                        setFormState((prev) => ({
+                          ...prev,
+                          save_local_render_to_media_library: event.target.checked,
+                        }))
+                      }
+                      className="mt-0.5"
+                    />
+                    <span>Save finished local renders to my media library. Source videos still stay on this computer.</span>
+                  </label>
+                  {DESKTOP_DOWNLOADS.macosUrl || DESKTOP_DOWNLOADS.windowsUrl ? (
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      {DESKTOP_DOWNLOADS.macosUrl && (
+                        <a className="rounded-md border border-[var(--color-border)] px-3 py-1.5 text-xs font-semibold" href={DESKTOP_DOWNLOADS.macosUrl}>
+                          Download for macOS
+                        </a>
+                      )}
+                      {DESKTOP_DOWNLOADS.windowsUrl && (
+                        <a className="rounded-md border border-[var(--color-border)] px-3 py-1.5 text-xs font-semibold" href={DESKTOP_DOWNLOADS.windowsUrl}>
+                          Download for Windows
+                        </a>
+                      )}
+                    </div>
+                  ) : (
+                    <p className="mt-3 text-xs text-[var(--color-muted-foreground)]">
+                      Desktop installers are not published for this environment yet.
+                    </p>
+                  )}
+                </div>
+              )}
+            </section>
+
+            <section className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-background)]/55 p-5">
               <h2 className="text-lg font-semibold">1. Upload assets</h2>
-              <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">Use one GPX file and one or more clips.</p>
+              <p className="mt-1 text-sm text-[var(--color-muted-foreground)]">
+                {formState.render_target === "local"
+                  ? "Choose one GPX file and one or more clips. The source videos stay local."
+                  : "Use one GPX file and one or more clips."}
+              </p>
               <div className="mt-4 grid gap-5 sm:grid-cols-2">
                 <label className="block" htmlFor="gpx">
                   <span className="mb-2 block text-sm font-medium">GPX file (Slopes export)</span>
@@ -2358,7 +2653,9 @@ export default function HomePage() {
                   </p>
                 )}
                 <p className="mt-1 text-xs text-[var(--color-muted-foreground)]">
-                  Keep this tab open through upload completion. Rendering continues server-side after upload.
+                  {formState.render_target === "local"
+                    ? "Keep POVerlay Desktop open while rendering. Server rendering remains available as a fallback."
+                    : "Keep this tab open through upload completion. Rendering continues server-side after upload."}
                 </p>
               </div>
             </section>

@@ -1,0 +1,82 @@
+name: Deployed Local Render Smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      api_base:
+        description: "Hosted API origin, for example https://api.poverlay.com."
+        required: true
+        type: string
+      web_origin:
+        description: "Hosted web origin used as local-worker Origin header. Defaults to api_base."
+        required: false
+        type: string
+      timeout_seconds:
+        description: "Seconds to wait for the deployed local job to finish."
+        required: false
+        default: "45"
+        type: string
+
+jobs:
+  deployed-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate smoke inputs and secrets
+        env:
+          POVERLAY_DEPLOYED_API_BASE: ${{ inputs.api_base }}
+          POVERLAY_DEPLOYED_AUTH_TOKEN: ${{ secrets.POVERLAY_DEPLOYED_SMOKE_AUTH_TOKEN }}
+          POVERLAY_DEPLOYED_FIREBASE_API_KEY: ${{ secrets.POVERLAY_DEPLOYED_FIREBASE_API_KEY }}
+          POVERLAY_DEPLOYED_FIREBASE_EMAIL: ${{ secrets.POVERLAY_DEPLOYED_FIREBASE_EMAIL }}
+          POVERLAY_DEPLOYED_FIREBASE_PASSWORD: ${{ secrets.POVERLAY_DEPLOYED_FIREBASE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${POVERLAY_DEPLOYED_API_BASE:-}" ]]; then
+            echo "api_base input is required." >&2
+            exit 1
+          fi
+          if [[ -n "${POVERLAY_DEPLOYED_AUTH_TOKEN:-}" ]]; then
+            exit 0
+          fi
+          if [[ -z "${POVERLAY_DEPLOYED_FIREBASE_API_KEY:-}" || -z "${POVERLAY_DEPLOYED_FIREBASE_EMAIL:-}" || -z "${POVERLAY_DEPLOYED_FIREBASE_PASSWORD:-}" ]]; then
+            echo "Configure either POVERLAY_DEPLOYED_SMOKE_AUTH_TOKEN or all of POVERLAY_DEPLOYED_FIREBASE_API_KEY, POVERLAY_DEPLOYED_FIREBASE_EMAIL, and POVERLAY_DEPLOYED_FIREBASE_PASSWORD." >&2
+            exit 1
+          fi
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Setup pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@9.15.4 --activate
+
+      - name: Install Python dependencies
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install -r apps/api/requirements-dev.txt
+
+      - name: Install JS dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run deployed local-render smoke
+        env:
+          POVERLAY_DEPLOYED_API_BASE: ${{ inputs.api_base }}
+          POVERLAY_DEPLOYED_WEB_ORIGIN: ${{ inputs.web_origin || inputs.api_base }}
+          POVERLAY_DEPLOYED_AUTH_TOKEN: ${{ secrets.POVERLAY_DEPLOYED_SMOKE_AUTH_TOKEN }}
+          POVERLAY_DEPLOYED_FIREBASE_API_KEY: ${{ secrets.POVERLAY_DEPLOYED_FIREBASE_API_KEY }}
+          POVERLAY_DEPLOYED_FIREBASE_EMAIL: ${{ secrets.POVERLAY_DEPLOYED_FIREBASE_EMAIL }}
+          POVERLAY_DEPLOYED_FIREBASE_PASSWORD: ${{ secrets.POVERLAY_DEPLOYED_FIREBASE_PASSWORD }}
+          POVERLAY_DEPLOYED_SMOKE_TIMEOUT_SECONDS: ${{ inputs.timeout_seconds }}
+        run: pnpm smoke:deployed-local-render
