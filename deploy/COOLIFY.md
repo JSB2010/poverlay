@@ -37,6 +37,7 @@ This repository now deploys through Coolify using Docker Compose. The Compose fi
      - `API_PROXY_TARGET=http://api:8787`
      - `NEXT_PROXY_CLIENT_MAX_BODY_SIZE=64gb`
      - `NEXT_PROXY_TIMEOUT_MS=1800000` for 30-minute proxied upload requests
+     - `NEXT_PUBLIC_DESKTOP_DOWNLOAD_BASE_URL=https://github.com/JSB2010/poverlay/releases/download/desktop-beta-20260529-a3b826b` until signed production installers replace the beta assets.
    - Set **Build + Runtime** for `NEXT_PUBLIC_*`, `API_PROXY_TARGET`, `NEXT_PROXY_CLIENT_MAX_BODY_SIZE`, and `NEXT_PROXY_TIMEOUT_MS`.
    - Set **Runtime only** for secrets (Firebase admin keys, R2 keys, Brevo, etc).
    - If `FIRESTORE_ENABLED=true`, provide one Firebase service-account source to the API container: `FIREBASE_CREDENTIALS_JSON`, `FIREBASE_CREDENTIALS_PATH`, `GOOGLE_APPLICATION_CREDENTIALS`, or `FIREBASE_ADMIN_CLIENT_EMAIL` plus one `FIREBASE_ADMIN_PRIVATE_KEY*` value.

@@ -7,7 +7,7 @@ Use this checklist before calling client-side rendering production-ready.
 - `LOCAL_RENDER_ENABLED=true` is set on the deployed API.
 - Firestore job persistence is enabled on the deployed API.
 - R2 is enabled if the media-library checkbox will be exposed to users.
-- `NEXT_PUBLIC_DESKTOP_DOWNLOAD_BASE_URL` or platform-specific desktop download URLs are set on the deployed web app.
+- `NEXT_PUBLIC_DESKTOP_DOWNLOAD_BASE_URL` or platform-specific desktop download URLs are set on the deployed web app. The Coolify Compose default currently points to the unsigned `desktop-beta-20260529-a3b826b` prerelease; replace it with signed production assets before calling the release production-ready.
 - The desktop worker allow lists permit the deployed web/API origins through `POVERLAY_ALLOWED_WEB_ORIGINS` and `POVERLAY_ALLOWED_API_BASES` when those origins are not under `poverlay.com`.
 
 ## Deployed Smoke
