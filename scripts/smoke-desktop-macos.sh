@@ -15,7 +15,7 @@ if curl -fsS --max-time 1 "$health_url" >/dev/null 2>&1; then
 fi
 
 executable="$(
-  find "$app_path/Contents/MacOS" -maxdepth 1 -type f -perm -111 ! -name "poverlay-worker" | head -n 1
+  find "$app_path/Contents/MacOS" -maxdepth 1 -type f -perm -111 ! -name "poverlay-worker*" | head -n 1
 )"
 
 if [[ -z "$executable" ]]; then
@@ -59,6 +59,8 @@ done
 
 echo "Timed out waiting for local worker health endpoint. App log follows:" >&2
 cat "$log_file" >&2
-echo "Bundle executables:" >&2
-find "$app_path/Contents/MacOS" -maxdepth 1 -type f -perm -111 -print >&2 || true
+echo "Bundle files:" >&2
+find "$app_path" -maxdepth 5 -type f -print >&2 || true
+echo "Bundle executable files:" >&2
+find "$app_path" -maxdepth 5 -type f -perm -111 -print >&2 || true
 exit 1

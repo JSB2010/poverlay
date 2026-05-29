@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 
 const extension = process.platform === "win32" ? ".exe" : "";
@@ -42,5 +42,8 @@ if (!existsSync(source)) {
 }
 
 const destinationDir = join("apps", "desktop", "src-tauri", "binaries");
+const destination = join(destinationDir, `poverlay-worker-${targetTriple}${extension}`);
 mkdirSync(destinationDir, { recursive: true });
-copyFileSync(source, join(destinationDir, `poverlay-worker-${targetTriple}${extension}`));
+copyFileSync(source, destination);
+chmodSync(destination, 0o755);
+console.log(`Staged desktop sidecar: ${destination}`);
