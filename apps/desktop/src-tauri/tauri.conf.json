@@ -1,0 +1,46 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "POVerlay Desktop",
+  "version": "0.1.0",
+  "identifier": "com.poverlay.desktop",
+  "build": {
+    "beforeDevCommand": "pnpm vite --host 127.0.0.1 --port 5174",
+    "beforeBuildCommand": "pnpm vite build",
+    "devUrl": "http://127.0.0.1:5174",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "POVerlay Desktop",
+        "width": 460,
+        "height": 420,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["dmg", "msi", "nsis"],
+    "externalBin": ["binaries/poverlay-worker"],
+    "createUpdaterArtifacts": false,
+    "macOS": {
+      "minimumSystemVersion": "12.0"
+    },
+    "windows": {
+      "wix": {
+        "language": "en-US"
+      }
+    }
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["poverlay"]
+      }
+    }
+  }
+}

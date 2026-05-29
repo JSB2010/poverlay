@@ -11,6 +11,7 @@ import os
 import queue
 from pathlib import Path
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -102,6 +103,9 @@ JOB_DATABASE_RETENTION_DAYS = RUNTIME_CONFIG.job_database_retention_days
 FFMPEG_THREADS_PER_RENDER = RUNTIME_CONFIG.ffmpeg_threads_per_render
 DELETE_INPUTS_ON_COMPLETE = RUNTIME_CONFIG.delete_inputs_on_complete
 DELETE_WORK_ON_COMPLETE = RUNTIME_CONFIG.delete_work_on_complete
+LOCAL_RENDER_ENABLED = RUNTIME_CONFIG.local_render_enabled
+LOCAL_SMOKE_AUTH_UID = (RUNTIME_CONFIG.local_smoke_auth_uid or "").strip()
+LOCAL_SMOKE_IN_MEMORY_JOBS = RUNTIME_CONFIG.local_smoke_in_memory_jobs
 JOB_EXPIRY_MARKER_FILE = ".expires-at"
 ADMIN_UIDS = {uid.strip() for uid in RUNTIME_CONFIG.admin_uids if uid.strip()}
 
@@ -324,6 +328,7 @@ def _available_render_profile_ids() -> list[str]:
 AVAILABLE_RENDER_PROFILE_IDS = _available_render_profile_ids()
 MANUAL_RENDER_PROFILES = set(AVAILABLE_RENDER_PROFILE_IDS)
 ALLOWED_RENDER_PROFILES = {AUTO_RENDER_PROFILE, *MANUAL_RENDER_PROFILES}
+LOCAL_ALLOWED_RENDER_PROFILES = {AUTO_RENDER_PROFILE, *RENDER_PROFILE_CATALOG.keys()}
 
 if sys.platform == "darwin":
     DEFAULT_RENDER_PROFILE = "qt-hevc-balanced"
@@ -332,10 +337,17 @@ else:
 
 
 TERMINAL_JOB_STATUSES = {"completed", "completed_with_errors", "failed"}
+LOCAL_RENDER_ACTIVE_STATUSES = {"local_pending", "local_running", "local_uploading"}
+LOCAL_RENDER_ALLOWED_VIDEO_STATUSES = {*LOCAL_RENDER_ACTIVE_STATUSES, *TERMINAL_JOB_STATUSES}
+LOCAL_RENDER_PAIRING_TTL_SECONDS = 5 * 60
+LOCAL_RENDER_WORKER_SESSION_TTL_SECONDS = 24 * 60 * 60
 ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 # Firestore is the source of truth; this cache only reduces repeated reads within a worker run.
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
+LOCAL_RENDER_LOCK = threading.Lock()
+LOCAL_RENDER_PAIRINGS: dict[str, dict[str, Any]] = {}
+LOCAL_RENDER_WORKER_SESSIONS: dict[str, dict[str, Any]] = {}
 FIREBASE_AUTH_ENABLED = RUNTIME_CONFIG.firebase.auth_enabled
 FIREBASE_PROJECT_ID = (RUNTIME_CONFIG.firebase.project_id or "").strip()
 FIREBASE_CREDENTIALS_JSON = (RUNTIME_CONFIG.firebase.credentials_json or "").strip()
@@ -356,6 +368,7 @@ R2_ENDPOINT = (RUNTIME_CONFIG.r2.endpoint or "").strip()
 R2_ACCESS_KEY_ID = (RUNTIME_CONFIG.r2.access_key_id or "").strip()
 R2_SECRET_ACCESS_KEY = (RUNTIME_CONFIG.r2.secret_access_key or "").strip()
 R2_SIGNED_URL_TTL_SECONDS = 15 * 60
+R2_SIGNED_UPLOAD_URL_TTL_SECONDS = 30 * 60
 MEDIA_LIST_MAX_PAGE_SIZE = 100
 MEDIA_SORT_FIELDS = {"created_at", "updated_at", "status", "title"}
 MEDIA_SORT_ORDERS = {"asc", "desc"}
@@ -518,6 +531,86 @@ class AdminCancelRequest(BaseModel):
     reason: str | None = None
 
 
+class LocalRenderPairingStartResponse(BaseModel):
+    pairing_code: str
+    expires_at: str
+    desktop_deep_link: str
+
+
+class LocalRenderPairingCompleteRequest(BaseModel):
+    pairing_code: str
+    worker_version: str | None = None
+    worker_platform: str | None = None
+
+
+class LocalRenderPairingCompleteResponse(BaseModel):
+    worker_token: str
+    worker_session_id: str
+    expires_at: str
+    api_base_url: str
+    uid: str
+
+
+class LocalRenderVideoManifest(BaseModel):
+    input_name: str
+    title: str | None = None
+    size_bytes: int | None = None
+    source_resolution: str | None = None
+    source_fps: str | None = None
+    source_duration_seconds: float | None = None
+    local_input_path: str | None = None
+
+
+class LocalRenderJobCreateRequest(BaseModel):
+    gpx_name: str
+    videos: list[LocalRenderVideoManifest]
+    settings: dict[str, Any]
+    upload_intent: str = "local_only"
+    local_output_dir: str | None = None
+
+
+class LocalRenderVideoProgressUpdate(BaseModel):
+    video_id: str | None = None
+    input_name: str | None = None
+    status: str | None = None
+    progress: int | None = None
+    detail: str | None = None
+    error: str | None = None
+    output_name: str | None = None
+    local_output_path: str | None = None
+    output_size_bytes: int | None = None
+    render_profile: str | None = None
+    render_profile_label: str | None = None
+    output_resolution: str | None = None
+    output_fps: str | None = None
+    output_duration_seconds: float | None = None
+    output_codec: str | None = None
+    render_elapsed_seconds: float | None = None
+    wall_x_realtime: float | None = None
+
+
+class LocalRenderJobProgressUpdate(BaseModel):
+    status: str | None = None
+    progress: int | None = None
+    message: str | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+    videos: list[LocalRenderVideoProgressUpdate] | None = None
+
+
+class LocalRenderUploadTargetRequest(BaseModel):
+    video_id: str
+    output_name: str
+    content_type: str = "video/mp4"
+
+
+class LocalRenderUploadCompleteRequest(BaseModel):
+    video_id: str
+    output_name: str
+    output_size_bytes: int | None = None
+    local_output_path: str | None = None
+
+
 def _safe_filename(name: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", name.strip())
     return safe or "file"
@@ -562,6 +655,10 @@ def _utc_now() -> str:
 
 def _utc_after_hours(hours: float) -> str:
     return (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
+
+
+def _utc_after_seconds(seconds: float) -> str:
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
 
 
 def _safe_unlink(path: Path) -> None:
@@ -945,6 +1042,9 @@ def _persist_job_state(job: dict[str, Any]) -> dict[str, Any]:
     payload = deepcopy(job)
     payload["updated_at"] = _utc_now()
     job_id = str(payload["id"])
+    if not FIRESTORE_ENABLED and LOCAL_SMOKE_IN_MEMORY_JOBS:
+        _cache_job_state(payload)
+        return payload
 
     def _write() -> None:
         _firestore_jobs_collection().document(job_id).set(payload)
@@ -960,6 +1060,12 @@ def _persist_job_state(job: dict[str, Any]) -> dict[str, Any]:
 
 
 def _delete_job_state(job_id: str) -> None:
+    if not FIRESTORE_ENABLED and LOCAL_SMOKE_IN_MEMORY_JOBS:
+        _forget_job(job_id)
+        with _QUEUE_WORKER_LOCK:
+            ENQUEUED_JOBS.discard(job_id)
+        return
+
     def _delete() -> None:
         _firestore_jobs_collection().document(job_id).delete()
 
@@ -982,6 +1088,10 @@ def _load_job_state(job_id: str, *, prefer_cache: bool) -> dict[str, Any] | None
                 return deepcopy(cached)
 
     if not FIRESTORE_ENABLED:
+        if LOCAL_SMOKE_IN_MEMORY_JOBS:
+            with JOBS_LOCK:
+                cached = JOBS.get(job_id)
+                return deepcopy(cached) if cached is not None else None
         return None
 
     def _read() -> Any:
@@ -1274,6 +1384,48 @@ def _signed_r2_download_url(object_key: str, filename: str) -> str:
     )
 
 
+def _signed_r2_upload_url(object_key: str, content_type: str) -> str:
+    safe_content_type = content_type.strip() or "application/octet-stream"
+
+    def _sign() -> str:
+        return _r2_client().generate_presigned_url(
+            "put_object",
+            Params={
+                "Bucket": R2_BUCKET,
+                "Key": object_key,
+                "ContentType": safe_content_type,
+            },
+            ExpiresIn=R2_SIGNED_UPLOAD_URL_TTL_SECONDS,
+        )
+
+    return _retry_operation(
+        f"Signing upload URL for {object_key}",
+        _sign,
+        attempts=UPLOAD_RETRY_ATTEMPTS,
+        delay_seconds=UPLOAD_RETRY_DELAY_SECONDS,
+    )
+
+
+def _verify_r2_object(object_key: str) -> dict[str, Any]:
+    def _head() -> dict[str, Any]:
+        return _r2_client().head_object(Bucket=R2_BUCKET, Key=object_key)
+
+    metadata = _retry_operation(
+        f"Verifying R2 object {object_key}",
+        _head,
+        attempts=UPLOAD_RETRY_ATTEMPTS,
+        delay_seconds=UPLOAD_RETRY_DELAY_SECONDS,
+    )
+    etag = metadata.get("ETag")
+    return {
+        "r2_object_key": object_key,
+        "r2_bucket": R2_BUCKET,
+        "r2_etag": etag.strip('"') if isinstance(etag, str) else None,
+        "r2_uploaded_at": _utc_now(),
+        "output_size_bytes": int(metadata.get("ContentLength") or 0),
+    }
+
+
 def _enqueue_job(job_id: str) -> bool:
     added = False
     with _QUEUE_WORKER_LOCK:
@@ -1495,6 +1647,17 @@ def _require_durable_pipeline_enabled() -> None:
         raise HTTPException(status_code=503, detail="Firestore job persistence is disabled")
     if not R2_UPLOAD_ENABLED:
         raise HTTPException(status_code=503, detail="R2 output upload is disabled")
+
+
+def _require_job_persistence_enabled() -> None:
+    if not FIRESTORE_ENABLED and not LOCAL_SMOKE_IN_MEMORY_JOBS:
+        raise HTTPException(status_code=503, detail="Firestore job persistence is disabled")
+
+
+def _require_local_render_enabled() -> None:
+    if not LOCAL_RENDER_ENABLED:
+        raise HTTPException(status_code=503, detail="Local rendering is not enabled")
+    _require_job_persistence_enabled()
 
 
 def _is_active_job(job_id: str) -> bool:
@@ -1740,8 +1903,82 @@ def _verify_firebase_token(token: str) -> str:
     return uid
 
 
-def _require_user_uid(token: str = Depends(_bearer_token_from_header)) -> str:
+def _require_user_uid(authorization: str | None = Header(default=None, alias="Authorization")) -> str:
+    if not FIREBASE_AUTH_ENABLED and LOCAL_SMOKE_AUTH_UID:
+        return LOCAL_SMOKE_AUTH_UID
+    token = _bearer_token_from_header(authorization)
     return _verify_firebase_token(token)
+
+
+def _prune_local_render_credentials_locked(now: datetime) -> None:
+    expired_pairings = [
+        code
+        for code, pairing in LOCAL_RENDER_PAIRINGS.items()
+        if (_parse_iso(str(pairing.get("expires_at") or "")) or now) <= now
+    ]
+    for code in expired_pairings:
+        LOCAL_RENDER_PAIRINGS.pop(code, None)
+
+    expired_sessions = [
+        token
+        for token, session in LOCAL_RENDER_WORKER_SESSIONS.items()
+        if (_parse_iso(str(session.get("expires_at") or "")) or now) <= now
+    ]
+    for token in expired_sessions:
+        LOCAL_RENDER_WORKER_SESSIONS.pop(token, None)
+
+
+def _create_local_render_pairing(uid: str) -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    pairing_code = secrets.token_urlsafe(32)
+    expires_at = _utc_after_seconds(LOCAL_RENDER_PAIRING_TTL_SECONDS)
+    payload = {
+        "uid": uid,
+        "pairing_code": pairing_code,
+        "expires_at": expires_at,
+        "created_at": _utc_now(),
+    }
+    with LOCAL_RENDER_LOCK:
+        _prune_local_render_credentials_locked(now)
+        LOCAL_RENDER_PAIRINGS[pairing_code] = payload
+    return payload
+
+
+def _complete_local_render_pairing(payload: LocalRenderPairingCompleteRequest) -> dict[str, Any]:
+    pairing_code = payload.pairing_code.strip()
+    if not pairing_code:
+        raise HTTPException(status_code=400, detail="pairing_code is required")
+
+    now = datetime.now(timezone.utc)
+    with LOCAL_RENDER_LOCK:
+        _prune_local_render_credentials_locked(now)
+        pairing = LOCAL_RENDER_PAIRINGS.pop(pairing_code, None)
+        if pairing is None:
+            raise HTTPException(status_code=404, detail="Pairing code not found or expired")
+
+        expires_at = _utc_after_seconds(LOCAL_RENDER_WORKER_SESSION_TTL_SECONDS)
+        worker_token = secrets.token_urlsafe(48)
+        worker_session_id = uuid4().hex
+        session = {
+            "id": worker_session_id,
+            "uid": str(pairing["uid"]),
+            "worker_version": (payload.worker_version or "").strip(),
+            "worker_platform": (payload.worker_platform or "").strip(),
+            "created_at": _utc_now(),
+            "expires_at": expires_at,
+        }
+        LOCAL_RENDER_WORKER_SESSIONS[worker_token] = session
+        return {"worker_token": worker_token, **session}
+
+
+def _require_worker_session(token: str = Depends(_bearer_token_from_header)) -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    with LOCAL_RENDER_LOCK:
+        _prune_local_render_credentials_locked(now)
+        session = LOCAL_RENDER_WORKER_SESSIONS.get(token)
+        if session is None:
+            raise HTTPException(status_code=401, detail="Invalid or expired worker token")
+        return deepcopy(session)
 
 
 def _is_uid_admin(uid: str) -> bool:
@@ -2581,6 +2818,88 @@ def _parse_component_visibility(raw: str | None, include_maps: bool) -> dict[str
     return visibility
 
 
+def _normalize_component_visibility(value: Any, include_maps: bool) -> dict[str, bool]:
+    if value is None:
+        return _parse_component_visibility("", include_maps)
+    if isinstance(value, str):
+        return _parse_component_visibility(value, include_maps)
+    if not isinstance(value, dict):
+        raise HTTPException(status_code=400, detail="component_visibility must be an object")
+
+    visibility = dict(DEFAULT_COMPONENT_VISIBILITY)
+    for key, raw_value in value.items():
+        if key not in COMPONENT_OPTIONS:
+            raise HTTPException(status_code=400, detail=f"Unsupported component option: {key}")
+        visibility[key] = _coerce_bool(raw_value)
+    if "route_maps" not in value:
+        visibility["route_maps"] = bool(include_maps)
+    return visibility
+
+
+def _normalized_local_render_settings(raw_settings: dict[str, Any]) -> dict[str, Any]:
+    settings = dict(raw_settings)
+    speed_units = str(settings.get("speed_units", "kph"))
+    gpx_speed_unit = str(settings.get("gpx_speed_unit", "auto"))
+    altitude_units = str(settings.get("altitude_units", "metre"))
+    distance_units = str(settings.get("distance_units", "km"))
+    temperature_units = str(settings.get("temperature_units", "degC"))
+    map_style = str(settings.get("map_style", "osm"))
+    overlay_theme = str(settings.get("overlay_theme", "powder-neon"))
+    layout_style = str(settings.get("layout_style", DEFAULT_LAYOUT_STYLE))
+    fps_mode = str(settings.get("fps_mode", "source_exact"))
+    render_profile = str(settings.get("render_profile", AUTO_RENDER_PROFILE))
+    include_maps = _coerce_bool(settings.get("include_maps", True))
+
+    try:
+        gpx_offset_seconds = float(settings.get("gpx_offset_seconds", 0.0))
+        fixed_fps = float(settings.get("fixed_fps", 30.0))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="gpx_offset_seconds and fixed_fps must be numeric") from exc
+
+    if speed_units not in ALLOWED_UNITS_SPEED:
+        raise HTTPException(status_code=400, detail=f"Unsupported speed units: {speed_units}")
+    if gpx_speed_unit not in ALLOWED_GPX_SPEED_UNITS:
+        raise HTTPException(status_code=400, detail=f"Unsupported gpx_speed_unit: {gpx_speed_unit}")
+    if altitude_units not in ALLOWED_UNITS_ALTITUDE:
+        raise HTTPException(status_code=400, detail=f"Unsupported altitude units: {altitude_units}")
+    if distance_units not in ALLOWED_UNITS_DISTANCE:
+        raise HTTPException(status_code=400, detail=f"Unsupported distance units: {distance_units}")
+    if temperature_units not in ALLOWED_UNITS_TEMP:
+        raise HTTPException(status_code=400, detail=f"Unsupported temperature units: {temperature_units}")
+    if map_style not in ALLOWED_MAP_STYLES:
+        raise HTTPException(status_code=400, detail=f"Unsupported map style: {map_style}")
+    if overlay_theme not in THEMES:
+        raise HTTPException(status_code=400, detail=f"Unsupported overlay theme: {overlay_theme}")
+    if layout_style not in LAYOUT_STYLES:
+        raise HTTPException(status_code=400, detail=f"Unsupported layout style: {layout_style}")
+    if fps_mode not in ALLOWED_FPS_MODES:
+        raise HTTPException(status_code=400, detail=f"Unsupported fps mode: {fps_mode}")
+    if fps_mode == "fixed" and fixed_fps <= 0:
+        raise HTTPException(status_code=400, detail="fixed_fps must be > 0")
+    if render_profile not in LOCAL_ALLOWED_RENDER_PROFILES:
+        raise HTTPException(status_code=400, detail=f"Unsupported render_profile: {render_profile}")
+
+    component_visibility = _normalize_component_visibility(settings.get("component_visibility"), include_maps)
+    include_maps = bool(component_visibility.get("route_maps", include_maps))
+
+    return {
+        "speed_units": speed_units,
+        "gpx_speed_unit": gpx_speed_unit,
+        "altitude_units": altitude_units,
+        "distance_units": distance_units,
+        "temperature_units": temperature_units,
+        "map_style": map_style,
+        "gpx_offset_seconds": gpx_offset_seconds,
+        "overlay_theme": overlay_theme,
+        "layout_style": layout_style,
+        "component_visibility": component_visibility,
+        "include_maps": include_maps,
+        "fps_mode": fps_mode,
+        "fixed_fps": fixed_fps,
+        "render_profile": render_profile,
+    }
+
+
 def _auto_render_profile_candidates(metadata: dict[str, Any]) -> list[str]:
     width = int(metadata.get("width") or 0)
     height = int(metadata.get("height") or 0)
@@ -2630,6 +2949,256 @@ def _overlay_dimensions_for_profile(metadata: dict[str, Any], profile_id: str) -
 
     scaled_height = int(round(height * (PROFILE_4K_COMPAT_MAX_WIDTH / float(width))))
     return _to_even(PROFILE_4K_COMPAT_MAX_WIDTH), _to_even(scaled_height)
+
+
+def _clamped_progress(value: int | None) -> int | None:
+    if value is None:
+        return None
+    return max(0, min(100, int(value)))
+
+
+def _parse_resolution(value: str | None) -> tuple[int, int] | None:
+    if not value:
+        return None
+    match = re.fullmatch(r"\s*(\d{2,5})x(\d{2,5})\s*", value)
+    if not match:
+        return None
+    width = int(match.group(1))
+    height = int(match.group(2))
+    if width < 2 or height < 2:
+        return None
+    return width, height
+
+
+def _local_render_job_response(job: dict[str, Any]) -> dict[str, Any]:
+    return deepcopy(job)
+
+
+def _create_local_render_job(payload: LocalRenderJobCreateRequest, *, uid: str) -> dict[str, Any]:
+    gpx_name = _safe_filename(payload.gpx_name)
+    if not gpx_name.lower().endswith(".gpx"):
+        raise HTTPException(status_code=400, detail="gpx_name must reference a .gpx file")
+    if not payload.videos:
+        raise HTTPException(status_code=400, detail="Please include at least one video manifest")
+    if payload.upload_intent not in {"local_only", "media_library"}:
+        raise HTTPException(status_code=400, detail="upload_intent must be local_only or media_library")
+    if payload.upload_intent == "media_library" and not R2_UPLOAD_ENABLED:
+        raise HTTPException(status_code=503, detail="R2 output upload is disabled")
+
+    settings = _normalized_local_render_settings(payload.settings)
+    now = _utc_now()
+    job_id = uuid4().hex
+    seen_names: set[str] = set()
+    videos: list[dict[str, Any]] = []
+
+    for index, video in enumerate(payload.videos, start=1):
+        input_name = _safe_filename(video.input_name or f"video-{index}.mp4")
+        while input_name in seen_names:
+            input_name = f"{Path(input_name).stem}-{index}{Path(input_name).suffix}"
+        seen_names.add(input_name)
+        resolution = _parse_resolution(video.source_resolution)
+        if resolution is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"source_resolution is required for local render video {input_name}",
+            )
+        layout_xml = render_layout_xml(
+            resolution[0],
+            resolution[1],
+            settings["overlay_theme"],
+            include_maps=bool(settings["include_maps"]),
+            layout_style=str(settings.get("layout_style", DEFAULT_LAYOUT_STYLE)),
+            component_visibility=settings.get("component_visibility"),
+            speed_units=str(settings.get("speed_units", "kph")),
+        )
+
+        videos.append(
+            {
+                "id": uuid4().hex,
+                "title": video.title or Path(input_name).stem,
+                "input_name": input_name,
+                "local_input_path": video.local_input_path,
+                "layout_xml": layout_xml,
+                "status": "local_pending",
+                "progress": 0,
+                "detail": "Waiting for local worker",
+                "error": None,
+                "output_name": None,
+                "local_output_path": None,
+                "output_size_bytes": None,
+                "log_name": None,
+                "render_profile": None,
+                "render_profile_label": None,
+                "source_resolution": video.source_resolution,
+                "source_fps": video.source_fps,
+                "source_duration_seconds": video.source_duration_seconds,
+                "source_size_bytes": video.size_bytes,
+                "output_resolution": None,
+                "output_fps": None,
+                "output_duration_seconds": None,
+                "output_codec": None,
+                "render_elapsed_seconds": None,
+                "wall_x_realtime": None,
+                "r2_object_key": None,
+                "r2_bucket": None,
+                "r2_etag": None,
+                "r2_uploaded_at": None,
+            }
+        )
+
+    job = {
+        "id": job_id,
+        "uid": uid,
+        "job_dir": "",
+        "render_target": "local",
+        "worker_session_id": None,
+        "worker_version": None,
+        "worker_platform": None,
+        "status": "local_pending",
+        "created_at": now,
+        "updated_at": now,
+        "expires_at": None,
+        "started_at": None,
+        "finished_at": None,
+        "local_artifacts_deleted_at": None,
+        "progress": 0,
+        "message": "Waiting for local worker",
+        "gpx_name": gpx_name,
+        "videos": videos,
+        "settings": settings,
+        "local_output_dir": payload.local_output_dir,
+        "upload_intent": payload.upload_intent,
+    }
+    return _persist_job_state(job)
+
+
+def _apply_local_render_video_update(video: dict[str, Any], update: LocalRenderVideoProgressUpdate) -> None:
+    fields = update.model_dump(exclude_unset=True, exclude_none=True)
+    fields.pop("video_id", None)
+    fields.pop("input_name", None)
+    status = fields.get("status")
+    if status is not None and str(status) not in LOCAL_RENDER_ALLOWED_VIDEO_STATUSES:
+        raise HTTPException(status_code=400, detail=f"Unsupported local video status: {status}")
+    if "progress" in fields:
+        fields["progress"] = _clamped_progress(fields["progress"])
+    video.update(fields)
+
+
+def _apply_local_render_job_update(
+    job_id: str,
+    payload: LocalRenderJobProgressUpdate,
+    *,
+    worker_session: dict[str, Any],
+) -> dict[str, Any]:
+    job = _get_job(job_id, requester_uid=str(worker_session.get("uid") or ""))
+    if str(job.get("render_target") or "") != "local":
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    updated = payload.model_dump(exclude_unset=True, exclude_none=True)
+    video_updates = updated.pop("videos", None)
+    status = updated.get("status")
+    if status is not None and str(status) not in {*LOCAL_RENDER_ACTIVE_STATUSES, *TERMINAL_JOB_STATUSES}:
+        raise HTTPException(status_code=400, detail=f"Unsupported local job status: {status}")
+    if "progress" in updated:
+        updated["progress"] = _clamped_progress(updated["progress"])
+
+    if status == "local_running" and not job.get("started_at"):
+        updated.setdefault("started_at", _utc_now())
+    if status in TERMINAL_JOB_STATUSES and not updated.get("finished_at"):
+        updated["finished_at"] = _utc_now()
+
+    updated["worker_session_id"] = worker_session.get("id")
+    updated["worker_version"] = worker_session.get("worker_version") or None
+    updated["worker_platform"] = worker_session.get("worker_platform") or None
+    job.update(updated)
+
+    if video_updates:
+        for video_update in payload.videos or []:
+            target_video: dict[str, Any] | None = None
+            for candidate in job.get("videos", []):
+                if video_update.video_id and str(candidate.get("id") or "") == video_update.video_id:
+                    target_video = candidate
+                    break
+                if video_update.input_name and str(candidate.get("input_name") or "") == video_update.input_name:
+                    target_video = candidate
+                    break
+            if target_video is None:
+                raise HTTPException(status_code=404, detail="Video not found")
+            _apply_local_render_video_update(target_video, video_update)
+
+    return _persist_job_state(job)
+
+
+def _require_local_worker_job(job_id: str, worker_session: dict[str, Any]) -> dict[str, Any]:
+    job = _get_job(job_id, requester_uid=str(worker_session.get("uid") or ""))
+    if str(job.get("render_target") or "") != "local":
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
+
+
+def _create_local_render_upload_target(
+    job_id: str,
+    payload: LocalRenderUploadTargetRequest,
+    *,
+    worker_session: dict[str, Any],
+) -> dict[str, Any]:
+    if not R2_UPLOAD_ENABLED:
+        raise HTTPException(status_code=503, detail="R2 output upload is disabled")
+    job = _require_local_worker_job(job_id, worker_session)
+    if str(job.get("upload_intent") or "local_only") != "media_library":
+        raise HTTPException(status_code=409, detail="Job is not configured for media-library upload")
+    _, video = _find_video_by_id(job, payload.video_id)
+    output_name = _safe_filename(payload.output_name)
+    if not output_name:
+        raise HTTPException(status_code=400, detail="output_name is required")
+
+    object_key = build_r2_output_object_key(str(job.get("uid") or ""), job_id, output_name)
+    content_type = payload.content_type.strip() or "application/octet-stream"
+    video["output_name"] = output_name
+    video["status"] = "local_uploading"
+    video["detail"] = "Uploading rendered output to media library"
+    video["r2_object_key"] = object_key
+    _persist_job_state(job)
+    return {
+        "upload_url": _signed_r2_upload_url(object_key, content_type),
+        "method": "PUT",
+        "headers": {"Content-Type": content_type},
+        "object_key": object_key,
+        "bucket": R2_BUCKET,
+        "expires_in_seconds": R2_SIGNED_UPLOAD_URL_TTL_SECONDS,
+    }
+
+
+def _complete_local_render_upload(
+    job_id: str,
+    payload: LocalRenderUploadCompleteRequest,
+    *,
+    worker_session: dict[str, Any],
+) -> dict[str, Any]:
+    job = _require_local_worker_job(job_id, worker_session)
+    video_index, video = _find_video_by_id(job, payload.video_id)
+    object_key = str(video.get("r2_object_key") or "")
+    if not object_key:
+        object_key = build_r2_output_object_key(str(job.get("uid") or ""), job_id, _safe_filename(payload.output_name))
+    try:
+        upload_metadata = _verify_r2_object(object_key)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Failed to verify uploaded output: {exc}") from exc
+
+    if payload.output_size_bytes and int(upload_metadata.get("output_size_bytes") or 0) != payload.output_size_bytes:
+        raise HTTPException(status_code=409, detail="Uploaded output size does not match local output size")
+
+    job["videos"][video_index].update(
+        {
+            "status": "completed",
+            "progress": 100,
+            "detail": "Uploaded to media library",
+            "output_name": _safe_filename(payload.output_name),
+            "local_output_path": payload.local_output_path,
+            **upload_metadata,
+        }
+    )
+    return _persist_job_state(job)
 
 
 def _run_renderer(
@@ -3054,6 +3623,7 @@ def meta() -> dict[str, Any]:
         "render_profile_ids": AVAILABLE_RENDER_PROFILE_IDS,
         "default_render_profile": AUTO_RENDER_PROFILE,
         "render_eta_calibration": _get_render_eta_calibration(),
+        "local_render_enabled": LOCAL_RENDER_ENABLED,
     }
 
 
@@ -3082,6 +3652,73 @@ def update_user_settings(payload: UserSettingsUpdate, uid: str = Depends(_requir
         "uid": uid,
         "notifications_enabled": bool(profile.get("notifications_enabled", True)),
     }
+
+
+@app.post("/api/local-render/pairing/start")
+def start_local_render_pairing(uid: str = Depends(_require_user_uid)) -> dict[str, Any]:
+    _require_local_render_enabled()
+    pairing = _create_local_render_pairing(uid)
+    pairing_code = str(pairing["pairing_code"])
+    return {
+        "pairing_code": pairing_code,
+        "expires_at": pairing["expires_at"],
+        "desktop_deep_link": f"poverlay://connect?pairing_code={quote(pairing_code)}",
+    }
+
+
+@app.post("/api/local-render/pairing/complete")
+def complete_local_render_pairing(payload: LocalRenderPairingCompleteRequest) -> dict[str, Any]:
+    _require_local_render_enabled()
+    session = _complete_local_render_pairing(payload)
+    return {
+        "worker_token": session["worker_token"],
+        "worker_session_id": session["id"],
+        "expires_at": session["expires_at"],
+        "api_base_url": RUNTIME_CONFIG.api_base_url,
+        "uid": session["uid"],
+    }
+
+
+@app.post("/api/local-render/jobs")
+def create_local_render_job(
+    payload: LocalRenderJobCreateRequest,
+    uid: str = Depends(_require_user_uid),
+) -> dict[str, Any]:
+    _require_local_render_enabled()
+    job = _create_local_render_job(payload, uid=uid)
+    return _local_render_job_response(job)
+
+
+@app.patch("/api/local-render/jobs/{job_id}")
+def update_local_render_job(
+    job_id: str,
+    payload: LocalRenderJobProgressUpdate,
+    worker_session: dict[str, Any] = Depends(_require_worker_session),
+) -> dict[str, Any]:
+    _require_local_render_enabled()
+    job = _apply_local_render_job_update(job_id, payload, worker_session=worker_session)
+    return _local_render_job_response(job)
+
+
+@app.post("/api/local-render/jobs/{job_id}/upload-target")
+def create_local_render_upload_target(
+    job_id: str,
+    payload: LocalRenderUploadTargetRequest,
+    worker_session: dict[str, Any] = Depends(_require_worker_session),
+) -> dict[str, Any]:
+    _require_local_render_enabled()
+    return _create_local_render_upload_target(job_id, payload, worker_session=worker_session)
+
+
+@app.post("/api/local-render/jobs/{job_id}/upload-complete")
+def complete_local_render_upload(
+    job_id: str,
+    payload: LocalRenderUploadCompleteRequest,
+    worker_session: dict[str, Any] = Depends(_require_worker_session),
+) -> dict[str, Any]:
+    _require_local_render_enabled()
+    job = _complete_local_render_upload(job_id, payload, worker_session=worker_session)
+    return _local_render_job_response(job)
 
 
 @app.get("/api/admin/ops/overview")

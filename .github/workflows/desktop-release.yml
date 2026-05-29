@@ -1,0 +1,312 @@
+name: Desktop Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "GitHub release tag. Defaults to desktop-beta-${run_number}."
+        required: false
+        type: string
+      publish_release:
+        description: "Publish installer assets to a GitHub prerelease."
+        required: false
+        default: true
+        type: boolean
+      sign_macos:
+        description: "Code sign the macOS app with Apple Developer ID secrets."
+        required: false
+        default: false
+        type: boolean
+      notarize_macos:
+        description: "Notarize and staple the macOS DMG. Requires sign_macos."
+        required: false
+        default: false
+        type: boolean
+      sign_windows:
+        description: "Code sign Windows EXE/MSI artifacts with a PFX certificate."
+        required: false
+        default: false
+        type: boolean
+      windows_timestamp_url:
+        description: "Timestamp URL for Windows signing."
+        required: false
+        default: "http://timestamp.sectigo.com"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-worker:
+    name: Build worker (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install worker build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller
+          python -m pip install -e apps/local-worker
+      - name: Build worker sidecar
+        working-directory: apps/local-worker
+        run: pyinstaller pyinstaller/poverlay-worker.spec --distpath dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: poverlay-worker-${{ matrix.os }}
+          path: apps/local-worker/dist/*
+
+  build-desktop:
+    name: Build desktop (${{ matrix.os }})
+    needs: build-worker
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: poverlay-worker-${{ matrix.os }}
+          path: apps/local-worker/dist
+          merge-multiple: true
+      - name: Install JS dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Stage worker sidecar
+        run: pnpm stage:desktop-sidecar
+      - name: Validate macOS signing secrets
+        if: runner.os == 'macOS' && (inputs.sign_macos || inputs.notarize_macos)
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          if [[ "${{ inputs.notarize_macos }}" == "true" && "${{ inputs.sign_macos }}" != "true" ]]; then
+            echo "notarize_macos requires sign_macos." >&2
+            exit 1
+          fi
+          if [[ -z "${APPLE_CERTIFICATE:-}" || -z "${APPLE_CERTIFICATE_PASSWORD:-}" ]]; then
+            echo "APPLE_CERTIFICATE and APPLE_CERTIFICATE_PASSWORD secrets are required for macOS signing." >&2
+            exit 1
+          fi
+          if [[ -n "${APPLE_SIGNING_IDENTITY:-}" ]]; then
+            echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY" >> "$GITHUB_ENV"
+          fi
+      - name: Import Apple Developer ID certificate
+        if: runner.os == 'macOS' && inputs.sign_macos
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          keychain_path="$RUNNER_TEMP/poverlay-signing.keychain-db"
+          keychain_password="$(openssl rand -base64 32)"
+          certificate_path="$RUNNER_TEMP/poverlay-certificate.p12"
+
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$certificate_path"
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security import "$certificate_path" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -k "$keychain_path"
+          existing_keychains=()
+          while IFS= read -r existing_keychain; do
+            existing_keychains+=("$existing_keychain")
+          done < <(security list-keychains -d user | tr -d '"')
+          security list-keychains -d user -s "$keychain_path" "${existing_keychains[@]}"
+          security default-keychain -s "$keychain_path"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain_path"
+
+          security find-identity -v -p codesigning "$keychain_path"
+          if [[ -z "${APPLE_SIGNING_IDENTITY:-}" ]]; then
+            identity="$(
+              security find-identity -v -p codesigning "$keychain_path" |
+                awk -F'"' '/Developer ID Application/ {print $2; exit} END { if (NR == 0) exit 1 }'
+            )"
+            if [[ -z "$identity" ]]; then
+              identity="$(
+                security find-identity -v -p codesigning "$keychain_path" |
+                  awk -F'"' '/"/ {print $2; exit}'
+              )"
+            fi
+            if [[ -z "$identity" ]]; then
+              echo "No code signing identity was found after importing APPLE_CERTIFICATE." >&2
+              exit 1
+            fi
+            echo "APPLE_SIGNING_IDENTITY=$identity" >> "$GITHUB_ENV"
+          fi
+      - name: Prepare Windows signing certificate
+        if: runner.os == 'Windows' && inputs.sign_windows
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          WINDOWS_TIMESTAMP_URL: ${{ inputs.windows_timestamp_url }}
+        run: |
+          if (-not $env:WINDOWS_CERTIFICATE -or -not $env:WINDOWS_CERTIFICATE_PASSWORD) {
+            throw "WINDOWS_CERTIFICATE and WINDOWS_CERTIFICATE_PASSWORD secrets are required for Windows signing."
+          }
+          New-Item -ItemType Directory -Force certificate | Out-Null
+          Set-Content -Path certificate/tempCert.txt -Value $env:WINDOWS_CERTIFICATE
+          certutil -decode certificate/tempCert.txt certificate/certificate.pfx
+          Remove-Item certificate/tempCert.txt
+          $securePassword = ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -Force -AsPlainText
+          $certificate = Import-PfxCertificate -FilePath certificate/certificate.pfx -CertStoreLocation Cert:\CurrentUser\My -Password $securePassword
+          if (-not $certificate.Thumbprint) {
+            throw "Could not import Windows signing certificate."
+          }
+          $signingConfig = @{
+            bundle = @{
+              windows = @{
+                certificateThumbprint = $certificate.Thumbprint
+                digestAlgorithm = "sha256"
+                timestampUrl = $env:WINDOWS_TIMESTAMP_URL
+              }
+            }
+          }
+          $configPath = "apps/desktop/src-tauri/tauri.windows-signing.conf.json"
+          $signingConfig | ConvertTo-Json -Depth 5 | Set-Content -Path $configPath -Encoding UTF8
+          "POVERLAY_WINDOWS_TAURI_CONFIG=src-tauri/tauri.windows-signing.conf.json" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Build unsigned macOS desktop app
+        if: runner.os == 'macOS' && !inputs.sign_macos
+        run: pnpm --filter @poverlay/desktop exec tauri build --bundles app
+      - name: Build signed macOS desktop app
+        if: runner.os == 'macOS' && inputs.sign_macos
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: pnpm --filter @poverlay/desktop exec tauri build --bundles app
+      - name: Build Windows desktop app
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tauriArgs = @("build", "--bundles", "nsis,msi")
+          if ($env:POVERLAY_WINDOWS_TAURI_CONFIG) {
+            $tauriArgs += @("--config", $env:POVERLAY_WINDOWS_TAURI_CONFIG)
+          }
+          pnpm --filter @poverlay/desktop exec tauri @tauriArgs
+      - name: Verify macOS code signature
+        if: runner.os == 'macOS' && inputs.sign_macos
+        run: |
+          set -euo pipefail
+          codesign --verify --deep --strict --verbose=2 "apps/desktop/src-tauri/target/release/bundle/macos/POVerlay Desktop.app"
+          codesign -dv "apps/desktop/src-tauri/target/release/bundle/macos/POVerlay Desktop.app"
+      - name: Smoke test macOS desktop app
+        if: runner.os == 'macOS'
+        run: ./scripts/smoke-desktop-macos.sh "apps/desktop/src-tauri/target/release/bundle/macos/POVerlay Desktop.app"
+      - name: Smoke test Windows desktop app
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/smoke-desktop-windows.ps1
+      - name: Prepare macOS installer assets
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          ./scripts/package-macos-dmg.sh \
+            "apps/desktop/src-tauri/target/release/bundle/macos/POVerlay Desktop.app" \
+            "release-assets/poverlay-desktop-macos.dmg"
+      - name: Prepare Apple notarization API key
+        if: runner.os == 'macOS' && inputs.notarize_macos
+        shell: bash
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${APPLE_API_KEY:-}" || -n "${APPLE_API_ISSUER:-}" || -n "${APPLE_API_PRIVATE_KEY:-}" ]]; then
+            if [[ -z "${APPLE_API_KEY:-}" || -z "${APPLE_API_ISSUER:-}" || -z "${APPLE_API_PRIVATE_KEY:-}" ]]; then
+              echo "APPLE_API_KEY, APPLE_API_ISSUER, and APPLE_API_PRIVATE_KEY secrets are required when using API-key notarization." >&2
+              exit 1
+            fi
+            key_path="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+            printf '%s' "$APPLE_API_PRIVATE_KEY" > "$key_path"
+            chmod 600 "$key_path"
+            echo "APPLE_API_KEY_PATH=$key_path" >> "$GITHUB_ENV"
+          elif [[ -z "${APPLE_ID:-}" || -z "${APPLE_PASSWORD:-}" || -z "${APPLE_TEAM_ID:-}" ]]; then
+            echo "Provide either APPLE_API_KEY/APPLE_API_ISSUER/APPLE_API_PRIVATE_KEY or APPLE_ID/APPLE_PASSWORD/APPLE_TEAM_ID secrets for notarization." >&2
+            exit 1
+          fi
+      - name: Notarize macOS DMG
+        if: runner.os == 'macOS' && inputs.notarize_macos
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: ./scripts/notarize-macos-dmg.sh "release-assets/poverlay-desktop-macos.dmg"
+      - name: Prepare Windows installer assets
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force release-assets | Out-Null
+          $bundleRoot = "apps/desktop/src-tauri/target/release/bundle"
+          $exe = Get-ChildItem -Path "$bundleRoot/nsis" -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $exe) {
+            $exe = Get-ChildItem -Path $bundleRoot -Recurse -Filter "*.exe" | Select-Object -First 1
+          }
+          if (-not $exe) {
+            throw "No Windows EXE installer artifact found"
+          }
+          Copy-Item $exe.FullName "release-assets/poverlay-desktop-windows.exe"
+          $msi = Get-ChildItem -Path $bundleRoot -Recurse -Filter "*.msi" | Select-Object -First 1
+          if ($msi) {
+            Copy-Item $msi.FullName "release-assets/poverlay-desktop-windows.msi"
+          }
+      - name: Verify Windows signatures
+        if: runner.os == 'Windows' && inputs.sign_windows
+        shell: pwsh
+        run: ./scripts/verify-windows-signatures.ps1 -Path release-assets
+      - uses: actions/upload-artifact@v4
+        with:
+          name: poverlay-desktop-installers-${{ matrix.os }}
+          path: release-assets/*
+
+  publish-release:
+    name: Publish desktop prerelease
+    needs: build-desktop
+    if: ${{ inputs.publish_release }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: poverlay-desktop-installers-*
+          path: release-assets
+          merge-multiple: true
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          tag="${RELEASE_TAG:-desktop-beta-${GITHUB_RUN_NUMBER}}"
+          gh release create "$tag" release-assets/* \
+            --title "POVerlay Desktop ${tag}" \
+            --notes "Desktop beta installers for POVerlay local rendering." \
+            --prerelease

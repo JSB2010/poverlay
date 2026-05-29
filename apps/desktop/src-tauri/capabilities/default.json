@@ -1,0 +1,20 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default desktop permissions",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "shell:default",
+    {
+      "identifier": "shell:allow-execute",
+      "allow": [
+        {
+          "name": "binaries/poverlay-worker",
+          "sidecar": true,
+          "args": ["serve", "--host", "127.0.0.1", "--port", "47981"]
+        }
+      ]
+    }
+  ]
+}

@@ -6,9 +6,17 @@
     "dev": "concurrently -k -n WEB,API -c cyan,orange \"./scripts/run-web.sh\" \"./scripts/run-api.sh\"",
     "dev:web": "./scripts/run-web.sh",
     "dev:api": "./scripts/run-api.sh",
+    "dev:desktop": "pnpm --filter @poverlay/desktop dev",
     "build": "pnpm --filter @poverlay/web build && ./scripts/sync-next-standalone.sh",
+    "stage:desktop-sidecar": "node scripts/stage-desktop-sidecar.mjs",
+    "build:desktop": "pnpm stage:desktop-sidecar && pnpm --filter @poverlay/desktop build",
+    "build:desktop:macos": "pnpm stage:desktop-sidecar && pnpm --filter @poverlay/desktop exec tauri build --bundles app && ./scripts/package-macos-dmg.sh \"apps/desktop/src-tauri/target/release/bundle/macos/POVerlay Desktop.app\" \"apps/desktop/src-tauri/target/release/bundle/dmg/poverlay-desktop-macos.dmg\"",
+    "smoke:desktop:macos": "./scripts/smoke-desktop-macos.sh \"apps/desktop/src-tauri/target/release/bundle/macos/POVerlay Desktop.app\"",
+    "smoke:local-render:http": "./scripts/smoke-local-render-http.py",
+    "smoke:deployed-local-render": "./scripts/smoke-deployed-local-render.py",
     "start:web": "pnpm --filter @poverlay/web start",
     "check:web": "pnpm --filter @poverlay/web typecheck",
+    "check:desktop": "pnpm --filter @poverlay/desktop typecheck",
     "check": "./scripts/check.sh"
   },
   "devDependencies": {
