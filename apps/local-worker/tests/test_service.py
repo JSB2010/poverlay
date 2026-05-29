@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import struct
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -184,6 +185,30 @@ def test_jobs_saves_uploads_and_queues_background(monkeypatch, tmp_path: Path) -
     assert queued_manifest["id"] == "job-1"
     assert gpx_path.read_bytes() == b"<gpx />"
     assert video_paths["clip.mp4"].read_bytes() == b"video"
+
+
+def test_restore_timeline_timestamp_uses_manifest_metadata(tmp_path: Path) -> None:
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"video")
+
+    restored = service._restore_timeline_timestamp({"timeline_start_ms": 1_770_485_900_000}, video_path)
+
+    assert restored == 1_770_485_900
+    assert int(video_path.stat().st_mtime) == 1_770_485_900
+
+
+def test_restore_timeline_timestamp_reads_mp4_creation_time(tmp_path: Path) -> None:
+    video_path = tmp_path / "clip.mp4"
+    creation_seconds = 2_082_844_800 + 1_770_485_900
+    mvhd_payload = b"\x00\x00\x00\x00" + struct.pack(">I", creation_seconds) + b"\x00\x00\x00\x00"
+    mvhd_box = struct.pack(">I", len(mvhd_payload) + 8) + b"mvhd" + mvhd_payload
+    moov_box = struct.pack(">I", len(mvhd_box) + 8) + b"moov" + mvhd_box
+    video_path.write_bytes(struct.pack(">I", 16) + b"ftyp" + b"isom0000" + moov_box)
+
+    restored = service._restore_timeline_timestamp({}, video_path)
+
+    assert restored == 1_770_485_900
+    assert int(video_path.stat().st_mtime) == 1_770_485_900
 
 
 def test_jobs_endpoint_runs_local_only_render_and_reports_output(monkeypatch, tmp_path: Path) -> None:

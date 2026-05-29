@@ -10,6 +10,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 from typing import Any
 from urllib.parse import urlparse
 
@@ -28,6 +29,8 @@ DEFAULT_PORT = 47981
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 DEFAULT_ALLOWED_HOST_SUFFIXES = ("poverlay.com",)
 DEFAULT_ALLOWED_METHODS = ("GET", "POST", "OPTIONS")
+MP4_EPOCH_OFFSET_SECONDS = 2_082_844_800
+MP4_TIMESTAMP_SCAN_BYTES = 16 * 1024 * 1024
 DEFAULT_ALLOWED_WEB_ORIGINS = (
     "https://poverlay.com",
     "https://www.poverlay.com",
@@ -220,6 +223,83 @@ def _job_root(job_id: str) -> Path:
     return Path.home() / "POVerlay" / "Jobs" / _safe_filename(job_id)
 
 
+def _mp4_timestamp_to_unix_seconds(seconds_since_1904: int) -> float | None:
+    unix_seconds = seconds_since_1904 - MP4_EPOCH_OFFSET_SECONDS
+    if unix_seconds <= 0:
+        return None
+    return float(unix_seconds)
+
+
+def _parse_mp4_creation_time_from_bytes(data: bytes) -> float | None:
+    candidates: list[float] = []
+    offset = 0
+    while True:
+        index = data.find(b"mvhd", offset)
+        if index < 4:
+            break
+        box_start = index - 4
+        if box_start + 16 > len(data):
+            break
+        box_size = int.from_bytes(data[box_start : box_start + 4], "big")
+        if box_size < 16:
+            offset = index + 4
+            continue
+        version = data[box_start + 8]
+        seconds_since_1904: int | None = None
+        if version == 0 and box_start + 16 <= len(data):
+            seconds_since_1904 = int.from_bytes(data[box_start + 12 : box_start + 16], "big")
+        elif version == 1 and box_start + 20 <= len(data):
+            high = int.from_bytes(data[box_start + 12 : box_start + 16], "big")
+            low = int.from_bytes(data[box_start + 16 : box_start + 20], "big")
+            seconds_since_1904 = high * 4_294_967_296 + low
+        if seconds_since_1904 is not None:
+            unix_seconds = _mp4_timestamp_to_unix_seconds(seconds_since_1904)
+            if unix_seconds is not None:
+                candidates.append(unix_seconds)
+        offset = index + 4
+    return min(candidates) if candidates else None
+
+
+def _read_mp4_creation_time(path: Path) -> float | None:
+    if path.suffix.lower() not in {".mp4", ".mov"} or not path.is_file():
+        return None
+    file_size = path.stat().st_size
+    chunks: list[bytes] = []
+    with path.open("rb") as handle:
+        chunks.append(handle.read(min(file_size, MP4_TIMESTAMP_SCAN_BYTES)))
+        if file_size > MP4_TIMESTAMP_SCAN_BYTES:
+            handle.seek(max(file_size - MP4_TIMESTAMP_SCAN_BYTES, 0))
+            chunks.append(handle.read(MP4_TIMESTAMP_SCAN_BYTES))
+    candidates = [value for chunk in chunks if (value := _parse_mp4_creation_time_from_bytes(chunk)) is not None]
+    return min(candidates) if candidates else None
+
+
+def _manifest_video_timestamp(video: dict[str, Any]) -> float | None:
+    for key in ("timeline_start_ms", "creation_time_ms", "last_modified_ms"):
+        raw_value = video.get(key)
+        if raw_value is None:
+            continue
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value / 1000.0
+    return None
+
+
+def _restore_timeline_timestamp(video: dict[str, Any], input_path: Path) -> float | None:
+    timestamp = _manifest_video_timestamp(video) or _read_mp4_creation_time(input_path)
+    if timestamp is None:
+        return None
+    now = time.time()
+    # Ignore implausible media timestamps instead of making the copied file unusable.
+    if timestamp < 946_684_800 or timestamp > now + 366 * 24 * 60 * 60:
+        return None
+    os.utime(input_path, (timestamp, timestamp))
+    return timestamp
+
+
 def _settings_from_manifest(manifest: dict[str, Any], font_path: Path) -> RenderSettings:
     settings = manifest.get("settings")
     if not isinstance(settings, dict):
@@ -308,6 +388,7 @@ def _run_local_job(job_id: str, manifest: dict[str, Any], gpx_path: Path, video_
             input_path = video_paths.get(input_name)
             if input_path is None:
                 raise ValueError(f"Missing uploaded video for {input_name}")
+            _restore_timeline_timestamp(video, input_path)
 
             layout_xml = str(video.get("layout_xml") or "")
             if not layout_xml:
