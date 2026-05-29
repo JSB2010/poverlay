@@ -2,6 +2,8 @@
 
 Use this checklist before calling client-side rendering production-ready.
 
+Run `pnpm check:client-rendering-release` to preflight the deployed feature state, release assets, workflow evidence, deployed-smoke secrets, and production signing secrets.
+
 ## Hosted Environment
 
 - `LOCAL_RENDER_ENABLED=true` is set on the deployed API.

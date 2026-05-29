@@ -10,6 +10,7 @@ Last updated: 2026-05-29
 - Deployed local-render smoke job reached `completed`: `73c6775508ed4d34a969e763b244e091`
 - Deployed Studio bundle includes desktop download URLs for `desktop-beta-20260529-a3b826b`.
 - Published unsigned desktop prerelease: https://github.com/JSB2010/poverlay/releases/tag/desktop-beta-20260529-a3b826b
+- `pnpm check:client-rendering-release` passes all deployed/release checks and fails only on missing production signing/notarization secrets.
 
 ## Current Installer Assets
 
@@ -21,6 +22,10 @@ Last updated: 2026-05-29
   - SHA-256: `134774427e5cf6464d0b596b6610e40c353312552d12a1b5993037f98dba9b41`
 
 The published macOS DMG was downloaded, mounted, and the app inside it launched the bundled local worker successfully.
+
+The published Windows EXE and MSI were downloaded and their SHA-256 hashes matched the GitHub release metadata.
+
+The current macOS DMG is unsigned and rejected by Gatekeeper. This is expected for the unsigned beta assets and remains a production blocker.
 
 ## Remaining Production Gates
 
