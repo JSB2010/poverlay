@@ -20,6 +20,7 @@ hiddenimports = [
 ]
 datas = [
     *collect_data_files("gopro_overlay"),
+    *collect_data_files("geotiler"),
     *[
         (str(path), str(Path("vendor") / "gopro-dashboard-overlay" / path.relative_to(dashboard_root).parent))
         for path in dashboard_root.rglob("*")

@@ -159,7 +159,7 @@ def test_api_and_worker_complete_local_only_render_lifecycle(monkeypatch: pytest
     monkeypatch.setattr(
         worker_service,
         "choose_profile",
-        lambda capabilities: RenderProfile(  # noqa: ARG005
+        lambda capabilities, **kwargs: RenderProfile(  # noqa: ARG005
             id="local-h264-software",
             label="H.264 Software",
             output_args=("-vcodec", "libx264"),
@@ -281,7 +281,7 @@ def test_api_and_worker_complete_media_library_upload_lifecycle(monkeypatch: pyt
     monkeypatch.setattr(
         worker_service,
         "choose_profile",
-        lambda capabilities: RenderProfile(  # noqa: ARG005
+        lambda capabilities, **kwargs: RenderProfile(  # noqa: ARG005
             id="local-h264-software",
             label="H.264 Software",
             output_args=("-vcodec", "libx264"),

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import platform
 import subprocess
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -16,6 +17,7 @@ class RenderProfile:
     id: str
     label: str
     output_args: tuple[str, ...]
+    filter: str | None = None
 
 
 def _parse_ffmpeg_names(output: str) -> frozenset[str]:
@@ -77,18 +79,136 @@ def _h264_fallback() -> RenderProfile:
     )
 
 
+def _h264_4k_compat(capabilities: FfmpegCapabilities, *, system: str | None = None) -> RenderProfile:
+    system_name = (system or platform.system()).lower()
+    encoders = capabilities.encoders
+    filter_graph = "[0:v]scale=min(3840\\,iw):-2:flags=lanczos[main];[main][1:v]overlay"
+
+    if system_name != "darwin" and "h264_nvenc" in encoders:
+        return RenderProfile(
+            id="h264-4k-compat",
+            label="H.264 4K Compatibility (NVIDIA NVENC)",
+            output_args=(
+                "-vcodec",
+                "h264_nvenc",
+                "-preset",
+                "p5",
+                "-b:v",
+                "40M",
+                "-maxrate",
+                "50M",
+                "-bufsize",
+                "80M",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+            ),
+            filter=filter_graph,
+        )
+
+    return RenderProfile(
+        id="h264-4k-compat",
+        label="H.264 4K Compatibility",
+        output_args=(
+            "-vcodec",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "20",
+            "-maxrate",
+            "40M",
+            "-bufsize",
+            "80M",
+            "-pix_fmt",
+            "yuv420p",
+            "-profile:v",
+            "high",
+            "-level",
+            "5.1",
+            "-movflags",
+            "+faststart",
+        ),
+        filter=filter_graph,
+    )
+
+
+def _h264_fast() -> RenderProfile:
+    return RenderProfile(
+        id="h264-fast",
+        label="H.264 Fast Draft",
+        output_args=("-vcodec", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-movflags", "+faststart"),
+    )
+
+
+def _h264_source() -> RenderProfile:
+    return RenderProfile(
+        id="h264-source",
+        label="H.264 Source Resolution",
+        output_args=(
+            "-vcodec",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "19",
+            "-maxrate",
+            "70M",
+            "-bufsize",
+            "140M",
+            "-pix_fmt",
+            "yuv420p",
+            "-profile:v",
+            "high",
+            "-movflags",
+            "+faststart",
+        ),
+    )
+
+
+def _parse_resolution(value: str | None) -> tuple[int, int] | None:
+    if not value or "x" not in value:
+        return None
+    width_raw, height_raw = value.lower().split("x", 1)
+    try:
+        width = int(width_raw.strip())
+        height = int(height_raw.strip())
+    except ValueError:
+        return None
+    if width < 2 or height < 2:
+        return None
+    return width, height
+
+
 def choose_profile(
     capabilities: FfmpegCapabilities,
     *,
     system: str | None = None,
     prefer_hevc: bool = True,
+    requested_profile: str | None = None,
+    source_resolution: str | None = None,
 ) -> RenderProfile:
     system_name = (system or platform.system()).lower()
     encoders = capabilities.encoders
+    resolution = _parse_resolution(source_resolution)
+    high_resolution = bool(resolution and (resolution[0] > 3840 or resolution[1] > 2160))
+    requested = str(requested_profile or "").strip()
+
+    if requested == "h264-4k-compat" or (requested == "auto" and high_resolution):
+        return _h264_4k_compat(capabilities, system=system)
+    if requested == "h264-fast":
+        return _h264_fast()
+    if requested == "h264-source":
+        return _h264_source()
 
     if system_name == "darwin" and prefer_hevc and "hevc_videotoolbox" in encoders:
+        profile_id = requested if requested in {"qt-hevc-balanced", "qt-hevc-high"} else "local-hevc-videotoolbox"
+        bitrate = "70M" if requested == "qt-hevc-high" else "45M"
+        maxrate = "90M" if requested == "qt-hevc-high" else "60M"
+        bufsize = "140M" if requested == "qt-hevc-high" else "90M"
         return RenderProfile(
-            id="local-hevc-videotoolbox",
+            id=profile_id,
             label="HEVC VideoToolbox",
             output_args=(
                 "-vcodec",
@@ -96,11 +216,11 @@ def choose_profile(
                 "-tag:v",
                 "hvc1",
                 "-b:v",
-                "45M",
+                bitrate,
                 "-maxrate",
-                "60M",
+                maxrate,
                 "-bufsize",
-                "90M",
+                bufsize,
                 "-pix_fmt",
                 "yuv420p",
                 "-movflags",
@@ -183,11 +303,11 @@ def choose_profile(
     return _h264_fallback()
 
 
-def ffmpeg_profiles_json(profile: RenderProfile) -> dict[str, dict[str, list[str]]]:
-    return {
-        profile.id: {
-            "input": [],
-            "output": list(profile.output_args),
-        }
+def ffmpeg_profiles_json(profile: RenderProfile) -> dict[str, dict[str, Any]]:
+    payload: dict[str, Any] = {
+        "input": [],
+        "output": list(profile.output_args),
     }
-
+    if profile.filter:
+        payload["filter"] = profile.filter
+    return {profile.id: payload}

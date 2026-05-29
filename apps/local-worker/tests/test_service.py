@@ -211,6 +211,31 @@ def test_restore_timeline_timestamp_reads_mp4_creation_time(tmp_path: Path) -> N
     assert int(video_path.stat().st_mtime) == 1_770_485_900
 
 
+def test_overlay_size_for_4k_compat_scales_high_resolution_evenly() -> None:
+    overlay_size = service._overlay_size_for_video({"source_resolution": "5312x2988"}, "h264-4k-compat")
+
+    assert overlay_size == (3840, 2160)
+
+
+def test_scale_layout_xml_scales_geometry_for_downscaled_overlay() -> None:
+    layout_xml = (
+        '<layout><composite x="4536" y="835">'
+        '<frame width="717" height="328" cr="63">'
+        '<component type="text" x="101" y="39" size="52" outline_width="4">GPS</component>'
+        "</frame></composite></layout>"
+    )
+
+    scaled = service._scale_layout_xml(layout_xml, (5312, 2988), (3840, 2160))
+
+    assert 'x="3279"' in scaled
+    assert 'y="604"' in scaled
+    assert 'width="518"' in scaled
+    assert 'height="237"' in scaled
+    assert 'cr="46"' in scaled
+    assert 'size="38"' in scaled
+    assert 'outline_width="3"' in scaled
+
+
 def test_jobs_endpoint_runs_local_only_render_and_reports_output(monkeypatch, tmp_path: Path) -> None:
     with service.STATE_LOCK:
         service.STATE.api_base_url = "https://api.example.test"
@@ -222,7 +247,7 @@ def test_jobs_endpoint_runs_local_only_render_and_reports_output(monkeypatch, tm
     monkeypatch.setattr(
         service,
         "choose_profile",
-        lambda capabilities: RenderProfile(id="local-h264-software", label="H.264 Software", output_args=("-vcodec", "libx264")),
+        lambda capabilities, **kwargs: RenderProfile(id="local-h264-software", label="H.264 Software", output_args=("-vcodec", "libx264")),
     )
     monkeypatch.setattr(service, "write_ffmpeg_profile", lambda config_dir, profile: config_dir / "ffmpeg-profiles.json")
     monkeypatch.setattr(service, "_bundled_font_path", lambda: tmp_path / "font.ttf")
@@ -320,7 +345,7 @@ def test_run_local_job_uploads_media_library_output(monkeypatch, tmp_path: Path)
     monkeypatch.setattr(
         service,
         "choose_profile",
-        lambda capabilities: RenderProfile(id="local-h264-software", label="H.264 Software", output_args=("-vcodec", "libx264")),
+        lambda capabilities, **kwargs: RenderProfile(id="local-h264-software", label="H.264 Software", output_args=("-vcodec", "libx264")),
     )
     monkeypatch.setattr(service, "write_ffmpeg_profile", lambda config_dir, profile: config_dir / "ffmpeg-profiles.json")
 

@@ -13,6 +13,7 @@ import threading
 import time
 from typing import Any
 from urllib.parse import urlparse
+import xml.etree.ElementTree as ET
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,6 +32,7 @@ DEFAULT_ALLOWED_HOST_SUFFIXES = ("poverlay.com",)
 DEFAULT_ALLOWED_METHODS = ("GET", "POST", "OPTIONS")
 MP4_EPOCH_OFFSET_SECONDS = 2_082_844_800
 MP4_TIMESTAMP_SCAN_BYTES = 16 * 1024 * 1024
+PROFILE_4K_COMPAT_MAX_WIDTH = 3840
 DEFAULT_ALLOWED_WEB_ORIGINS = (
     "https://poverlay.com",
     "https://www.poverlay.com",
@@ -300,6 +302,74 @@ def _restore_timeline_timestamp(video: dict[str, Any], input_path: Path) -> floa
     return timestamp
 
 
+def _parse_resolution(value: str | None) -> tuple[int, int] | None:
+    if not value or "x" not in value:
+        return None
+    width_raw, height_raw = value.lower().split("x", 1)
+    try:
+        width = int(width_raw.strip())
+        height = int(height_raw.strip())
+    except ValueError:
+        return None
+    if width < 2 or height < 2:
+        return None
+    return width, height
+
+
+def _to_even(value: int) -> int:
+    if value < 2:
+        return 2
+    return value if value % 2 == 0 else value - 1
+
+
+def _overlay_size_for_video(video: dict[str, Any], profile_id: str) -> tuple[int, int] | None:
+    resolution = _parse_resolution(str(video.get("source_resolution") or ""))
+    if resolution is None:
+        return None
+    width, height = resolution
+    if profile_id != "h264-4k-compat" or width <= PROFILE_4K_COMPAT_MAX_WIDTH:
+        return None
+    scaled_height = int(round(height * (PROFILE_4K_COMPAT_MAX_WIDTH / float(width))))
+    return _to_even(PROFILE_4K_COMPAT_MAX_WIDTH), _to_even(scaled_height)
+
+
+def _scale_xml_number(raw_value: str, scale: float) -> str:
+    try:
+        value = float(raw_value)
+    except ValueError:
+        return raw_value
+    return str(max(0, int(round(value * scale))))
+
+
+def _scale_layout_xml(layout_xml: str, source_resolution: tuple[int, int], overlay_size: tuple[int, int] | None) -> str:
+    if overlay_size is None or overlay_size == source_resolution:
+        return layout_xml
+    source_width, source_height = source_resolution
+    if source_width <= 0 or source_height <= 0:
+        return layout_xml
+    scale_x = overlay_size[0] / float(source_width)
+    scale_y = overlay_size[1] / float(source_height)
+    scale_uniform = min(scale_x, scale_y)
+
+    try:
+        root = ET.fromstring(layout_xml)
+    except ET.ParseError:
+        return layout_xml
+
+    for element in root.iter():
+        for attr in ("x", "width"):
+            if attr in element.attrib:
+                element.set(attr, _scale_xml_number(element.attrib[attr], scale_x))
+        for attr in ("y", "height"):
+            if attr in element.attrib:
+                element.set(attr, _scale_xml_number(element.attrib[attr], scale_y))
+        for attr in ("size", "cr", "outline_width"):
+            if attr in element.attrib:
+                element.set(attr, _scale_xml_number(element.attrib[attr], scale_uniform))
+
+    return ET.tostring(root, encoding="unicode")
+
+
 def _settings_from_manifest(manifest: dict[str, Any], font_path: Path) -> RenderSettings:
     settings = manifest.get("settings")
     if not isinstance(settings, dict):
@@ -365,8 +435,7 @@ def _run_local_job(job_id: str, manifest: dict[str, Any], gpx_path: Path, video_
         outputs_dir.mkdir(parents=True, exist_ok=True)
         layouts_dir.mkdir(parents=True, exist_ok=True)
 
-        profile = choose_profile(detect_capabilities())
-        write_ffmpeg_profile(config_dir, profile)
+        capabilities = detect_capabilities()
         renderer_bin_raw = manifest.get("renderer_bin") or os.getenv("POVERLAY_LOCAL_RENDERER_BIN")
         if renderer_bin_raw:
             renderer_bin = Path(str(renderer_bin_raw))
@@ -375,6 +444,10 @@ def _run_local_job(job_id: str, manifest: dict[str, Any], gpx_path: Path, video_
             renderer_bin, renderer_args = _default_worker_renderer()
         font_path = _font_path_from_manifest(manifest)
         settings = _settings_from_manifest(manifest, font_path)
+        manifest_settings = manifest.get("settings")
+        requested_profile = (
+            str(manifest_settings.get("render_profile") or "auto") if isinstance(manifest_settings, dict) else "auto"
+        )
         videos = manifest.get("videos")
         if not isinstance(videos, list) or not videos:
             raise ValueError("job_manifest.videos must be a non-empty array")
@@ -389,10 +462,20 @@ def _run_local_job(job_id: str, manifest: dict[str, Any], gpx_path: Path, video_
             if input_path is None:
                 raise ValueError(f"Missing uploaded video for {input_name}")
             _restore_timeline_timestamp(video, input_path)
+            profile = choose_profile(
+                capabilities,
+                requested_profile=requested_profile,
+                source_resolution=str(video.get("source_resolution") or ""),
+            )
+            write_ffmpeg_profile(config_dir, profile)
+            overlay_size = _overlay_size_for_video(video, profile.id)
+            source_resolution = _parse_resolution(str(video.get("source_resolution") or ""))
 
             layout_xml = str(video.get("layout_xml") or "")
             if not layout_xml:
                 raise ValueError(f"Missing layout XML for {input_name}")
+            if source_resolution is not None:
+                layout_xml = _scale_layout_xml(layout_xml, source_resolution, overlay_size)
             layout_path = layouts_dir / f"{Path(input_name).stem}.xml"
             layout_path.write_text(layout_xml, encoding="utf-8")
             output_name = f"{Path(input_name).stem}-overlay.mp4"
@@ -401,7 +484,7 @@ def _run_local_job(job_id: str, manifest: dict[str, Any], gpx_path: Path, video_
                 renderer_bin=renderer_bin,
                 renderer_args=renderer_args,
                 gpx_path=gpx_path,
-                clip=RenderClip(input_path=input_path, output_path=output_path, layout_path=layout_path),
+                clip=RenderClip(input_path=input_path, output_path=output_path, layout_path=layout_path, overlay_size=overlay_size),
                 settings=settings,
                 profile=profile,
                 config_dir=config_dir,
