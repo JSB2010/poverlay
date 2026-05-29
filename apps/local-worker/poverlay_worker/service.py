@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 
 from . import __version__
 from .api_client import patch_json, post_json
@@ -26,11 +27,15 @@ from .upload import upload_file_to_presigned_url
 DEFAULT_PORT = 47981
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 DEFAULT_ALLOWED_HOST_SUFFIXES = ("poverlay.com",)
+DEFAULT_ALLOWED_METHODS = ("GET", "POST", "OPTIONS")
 DEFAULT_ALLOWED_WEB_ORIGINS = (
     "https://poverlay.com",
     "https://www.poverlay.com",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "tauri://localhost",
+    "http://tauri.localhost",
+    "https://tauri.localhost",
 )
 
 
@@ -70,7 +75,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[*DEFAULT_ALLOWED_WEB_ORIGINS, *_split_env_list("POVERLAY_ALLOWED_WEB_ORIGINS")],
     allow_origin_regex=r"^https://([a-zA-Z0-9-]+\.)?poverlay\.com$",
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=[*DEFAULT_ALLOWED_METHODS],
     allow_headers=["*"],
 )
 
@@ -86,6 +91,12 @@ def _url_origin(value: str) -> str:
     return f"{parsed.scheme}://{hostname}{port}"
 
 
+def _web_origin(value: str) -> str:
+    if value == "tauri://localhost":
+        return value
+    return _url_origin(value)
+
+
 def _is_local_url(value: str) -> bool:
     parsed = urlparse(value)
     return parsed.scheme == "http" and (parsed.hostname or "").lower() in LOCAL_HOSTS
@@ -94,6 +105,20 @@ def _is_local_url(value: str) -> bool:
 def _host_matches_allowed_suffix(hostname: str, suffixes: tuple[str, ...] = DEFAULT_ALLOWED_HOST_SUFFIXES) -> bool:
     normalized = hostname.lower().strip(".")
     return any(normalized == suffix or normalized.endswith(f".{suffix}") for suffix in suffixes)
+
+
+def _is_allowed_web_origin(origin: str) -> bool:
+    try:
+        normalized = _web_origin(origin)
+    except ValueError:
+        return False
+
+    allowed_origins = set(DEFAULT_ALLOWED_WEB_ORIGINS) | set(_split_env_list("POVERLAY_ALLOWED_WEB_ORIGINS"))
+    if normalized in allowed_origins:
+        return True
+    parsed = urlparse(normalized)
+    hostname = (parsed.hostname or "").lower()
+    return parsed.scheme == "https" and _host_matches_allowed_suffix(hostname)
 
 
 def _validate_api_base_url(api_base_url: str) -> str:
@@ -118,21 +143,31 @@ def _validate_api_base_url(api_base_url: str) -> str:
 def _validate_request_origin(origin: str | None) -> None:
     if not origin:
         return
-    try:
-        normalized = _url_origin(origin)
-    except ValueError as exc:
-        raise HTTPException(status_code=403, detail="Invalid request origin") from exc
+    if not _is_allowed_web_origin(origin):
+        raise HTTPException(status_code=403, detail="This origin is not allowed to pair with POVerlay Desktop")
 
-    if _is_local_url(normalized):
-        return
-    parsed = urlparse(normalized)
-    hostname = (parsed.hostname or "").lower()
-    allowed_origins = set(DEFAULT_ALLOWED_WEB_ORIGINS) | set(_split_env_list("POVERLAY_ALLOWED_WEB_ORIGINS"))
-    if normalized in allowed_origins:
-        return
-    if parsed.scheme == "https" and _host_matches_allowed_suffix(hostname):
-        return
-    raise HTTPException(status_code=403, detail="This origin is not allowed to pair with POVerlay Desktop")
+
+@app.middleware("http")
+async def _private_network_access_middleware(request: Request, call_next):
+    origin = request.headers.get("origin")
+    requested_private_network = request.headers.get("access-control-request-private-network", "").lower() == "true"
+    if request.method == "OPTIONS" and requested_private_network:
+        requested_method = request.headers.get("access-control-request-method", "")
+        if origin and requested_method in DEFAULT_ALLOWED_METHODS and _is_allowed_web_origin(origin):
+            response = PlainTextResponse("OK", status_code=200)
+            requested_headers = request.headers.get("access-control-request-headers", "*")
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Methods"] = ", ".join(DEFAULT_ALLOWED_METHODS)
+            response.headers["Access-Control-Allow-Headers"] = requested_headers
+            response.headers["Access-Control-Allow-Private-Network"] = "true"
+            response.headers["Access-Control-Max-Age"] = "600"
+            response.headers["Vary"] = "Origin"
+            return response
+
+    response = await call_next(request)
+    if requested_private_network and origin and _is_allowed_web_origin(origin):
+        response.headers["Access-Control-Allow-Private-Network"] = "true"
+    return response
 
 
 def _require_local_token(token: str | None) -> None:

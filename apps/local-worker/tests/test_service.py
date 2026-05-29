@@ -31,6 +31,41 @@ def test_health_reports_unpaired_worker() -> None:
     assert response.json()["paired"] is False
 
 
+def test_health_allows_desktop_app_origin() -> None:
+    response = client.get("/health", headers={"Origin": "tauri://localhost"})
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "tauri://localhost"
+
+
+def test_private_network_preflight_allows_poverlay_origin() -> None:
+    response = client.options(
+        "/health",
+        headers={
+            "Origin": "https://poverlay.com",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Private-Network": "true",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "https://poverlay.com"
+    assert response.headers["access-control-allow-private-network"] == "true"
+
+
+def test_private_network_preflight_rejects_untrusted_origin() -> None:
+    response = client.options(
+        "/health",
+        headers={
+            "Origin": "https://attacker.example",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Private-Network": "true",
+        },
+    )
+
+    assert response.status_code == 400
+
+
 def test_pairing_complete_stores_worker_and_returns_local_token(monkeypatch) -> None:
     monkeypatch.setenv("POVERLAY_ALLOWED_API_BASES", "https://api.example.test")
 
